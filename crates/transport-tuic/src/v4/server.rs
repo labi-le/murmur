@@ -18,6 +18,7 @@ use murmur_constant::adapters::{UDPPacket, WriteBack};
 use murmur_quic::ReceiveStream;
 use murmur_std_compat::net::Conn;
 use murmur_transport::socks5::socks5 as socks5_mod;
+use subtle::ConstantTimeEq as _;
 
 use super::packet;
 use super::protocol;
@@ -28,6 +29,12 @@ use crate::quic::Conn as QuicConn;
 pub type HandleTcpFn = Arc<dyn Fn(Box<dyn Conn>, socks5_mod::Addr, &[Addition]) -> anyhow::Result<()> + Send + Sync>;
 pub type HandleUdpFn =
     Arc<dyn Fn(socks5_mod::Addr, Box<dyn UDPPacket>, &[Addition]) -> anyhow::Result<()> + Send + Sync>;
+
+/// Compares against every configured token without an early return, so neither the position of a
+/// match nor the first differing byte is visible through timing (`==` on arrays is `memcmp`).
+fn tokens_match(tokens: &[[u8; 32]], candidate: &[u8; 32]) -> bool {
+    tokens.iter().fold(false, |acc, tkn| acc | bool::from(tkn.ct_eq(candidate)))
+}
 
 pub struct ServerOption {
     pub handle_tcp_fn: HandleTcpFn,
@@ -166,7 +173,7 @@ impl types::ServerHandler for ServerHandlerImpl {
         match command_head.type_ {
             protocol::CommandType::AUTHENTICATE_TYPE => {
                 let authenticate = protocol::read_authenticate_with_head(command_head, stream).await?;
-                let auth_ok = self.option.tokens.contains(&authenticate.tkn);
+                let auth_ok = tokens_match(&self.option.tokens, &authenticate.tkn);
                 self.auth_once.call_once(|| {
                     if !auth_ok {
                         let _ =
@@ -252,3 +259,22 @@ impl UDPPacket for ServerUdpPacket {
     }
 }
 
+#[cfg(test)]
+mod tests {
+    use super::tokens_match;
+
+    #[test]
+    fn only_a_configured_token_authenticates() {
+        let tkn = [0x11u8; 32];
+        let other = [0x22u8; 32];
+        let mut near_miss = tkn;
+        near_miss[31] = 0x12;
+
+        assert!(tokens_match(&[tkn], &tkn));
+        assert!(tokens_match(&[other, tkn], &tkn), "a token matching in any position counts");
+        assert!(!tokens_match(&[], &tkn), "no configured token authenticates nobody");
+        assert!(!tokens_match(&[other], &tkn));
+        assert!(!tokens_match(&[near_miss], &tkn), "a token differing in its last byte must not authenticate");
+        assert!(!tokens_match(&[other, near_miss], &tkn));
+    }
+}

@@ -22,6 +22,7 @@ parking_lot.workspace = true
 rand.workspace = true
 quinn.workspace = true
 rustls.workspace = true
+subtle.workspace = true
 thiserror.workspace = true
 tokio.workspace = true
 tokio-util.workspace = true

@@ -15,6 +15,7 @@ use murmur_constant::adapters::{UDPPacket, WriteBack};
 use murmur_quic::ReceiveStream;
 use murmur_std_compat::net::Conn as NetConn;
 use murmur_transport::socks5::socks5 as socks5_pkg;
+use subtle::ConstantTimeEq as _;
 
 use super::packet::QuicStreamPacketConn;
 use super::protocol;
@@ -162,8 +163,9 @@ impl types::type_::ServerHandler for ServerHandlerImpl {
                 let mut auth_uuid = uuid::Uuid::nil();
                 if let Some(password) = self.option.users.get(&authenticate.uuid) {
                     let token = protocol::gen_token(self.quic_conn.as_ref(), authenticate.uuid, password)?;
-                    if token == authenticate.token {
-                        auth_ok = true;
+                    // `==` on arrays is `memcmp`, which returns at the first differing byte.
+                    auth_ok = bool::from(token.ct_eq(&authenticate.token));
+                    if auth_ok {
                         auth_uuid = uuid::Uuid::from_bytes(authenticate.uuid);
                     }
                 }
@@ -260,6 +262,7 @@ mod tests {
 
     use bytes::Bytes;
     use parking_lot::Mutex as StdMutex;
+    use tokio::io::AsyncReadExt;
 
     use super::*;
 
@@ -310,13 +313,8 @@ mod tests {
 
         async fn handshake_complete(&self) {}
 
-        fn export_keying_material(
-            &self,
-            _label: &[u8],
-            _context: &[u8],
-            _length: usize,
-        ) -> anyhow::Result<Vec<u8>> {
-            anyhow::bail!("not exercised by the nat_key test path")
+        fn export_keying_material(&self, _label: &[u8], _context: &[u8], length: usize) -> anyhow::Result<Vec<u8>> {
+            Ok(vec![CONNECTION_TOKEN_BYTE; length])
         }
 
         async fn open_stream(&self, _ctx: &CancellationToken) -> anyhow::Result<Box<dyn murmur_quic::Stream>> {
@@ -390,4 +388,72 @@ mod tests {
         assert_eq!(seen[0].0, remote);
         assert_eq!(seen[1].0, remote);
         assert_ne!(seen[0].1, seen[1].1, "two associations sharing one QUIC connection/peer must not share a NAT key");
+    }
+
+    /// The token the fake connection's keying material derives to, one repeated byte wide.
+    const CONNECTION_TOKEN_BYTE: u8 = 0x11;
+    const USER_UUID: [u8; 16] = [7; 16];
+
+    fn authenticate_command(token: [u8; 32]) -> Vec<u8> {
+        let mut buf = bytes::BytesMut::new();
+        protocol::new_authenticate(USER_UUID, token).write_to(&mut buf);
+        buf.to_vec()
+    }
+
+    fn handler_with_user(quic_conn: Arc<dyn QuicConn>) -> ServerHandlerImpl {
+        ServerHandlerImpl {
+            option: ServerOption {
+                handle_tcp_fn: Arc::new(|_conn, _addr, _additions| {
+                    anyhow::bail!("tcp not exercised by the authentication test path")
+                }),
+                handle_udp_fn: Arc::new(|_addr, _packet, _additions| {
+                    anyhow::bail!("udp not exercised by the authentication test path")
+                }),
+                users: HashMap::from([(USER_UUID, "hunter2".to_owned())]),
+                max_udp_relay_packet_size: 1500,
+            },
+            quic_conn,
+            uuid: uuid::Uuid::new_v4(),
+            auth_ch: CancellationToken::new(),
+            auth_ok: murmur_common::atomic::type_::new_bool(false),
+            auth_uuid: TypedValue::default(),
+            auth_once: Once::new(),
+            udp_input_map: xsync::map::Map::default(),
+        }
+    }
+
+    /// The dispatcher reads the version byte before handing the stream over, so the test does too.
+    async fn handle_authenticate(handler: &ServerHandlerImpl, command: Vec<u8>) -> anyhow::Result<()> {
+        let mut stream = types::stream::StubUniStream::new(command, true);
+        let version = stream.read_u8().await?;
+        types::type_::ServerHandler::handle_uni_stream(handler, version, &mut stream).await
+    }
+
+    fn auth_ok(handler: &ServerHandlerImpl) -> bool {
+        types::type_::ServerHandler::auth_ok(handler)
+    }
+
+    #[tokio::test]
+    async fn an_authenticate_command_with_the_connections_token_authenticates_the_user() {
+        let quic_conn: Arc<dyn QuicConn> = Arc::new(FakeQuicConn("198.51.100.7:9".parse().unwrap()));
+        let handler = handler_with_user(quic_conn);
+
+        handle_authenticate(&handler, authenticate_command([CONNECTION_TOKEN_BYTE; 32]))
+            .await
+            .expect("the authenticate command parses");
+
+        assert!(auth_ok(&handler), "the token derived from the same keying material must authenticate");
+    }
+
+    #[tokio::test]
+    async fn an_authenticate_command_with_a_token_off_by_one_bit_is_rejected() {
+        let quic_conn: Arc<dyn QuicConn> = Arc::new(FakeQuicConn("198.51.100.7:9".parse().unwrap()));
+        let handler = handler_with_user(quic_conn);
+        let mut wrong = [CONNECTION_TOKEN_BYTE; 32];
+        wrong[31] ^= 1;
+
+        handle_authenticate(&handler, authenticate_command(wrong)).await.expect("the authenticate command parses");
+
+        assert!(!auth_ok(&handler), "a token differing in its last byte must not authenticate");
+    }
 }
