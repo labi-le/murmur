@@ -32,6 +32,33 @@ pub fn set_etag(b: bool) {
     *ETAG.write() = b;
 }
 
+/// Reads a response body in bounded chunks, stopping once `limit` bytes are in hand, so the
+/// declared tail of an oversized body is never allocated. The reference truncates, so the first
+/// `limit` bytes are what the caller keeps.
+async fn read_body_bounded<B>(body: B, limit: Option<usize>) -> Result<Vec<u8>>
+where
+    B: hyper::body::Body<Data = hyper::body::Bytes> + Unpin,
+    B::Error: std::error::Error + Send + Sync + 'static,
+{
+    let mut body = body;
+    let mut buf: Vec<u8> = Vec::new();
+    while let Some(frame) = body.frame().await {
+        let Ok(data) = frame?.into_data() else {
+            continue;
+        };
+        let remaining = limit.map_or(data.len(), |limit| limit.saturating_sub(buf.len()));
+        if remaining == 0 {
+            break;
+        }
+        let take = data.len().min(remaining);
+        buf.extend_from_slice(data.get(..take).unwrap_or_else(|| data.as_ref()));
+        if limit.is_some_and(|limit| buf.len() >= limit) {
+            break;
+        }
+    }
+    Ok(buf)
+}
+
 fn safe_write(path: &str, buf: &[u8]) -> Result<()> {
     let path = Path::new(path);
     let dir = path.parent().unwrap_or_else(|| Path::new(""));
@@ -200,15 +227,15 @@ impl Vehicle for HTTPVehicle {
         }
 
         let resp_header = resp.headers().clone();
-        let mut body = resp.into_body().collect().await?.to_bytes();
-        if self.size_limit > 0 {
-            let size_limit = usize::try_from(self.size_limit)
-                .map_err(|_| anyhow::anyhow!("size limit {} does not fit this platform", self.size_limit))?;
-            if body.len() > size_limit {
-                body = body.slice(..size_limit);
-            }
-        }
-        let buf = body.to_vec();
+        let limit = if self.size_limit > 0 {
+            Some(
+                usize::try_from(self.size_limit)
+                    .map_err(|_| anyhow::anyhow!("size limit {} does not fit this platform", self.size_limit))?,
+            )
+        } else {
+            None
+        };
+        let buf = read_body_bounded(resp.into_body(), limit).await?;
         let hash = make_hash(&buf);
 
         if etag() {
@@ -264,5 +291,59 @@ mod tests {
         let err = vehicle.read(&CancellationToken::new(), HashType::default()).await.expect_err("a closed port fails");
         let text = err.to_string();
         assert!(text.starts_with(&format!("Get \"{url}\": ")), "{text}");
+    }
+
+    /// `size-limit` bounds what is read, not only what is kept: collecting the whole body before
+    /// truncating leaves an unbounded response able to exhaust memory. The server declares a body
+    /// far past the limit and reports whether it pushed all of it; with the read capped at the
+    /// limit, the client stops before the body arrives in full.
+    #[tokio::test]
+    async fn read_stops_reading_at_the_size_limit_instead_of_buffering_the_body() {
+        use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
+
+        const BODY: usize = 32 * 1024 * 1024;
+        const LIMIT: usize = 64 * 1024;
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.expect("bind");
+        let port = listener.local_addr().expect("local addr").port();
+        let url = format!("http://127.0.0.1:{port}/geoip.dat");
+
+        let (tx, rx) = tokio::sync::oneshot::channel();
+        tokio::spawn(async move {
+            let Ok((mut sock, _)) = listener.accept().await else { return };
+            let mut head = [0u8; 4096];
+            let _ = sock.read(&mut head).await;
+            let header = format!(
+                "HTTP/1.1 200 OK\r\nContent-Type: application/octet-stream\r\nContent-Length: {BODY}\r\nConnection: close\r\n\r\n"
+            );
+            if sock.write_all(header.as_bytes()).await.is_err() {
+                let _ = tx.send(false);
+                return;
+            }
+            let chunk = [0u8; 64 * 1024];
+            let complete = tokio::time::timeout(Duration::from_secs(3), async {
+                let mut sent = 0usize;
+                while sent < BODY {
+                    let n = (BODY - sent).min(chunk.len());
+                    if sock.write_all(&chunk[..n]).await.is_err() {
+                        return false;
+                    }
+                    sent += n;
+                }
+                true
+            })
+            .await
+            .unwrap_or(false);
+            let _ = tx.send(complete);
+        });
+
+        let path = std::env::temp_dir().join(format!("murmur-vehicle-size-limit-{}", std::process::id()));
+        let vehicle =
+            HTTPVehicle::new(&url, &path.to_string_lossy(), "", HashMap::new(), Duration::from_secs(10), LIMIT as i64);
+        let (buf, _hash) = vehicle.read(&CancellationToken::new(), HashType::default()).await.expect("read succeeds");
+        assert_eq!(buf.len(), LIMIT, "the kept body is the first {LIMIT} bytes");
+
+        let sent_whole_body = rx.await.expect("server reports");
+        assert!(!sent_whole_body, "the client buffered the whole {BODY}-byte body despite size_limit={LIMIT}");
     }
 }
