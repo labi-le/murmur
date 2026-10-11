@@ -55,9 +55,9 @@ fn new_packet_buffer(options: &ReadWaitOptions) -> Buffer {
 
 fn new_buffer(options: &ReadWaitOptions, default_buffer_size: i32, reserve: bool) -> Buffer {
     let buffer_size = if options.mtu > 0 {
-        // The allocator's size is an `i32`, so an out-of-range headroom sum is clamped instead of
-        // wrapping into the negative size that would panic on allocation.
-        i32::try_from(options.mtu + options.front_headroom + options.rear_headroom).unwrap_or(i32::MAX)
+        // An MTU whose headroomed size does not fit the allocator's `i32` length keeps the default
+        // packet buffer instead of wrapping to an arbitrary one.
+        i32::try_from(options.mtu + options.front_headroom + options.rear_headroom).unwrap_or(default_buffer_size)
     } else {
         default_buffer_size
     };
@@ -228,4 +228,18 @@ impl WriterWithUpstream for EnhanceSingPacketConnImpl {
 }
 pub(crate) fn new_enhance_sing_packet_conn(conn: Arc<dyn SingPacketConn>) -> Arc<dyn EnhancePacketConn> {
     Arc::new(EnhanceSingPacketConnImpl::new(conn))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// An MTU whose headroomed size exceeds the allocator's `i32` length must keep the default
+    /// packet buffer rather than reserve, and touch, an `i32::MAX`-sized (2 GiB) block.
+    #[test]
+    fn an_oversized_mtu_falls_back_to_the_default_packet_buffer() {
+        let options = ReadWaitOptions { front_headroom: 0, rear_headroom: 0, mtu: usize::MAX };
+        let buffer = new_packet_buffer(&options);
+        assert_eq!(UDP_BUFFER_SIZE as usize, buffer.raw_cap());
+    }
 }
