@@ -341,10 +341,7 @@ impl<'a> Cursor<'a> {
     }
 
     /// Keeps the `next` name rather than implementing `Iterator`.
-    #[expect(
-        clippy::should_implement_trait,
-        reason = "the `next` name is kept rather than implementing `Iterator`"
-    )]
+    #[expect(clippy::should_implement_trait, reason = "the `next` name is kept rather than implementing `Iterator`")]
     pub fn next(&mut self) -> Option<(&'a [u8], &'a [u8])> {
         let current = self.current?;
         self.current = self.entries.range::<Vec<u8>, _>((Excluded(current), Unbounded)).next().map(|(key, _)| key);
