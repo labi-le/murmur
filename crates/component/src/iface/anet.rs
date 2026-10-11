@@ -635,6 +635,10 @@ pub(crate) fn net_link_interfaces() -> anyhow::Result<Vec<Interface>> {
 }
 
 #[cfg(not(any(target_os = "linux", target_os = "android")))]
+#[expect(
+    clippy::unnecessary_wraps,
+    reason = "the signature is shared with the Linux variant, whose `/sys/class/net` read is fallible, and `net_interfaces` propagates it with `?`"
+)]
 pub(crate) fn net_link_interfaces() -> anyhow::Result<Vec<Interface>> {
     Ok(Vec::new())
 }
