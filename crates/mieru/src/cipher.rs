@@ -470,15 +470,22 @@ mod tests {
         assert_eq!(block.decrypt(&b).expect("decrypt b"), b"two");
     }
 
+    /// What the packet underlay relies on: each stateless `encrypt` call carries its own nonce, so
+    /// one message's nonce cannot open another message's ciphertext.
     #[test]
-    fn stateless_shared_nonce_for_metadata_and_payload() {
+    fn a_metadata_nonce_does_not_open_a_separately_sealed_payload() {
         let block = block_cipher_from_password(b"pw", true).expect("derive");
         let metadata = block.encrypt(b"metadata").expect("encrypt metadata");
-        let nonce: [u8; DEFAULT_NONCE_SIZE] = metadata[..DEFAULT_NONCE_SIZE].try_into().expect("nonce slice");
-        let payload = block.encrypt_with_nonce(&nonce, b"payload").expect("encrypt payload");
+        let meta_nonce: [u8; DEFAULT_NONCE_SIZE] = metadata[..DEFAULT_NONCE_SIZE].try_into().expect("nonce slice");
+        let payload = block.encrypt(b"payload").expect("encrypt payload");
+        let payload_nonce: [u8; DEFAULT_NONCE_SIZE] = payload[..DEFAULT_NONCE_SIZE].try_into().expect("nonce slice");
 
-        assert_eq!(block.decrypt(&metadata).expect("decrypt metadata"), b"metadata");
-        assert_eq!(block.decrypt_with_nonce(&nonce, &payload).expect("decrypt payload"), b"payload");
+        assert_ne!(meta_nonce, payload_nonce, "each stateless encrypt must carry its own nonce");
+        assert_eq!(block.decrypt(&payload).expect("decrypt payload"), b"payload");
+        assert!(
+            block.decrypt_with_nonce(&meta_nonce, &payload[DEFAULT_NONCE_SIZE..]).is_err(),
+            "the metadata's nonce must not open the payload"
+        );
     }
 
     #[test]

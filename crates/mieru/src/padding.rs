@@ -10,9 +10,10 @@ use rand::Rng;
 use crate::rng;
 use crate::trafficpattern::{Config, MAX_PADDING_LEN};
 
-/// `packetOverhead = NonceSize + MetadataLength + Overhead*2`.
+/// `packetOverhead = NonceSize*2 + MetadataLength + Overhead*2`, one nonce and one tag per AEAD
+/// blob (the metadata and the payload).
 pub const PACKET_OVERHEAD: usize =
-    crate::cipher::DEFAULT_NONCE_SIZE + crate::wire::METADATA_LENGTH + 2 * crate::cipher::DEFAULT_OVERHEAD;
+    crate::cipher::DEFAULT_NONCE_SIZE * 2 + crate::wire::METADATA_LENGTH + 2 * crate::cipher::DEFAULT_OVERHEAD;
 
 /// Where padding goes, which is what picks the traffic-pattern field that caps it.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -463,9 +464,9 @@ mod tests {
     #[test]
     fn the_transport_ceiling_ignores_the_pattern() {
         assert_eq!(max_padding_size(crate::session::Transport::Stream, 1400, 100, 0), 255);
-        // 1400 - 88 overhead - 200 fragment - 10 already used = 1102, capped at 255.
+        // 1400 - 112 overhead - 200 fragment - 10 already used = 1078, capped at 255.
         assert_eq!(max_padding_size(crate::session::Transport::Packet, 1400, 200, 10), 255);
-        assert_eq!(max_padding_size(crate::session::Transport::Packet, 400, 200, 10), 102);
+        assert_eq!(max_padding_size(crate::session::Transport::Packet, 400, 200, 10), 78);
         assert_eq!(max_padding_size(crate::session::Transport::Packet, 200, 200, 10), 0);
     }
 

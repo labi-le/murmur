@@ -15,8 +15,10 @@ pub use stream::StreamUnderlay;
 /// The default MTU; the `MieruOption` inbound never overrides it.
 pub const DEFAULT_MTU: usize = 1400;
 
-/// `packetOverhead = NonceSize + MetadataLength + Overhead*2`.
-pub const PACKET_OVERHEAD: usize = cipher::DEFAULT_NONCE_SIZE + wire::METADATA_LENGTH + cipher::DEFAULT_OVERHEAD * 2;
+/// `packetOverhead = NonceSize*2 + MetadataLength + Overhead*2`, one nonce and one tag per AEAD
+/// blob (the metadata and the payload).
+pub const PACKET_OVERHEAD: usize =
+    cipher::DEFAULT_NONCE_SIZE * 2 + wire::METADATA_LENGTH + cipher::DEFAULT_OVERHEAD * 2;
 
 #[derive(thiserror::Error, Debug)]
 pub enum UnderlayError {

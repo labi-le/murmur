@@ -161,28 +161,26 @@ async fn send_datagram(
     };
 
     let encrypted_meta = cipher.encrypt(&meta).map_err(cipher_io_err)?;
-    let nonce = nonce_prefix(&encrypted_meta)
-        .ok_or_else(|| std::io::Error::new(std::io::ErrorKind::InvalidData, "nonce prefix"))?;
     let mut datagram = Vec::with_capacity(
-        encrypted_meta.len() + payload.len() + prefix.len() + suffix.len() + cipher::DEFAULT_OVERHEAD,
+        encrypted_meta.len()
+            + prefix.len()
+            + payload.len()
+            + cipher::DEFAULT_NONCE_SIZE
+            + cipher::DEFAULT_OVERHEAD
+            + suffix.len(),
     );
     datagram.extend_from_slice(&encrypted_meta);
     // The wire order is metadata, then middle padding, then the payload, then end padding; the
     // receiver slices the payload out using the two lengths the metadata carries.
     datagram.extend_from_slice(&prefix);
     if !payload.is_empty() {
-        let encrypted_payload = cipher.encrypt_with_nonce(&nonce, payload).map_err(cipher_io_err)?;
+        // A payload sealed under the metadata's nonce would reuse that keystream and Poly1305 key.
+        let encrypted_payload = cipher.encrypt(payload).map_err(cipher_io_err)?;
         datagram.extend_from_slice(&encrypted_payload);
     }
     datagram.extend_from_slice(&suffix);
     socket.send_to(&datagram, peer).await?;
     Ok(())
-}
-
-/// The nonce prefix a datagram — or the encrypted metadata blob at its head — starts with.
-fn nonce_prefix(buf: &[u8]) -> Option<[u8; cipher::DEFAULT_NONCE_SIZE]> {
-    let prefix = buf.get(..cipher::DEFAULT_NONCE_SIZE)?;
-    prefix.try_into().ok()
 }
 
 fn wire_io_err(e: wire::WireError) -> std::io::Error {
@@ -399,27 +397,25 @@ impl Inner {
 
 /// Validates the decrypted metadata and decrypts the payload it describes; the nonce prefix sits
 /// in the datagram because the metadata and the payload are separate AEAD blobs.
-fn decode_segment(encrypted_meta: &[u8], rest: &[u8], decrypted: DecryptedMeta) -> Option<IncomingSegment> {
+fn decode_segment(rest: &[u8], decrypted: DecryptedMeta) -> Option<IncomingSegment> {
     if decrypted.plaintext.len() != wire::METADATA_LENGTH {
         return None;
     }
     let protocol_byte = *decrypted.plaintext.first()?;
     let protocol = ProtocolType::from_byte(protocol_byte).ok()?;
-    let nonce = nonce_prefix(encrypted_meta)?;
     let (meta, payload) = if protocol.is_session_struct() {
         let meta = SessionStruct::unmarshal(&decrypted.plaintext).ok()?;
         if wire::validate_timestamp(meta.timestamp).is_err() {
             return None;
         }
-        let payload = extract_payload(rest, &decrypted.cipher, &nonce, 0, meta.payload_len, meta.suffix_len)?;
+        let payload = extract_payload(rest, &decrypted.cipher, 0, meta.payload_len, meta.suffix_len)?;
         (SessionMeta::Session(meta), payload)
     } else {
         let meta = DataAckStruct::unmarshal(&decrypted.plaintext).ok()?;
         if wire::validate_timestamp(meta.timestamp).is_err() {
             return None;
         }
-        let payload =
-            extract_payload(rest, &decrypted.cipher, &nonce, meta.prefix_len, meta.payload_len, meta.suffix_len)?;
+        let payload = extract_payload(rest, &decrypted.cipher, meta.prefix_len, meta.payload_len, meta.suffix_len)?;
         (SessionMeta::DataAck(meta), payload)
     };
     Some(IncomingSegment {
@@ -491,7 +487,7 @@ async fn run_read_loop(inner: Arc<Inner>, accept_tx: mpsc::Sender<Arc<Session>>)
 
         // Discovery and the session cache only ever get the encrypted metadata, never the payload.
         let Some(decrypted) = inner.decrypt_meta(encrypted_meta, peer).await else { continue };
-        let Some(segment) = decode_segment(encrypted_meta, rest, decrypted) else { continue };
+        let Some(segment) = decode_segment(rest, decrypted) else { continue };
 
         route_segment(&inner, &accept_tx, peer, segment).await;
     }
@@ -508,16 +504,15 @@ async fn run_read_loop(inner: Arc<Inner>, accept_tx: mpsc::Sender<Arc<Session>>)
 fn extract_payload(
     rest: &[u8],
     cipher: &BlockCipher,
-    nonce: &[u8; cipher::DEFAULT_NONCE_SIZE],
     prefix_len: u8,
     payload_len: u16,
     suffix_len: u8,
 ) -> Option<Bytes> {
     let mut offset = prefix_len as usize;
     let payload = if payload_len > 0 {
-        let end = offset.checked_add(payload_len as usize + cipher::DEFAULT_OVERHEAD)?;
+        let end = offset.checked_add(payload_len as usize + cipher::DEFAULT_NONCE_SIZE + cipher::DEFAULT_OVERHEAD)?;
         let ciphertext = rest.get(offset..end)?;
-        let plaintext = cipher.decrypt_with_nonce(nonce, ciphertext).ok()?;
+        let plaintext = cipher.decrypt(ciphertext).ok()?;
         offset = end;
         Bytes::from(plaintext)
     } else {
@@ -546,4 +541,67 @@ async fn send_close_reply(
         suffix_len: 0,
     };
     let _ = send_datagram(socket, cipher, peer, meta.marshal(), &[], traffic_pattern, mtu).await;
+}
+
+#[cfg(test)]
+mod tests {
+    use std::sync::Mutex as StdMutex;
+
+    use super::*;
+
+    #[derive(Default)]
+    struct RecordingSocket(StdMutex<Vec<u8>>);
+
+    #[async_trait::async_trait]
+    impl PacketIo for RecordingSocket {
+        async fn recv_from(&self, _buf: &mut [u8]) -> std::io::Result<(usize, SocketAddr)> {
+            std::future::pending().await
+        }
+
+        async fn send_to(&self, buf: &[u8], _target: SocketAddr) -> std::io::Result<usize> {
+            self.0.lock().expect("recording socket lock").extend_from_slice(buf);
+            Ok(buf.len())
+        }
+
+        fn local_addr(&self) -> std::io::Result<SocketAddr> {
+            Ok(SocketAddr::from(([192, 0, 2, 1], 9)))
+        }
+    }
+
+    /// A datagram's metadata and payload must be sealed under distinct nonces: one nonce for both
+    /// reuses the keystream and the Poly1305 one-time key across two messages.
+    #[tokio::test]
+    async fn a_datagrams_metadata_and_payload_carry_separate_nonces() {
+        let socket = RecordingSocket::default();
+        let cipher = cipher::block_cipher_from_password(b"pw", true).expect("derive");
+        cipher.set_user_name(Some("bob".to_owned()));
+        let ack = DataAckStruct {
+            protocol: ProtocolType::DataClientToServer as u8,
+            timestamp: wire::now_minutes(),
+            payload_len: 7,
+            ..DataAckStruct::default()
+        };
+        let peer: SocketAddr = "192.0.2.1:9".parse().expect("peer addr");
+        send_datagram(&socket, &cipher, peer, ack.marshal(), b"payload", None, DEFAULT_MTU).await.expect("send");
+
+        let datagram = socket.0.lock().expect("recording socket lock").clone();
+        let (encrypted_meta, rest) = datagram.split_at(DATAGRAM_HEADER_LEN);
+        let plaintext = cipher.decrypt(encrypted_meta).expect("metadata opens");
+        let meta = DataAckStruct::unmarshal(&plaintext).expect("metadata");
+        let start = meta.prefix_len as usize;
+        let end = start + meta.payload_len as usize + cipher::DEFAULT_NONCE_SIZE + cipher::DEFAULT_OVERHEAD;
+        let payload_blob = rest.get(start..end).expect("payload blob with its own nonce prefix");
+
+        assert_ne!(
+            payload_blob.get(..cipher::DEFAULT_NONCE_SIZE).expect("payload nonce"),
+            encrypted_meta.get(..cipher::DEFAULT_NONCE_SIZE).expect("metadata nonce"),
+            "the payload must not be sealed under the metadata's nonce"
+        );
+        assert_eq!(cipher.decrypt(payload_blob).expect("payload opens under its own nonce"), b"payload");
+
+        let segment =
+            decode_segment(rest, DecryptedMeta { cipher: Arc::new(cipher), plaintext, discovered_user: None })
+                .expect("segment decodes");
+        assert_eq!(segment.payload, Bytes::from_static(b"payload"));
+    }
 }
