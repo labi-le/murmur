@@ -2417,7 +2417,7 @@ impl Node {
         if policy == BondingPolicy::None {
             return;
         }
-        let options = self.bonding_options_for_peer_locked(address);
+        let options = self.bonding_options_for_peer_static(address);
         self.maintain_bond_locked(address, policy, &options, now);
         let monitor_interval = options.failover_interval / 3;
         let due: Vec<PathKey> = self
@@ -2645,7 +2645,7 @@ mod tests {
     fn config_with_credentials(network_id: u64, member: Address, capability: Option<&Capability>) -> Vec<u8> {
         let mut config = append_test_network_config(network_id, member);
         if let Some(capability) = capability {
-            config = append_dictionary_entry(config, "CAP", &capability.append_binary(Vec::new()))
+            config = append_dictionary_entry(config, "CAP", &capability.append_binary(Vec::new()).expect("the capability encodes"))
                 .expect("valid dictionary entry");
         }
         config

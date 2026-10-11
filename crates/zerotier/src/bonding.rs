@@ -402,13 +402,11 @@ impl Node {
     }
 
     /// Resolves peer-specific or default bond options.
-    pub(crate) fn bonding_options_for_peer_locked(&self, address: Address) -> BondingOptions {
-        if let Some(configured) = self.peer_paths.get(&address) {
-            if let Some(options) = &configured.bonding_options {
-                return options.clone();
-            }
-        }
-        self.bonding_options.clone()
+    pub(crate) fn bonding_options_for_peer_locked(&self, address: Address) -> &BondingOptions {
+        self.peer_paths
+            .get(&address)
+            .and_then(|configured| configured.bonding_options.as_ref())
+            .unwrap_or(&self.bonding_options)
     }
 
     /// The measurement cadence for one peer.
@@ -444,7 +442,6 @@ impl Node {
             }
             return BondPaths::Many(paths.get(..1).unwrap_or_default().to_vec());
         }
-        let options = self.bonding_options_for_peer_locked(address);
         let Some(peer) = self.peers.get(&address) else {
             return BondPaths::single(best(self));
         };
@@ -454,6 +451,7 @@ impl Node {
         };
         let stale = due || peer.bond_known_path_count != peer.paths.len();
         let paths = if stale {
+            let options = self.bonding_options_for_peer_static(address);
             self.maintain_bond_locked(address, policy, &options, now)
         } else {
             self.peers.get(&address).map(|peer| peer.bond_paths.clone()).unwrap_or_default()
@@ -471,6 +469,7 @@ impl Node {
             return BondPaths::single(paths.first().copied());
         }
         if policy == BondingPolicy::BalanceRoundRobin {
+            let options = self.bonding_options_for_peer_static(address);
             return BondPaths::single(self.bond_round_robin_path(address, &paths, &options, packet_id));
         }
         if flow_id == NO_FLOW_ID {
@@ -697,8 +696,7 @@ impl Node {
     ) {
         let mut max_capacity = 0u32;
         for key in paths {
-            let (link, _) = bonding_link_for_socket(options, key.local_socket);
-            max_capacity = max_capacity.max(link.capacity);
+            max_capacity = max_capacity.max(bond_link_capacity(options, key.local_socket));
         }
         let have_configured_capacity = max_capacity != 0;
         if !have_configured_capacity {
@@ -710,8 +708,7 @@ impl Node {
             let Some(state) = self.peers.get(&address).and_then(|peer| peer.paths.get(key)).cloned() else {
                 continue;
             };
-            let (link, _) = bonding_link_for_socket(options, key.local_socket);
-            let capacity = if have_configured_capacity { link.capacity } else { 1 };
+            let capacity = if have_configured_capacity { bond_link_capacity(options, key.local_socket) } else { 1 };
             let quality = options.quality;
             let metric = BondMetrics {
                 // Both sides are scaled to seconds; only their ratio is used.
@@ -843,7 +840,7 @@ impl Node {
         explicit_failover: bool,
     ) {
         for key in paths {
-            let (link, _) = bonding_link_for_socket(options, key.local_socket);
+            let link = bonding_link_for_socket(options, key.local_socket);
             let quality = self
                 .peers
                 .get(&address)
@@ -851,10 +848,10 @@ impl Node {
                 .map(|state| state.bond_quality)
                 .unwrap_or_default();
             let mut score = bond_path_score(quality);
-            if bonding_link_prefers_address(&link, key.endpoint.ip()) {
+            if link.is_none_or(|link| bonding_link_prefers_address(link, key.endpoint.ip())) {
                 score += 500;
             }
-            if link.mode == BondingLinkMode::Primary
+            if link.is_none_or(|link| link.mode == BondingLinkMode::Primary)
                 && (options.link_select_method != BondingLinkSelectMethod::Optimize || explicit_failover)
             {
                 score += 1000;
@@ -874,12 +871,16 @@ impl Node {
     fn inherit_bond_failover_scores_locked(&mut self, address: Address, paths: &[PathKey], options: &BondingOptions) {
         for _ in 0..options.links.len() {
             for source in paths {
-                let (link, _) = bonding_link_for_socket(options, source.local_socket);
+                let Some(link) = bonding_link_for_socket(options, source.local_socket) else {
+                    continue;
+                };
                 if link.failover_to.is_empty() {
                     continue;
                 }
                 for target in paths {
-                    let (target_link, _) = bonding_link_for_socket(options, target.local_socket);
+                    let Some(target_link) = bonding_link_for_socket(options, target.local_socket) else {
+                        continue;
+                    };
                     if target_link.name != link.failover_to {
                         continue;
                     }
@@ -907,15 +908,15 @@ impl Node {
         active: PathKey,
         now: SystemTime,
     ) -> bool {
-        let (active_link, _) = bonding_link_for_socket(options, active.local_socket);
-        let (best_link, _) = bonding_link_for_socket(options, best.local_socket);
+        let active_primary =
+            bonding_link_for_socket(options, active.local_socket).is_none_or(|link| link.mode == BondingLinkMode::Primary);
+        let best_primary =
+            bonding_link_for_socket(options, best.local_socket).is_none_or(|link| link.mode == BondingLinkMode::Primary);
         match options.link_select_method {
-            BondingLinkSelectMethod::Always => {
-                active_link.mode != BondingLinkMode::Primary && best_link.mode == BondingLinkMode::Primary
-            }
+            BondingLinkSelectMethod::Always => !active_primary && best_primary,
             BondingLinkSelectMethod::Better => {
-                active_link.mode != BondingLinkMode::Primary
-                    && best_link.mode == BondingLinkMode::Primary
+                !active_primary
+                    && best_primary
                     && self.bond_path_score_of(address, &best) > self.bond_path_score_of(address, &active)
             }
             BondingLinkSelectMethod::Optimize => {
@@ -952,7 +953,7 @@ impl Node {
         if policy == BondingPolicy::None || root {
             return;
         }
-        if !bond_path_allowed(key, &self.bonding_options_for_peer_locked(address)) {
+        if !bond_path_allowed(key, self.bonding_options_for_peer_locked(address)) {
             return;
         }
         let Some(peer) = self.peers.get_mut(&address) else {
@@ -986,7 +987,7 @@ impl Node {
         if policy == BondingPolicy::None || root {
             return;
         }
-        if !bond_path_allowed(key, &self.bonding_options_for_peer_locked(address)) {
+        if !bond_path_allowed(key, self.bonding_options_for_peer_locked(address)) {
             return;
         }
         let verb = packet.verb();
@@ -1040,10 +1041,8 @@ impl Node {
             Some(peer) => peer.paths.keys().copied().collect(),
             None => return,
         };
-        for key in paths {
-            if !bond_path_allowed(key, &options) {
-                continue;
-            }
+        let allowed: Vec<PathKey> = paths.into_iter().filter(|key| bond_path_allowed(*key, options)).collect();
+        for key in allowed {
             self.expire_qos_records_locked(address, key, now, 3 * interval);
             let (due, ids, peer_address) = {
                 let Some(peer) = self.peers.get(&address) else {
@@ -1118,7 +1117,7 @@ impl Node {
                 peer.last_qos_rate_check.is_some_and(|checked| elapsed(now, checked) <= interval / peer_limit);
             peer.qos_rate_count = if rate_limited { peer.qos_rate_count + 1 } else { 0 };
             peer.last_qos_rate_check = Some(now);
-            (peer.qos_rate_count, self.bonding_options_for_peer_static(address))
+            (peer.qos_rate_count, self.bonding_options_for_peer_locked(address))
         };
         if count >= u16::try_from(MAX_PEER_PATHS * 2).unwrap_or(u16::MAX) {
             return;
@@ -1127,7 +1126,7 @@ impl Node {
         if payload.len() < 10 || payload.len() > QOS_MEASUREMENT_MAX_SIZE || !payload.len().is_multiple_of(10) {
             return;
         }
-        if !bond_path_allowed(key, &options) {
+        if !bond_path_allowed(key, options) {
             return;
         }
         let Some(peer) = self.peers.get_mut(&address) else {
@@ -1158,9 +1157,10 @@ impl Node {
         }
     }
 
-    /// Resolves bond options without holding a peer borrow.
-    fn bonding_options_for_peer_static(&self, address: Address) -> BondingOptions {
-        self.bonding_options_for_peer_locked(address)
+    /// Resolves bond options as an owned value, for callers that keep them across a mutable borrow
+    /// of the node.
+    pub(crate) fn bonding_options_for_peer_static(&self, address: Address) -> BondingOptions {
+        self.bonding_options_for_peer_locked(address).clone()
     }
 
     #[expect(
@@ -1291,7 +1291,6 @@ impl Node {
             return;
         };
         let policy = self.bonding_policy_for_peer_locked(address);
-        let options = self.bonding_options_for_peer_locked(address);
         let window = BOND_NEGOTIATION_WINDOW / u32::try_from(MAX_PEER_PATHS).unwrap_or(u32::MAX);
         let (count, negotiated_at, local_utility) = {
             let Some(peer) = self.peers.get_mut(&address) else {
@@ -1312,6 +1311,7 @@ impl Node {
         if policy != BondingPolicy::ActiveBackup {
             return;
         }
+        let options = self.bonding_options_for_peer_static(address);
         if options.link_select_method != BondingLinkSelectMethod::Optimize {
             return;
         }
@@ -1342,46 +1342,30 @@ pub fn contains_path(paths: &[PathKey], wanted: PathKey) -> bool {
     paths.contains(&wanted)
 }
 
-/// Applies the configured bonding-link policy to `key`.
+/// Applies the configured bonding-link policy to `key`. An empty table is the implicit
+/// single-socket link, which allows everything.
 #[must_use]
 pub fn bond_path_allowed(key: PathKey, options: &BondingOptions) -> bool {
-    let (link, configured) = bonding_link_for_socket(options, key.local_socket);
-    configured && !link.disabled && bonding_link_allows_address(&link, key.endpoint.ip())
+    if options.links.is_empty() {
+        return true;
+    }
+    bonding_link_for_socket(options, key.local_socket)
+        .is_some_and(|link| !link.disabled && bonding_link_allows_address(link, key.endpoint.ip()))
 }
 
-/// The configured physical link for a local socket, or the implicit
-/// single-socket link used when none is configured.
+/// The configured physical link owning `local_socket`, when the options table names one.
 #[must_use]
-pub fn bonding_link_for_socket(options: &BondingOptions, local_socket: i64) -> (BondingLink, bool) {
+pub fn bonding_link_for_socket(options: &BondingOptions, local_socket: i64) -> Option<&BondingLink> {
+    options.links.iter().find(|link| link.local_sockets.contains(&local_socket))
+}
+
+/// The capacity of the link owning `local_socket`: the implicit single-socket link when the table
+/// is empty, and none when the table does not name the socket.
+fn bond_link_capacity(options: &BondingOptions, local_socket: i64) -> u32 {
     if options.links.is_empty() {
-        return (
-            BondingLink {
-                name: local_socket.to_string(),
-                local_sockets: vec![local_socket],
-                capacity: 1,
-                ip_preference: 0,
-                mode: BondingLinkMode::Primary,
-                failover_to: String::new(),
-                disabled: false,
-            },
-            true,
-        );
+        return 1;
     }
-    match options.links.iter().find(|link| link.local_sockets.contains(&local_socket)) {
-        Some(link) => (link.clone(), true),
-        None => (
-            BondingLink {
-                name: String::new(),
-                local_sockets: Vec::new(),
-                capacity: 0,
-                ip_preference: 0,
-                mode: BondingLinkMode::Primary,
-                failover_to: String::new(),
-                disabled: false,
-            },
-            false,
-        ),
-    }
+    bonding_link_for_socket(options, local_socket).map_or(0, |link| link.capacity)
 }
 
 fn bonding_link_allows_address(link: &BondingLink, address: IpAddr) -> bool {
@@ -1408,21 +1392,24 @@ pub fn select_bonded_link_paths(paths: &[PathKey], options: &BondingOptions) -> 
     if paths.is_empty() {
         return Vec::new();
     }
-    let have_primary = paths.iter().any(|key| {
-        let (link, _) = bonding_link_for_socket(options, key.local_socket);
-        link.mode == BondingLinkMode::Primary
-    });
+    let have_primary = paths
+        .iter()
+        .any(|key| bonding_link_for_socket(options, key.local_socket).is_none_or(|link| link.mode == BondingLinkMode::Primary));
     let mut by_link: Vec<(String, Vec<PathKey>)> = Vec::new();
     for key in paths {
-        let (link, _) = bonding_link_for_socket(options, key.local_socket);
-        if (have_primary && link.mode == BondingLinkMode::Spare)
-            || (!have_primary && link.mode != BondingLinkMode::Spare)
-        {
+        let link = bonding_link_for_socket(options, key.local_socket);
+        let mode = link.map_or(BondingLinkMode::Primary, |link| link.mode);
+        if (have_primary && mode == BondingLinkMode::Spare) || (!have_primary && mode != BondingLinkMode::Spare) {
             continue;
         }
-        match by_link.iter_mut().find(|(name, _)| *name == link.name) {
+        // An empty table is the implicit single-socket link, whose name is the socket itself.
+        let name = link.map_or_else(
+            || if options.links.is_empty() { key.local_socket.to_string() } else { String::new() },
+            |link| link.name.clone(),
+        );
+        match by_link.iter_mut().find(|(known, _)| *known == name) {
             Some((_, candidates)) => candidates.push(*key),
-            None => by_link.push((link.name.clone(), vec![*key])),
+            None => by_link.push((name, vec![*key])),
         }
     }
     let mut result = Vec::with_capacity(paths.len());
@@ -1430,15 +1417,16 @@ pub fn select_bonded_link_paths(paths: &[PathKey], options: &BondingOptions) -> 
         let Some(first) = candidates.first().copied() else {
             continue;
         };
-        let (link, _) = bonding_link_for_socket(options, first.local_socket);
-        if matches!(link.ip_preference, 46 | 64) {
-            let preferred: Vec<PathKey> = candidates
-                .iter()
-                .copied()
-                .filter(|key| bonding_link_prefers_address(&link, key.endpoint.ip()))
-                .collect();
-            if !preferred.is_empty() {
-                candidates = preferred;
+        if let Some(link) = bonding_link_for_socket(options, first.local_socket) {
+            if matches!(link.ip_preference, 46 | 64) {
+                let preferred: Vec<PathKey> = candidates
+                    .iter()
+                    .copied()
+                    .filter(|key| bonding_link_prefers_address(link, key.endpoint.ip()))
+                    .collect();
+                if !preferred.is_empty() {
+                    candidates = preferred;
+                }
             }
         }
         result.extend(candidates);
@@ -1541,14 +1529,14 @@ pub fn initial_active_backup_path(paths: &[PathKey], options: &BondingOptions) -
     }
     let mut primary = None;
     for key in paths {
-        let (link, _) = bonding_link_for_socket(options, key.local_socket);
-        if link.mode != BondingLinkMode::Primary {
+        let link = bonding_link_for_socket(options, key.local_socket);
+        if link.is_some_and(|link| link.mode != BondingLinkMode::Primary) {
             continue;
         }
         if primary.is_none() {
             primary = Some(*key);
         }
-        if bonding_link_prefers_address(&link, key.endpoint.ip()) {
+        if link.is_none_or(|link| bonding_link_prefers_address(link, key.endpoint.ip())) {
             return Some(*key);
         }
     }
@@ -1909,6 +1897,17 @@ mod tests {
         );
     }
 
+    /// The link lookup runs per packet, so it must borrow the configured link instead of copying it.
+    #[test]
+    fn the_link_lookup_borrows_the_configured_link() {
+        let (options, _, _) = role_options(BondingLinkSelectMethod::Always);
+        let configured = &options.links[0].name;
+
+        let link = bonding_link_for_socket(&options, 0).expect("socket 0 owns a configured link");
+
+        assert!(std::ptr::eq(configured, &link.name), "the lookup must borrow the configured link");
+    }
+
     fn role_options(method: BondingLinkSelectMethod) -> (BondingOptions, PathKey, PathKey) {
         let options = normalize_bonding_options(BondingOptionsInput {
             link_select_method: Some(method),
@@ -2202,11 +2201,7 @@ mod tests {
 
         node.expire_qos_records_locked(address, path, now, Duration::from_secs(3));
 
-        assert_eq!(
-            node.peers[&address].paths[&path].loss,
-            0.1 * 0.95 + 0.05,
-            "the terms multiply and add separately"
-        );
+        assert_eq!(node.peers[&address].paths[&path].loss, 0.1 * 0.95 + 0.05, "the terms multiply and add separately");
     }
 
     #[test]
