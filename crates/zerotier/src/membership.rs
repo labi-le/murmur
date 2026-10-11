@@ -325,6 +325,39 @@ mod tests {
         parsed
     }
 
+    /// An unsigned certificate whose timestamp qualifier is repeated, which the parse accepts.
+    fn repeated_timestamp_certificate() -> CertificateOfMembership {
+        let mut raw = vec![1u8];
+        raw.extend_from_slice(&4u16.to_be_bytes());
+        for (id, value) in [
+            (QUALIFIER_TIMESTAMP, 1u64),
+            (QUALIFIER_TIMESTAMP, 2),
+            (QUALIFIER_NETWORK, 3),
+            (QUALIFIER_MEMBER, 4),
+        ] {
+            raw.extend_from_slice(&id.to_be_bytes());
+            raw.extend_from_slice(&value.to_be_bytes());
+            raw.extend_from_slice(&0u64.to_be_bytes());
+        }
+        raw.extend_from_slice(&[0u8; ADDRESS_SIZE]);
+        CertificateOfMembership::parse(&raw).expect("parses").0
+    }
+
+    /// The reference reads a repeated qualifier id two ways: its accessors take the first record and
+    /// its agreement map takes the last.
+    #[test]
+    fn a_repeated_qualifier_id_is_first_for_the_accessors_and_last_for_agreement() {
+        let certificate = repeated_timestamp_certificate();
+
+        assert_eq!(certificate.qualifiers.len(), 4);
+        assert_eq!(certificate.timestamp(), 1, "the accessor reads the first record, as the reference's does");
+        assert_eq!(
+            last_qualifier_value(&certificate.qualifiers, QUALIFIER_TIMESTAMP),
+            Some(2),
+            "the agreement lookup reads the last record, as the reference's map does"
+        );
+    }
+
     #[test]
     fn a_controller_signed_certificate_verifies() {
         let controller_identity = Identity::generate();
