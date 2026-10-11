@@ -8,8 +8,8 @@
 //! `read_at_least_from` (a robust multi-read loop) rather than the single-read probe-detection path.
 //!
 //! The bloom-filter-backed replay cache has no crate mirror; this
-//! uses a plain time-windowed `HashSet` guarded by a `parking_lot::Mutex` instead, pruned on
-//! every check. It rejects a replayed AuthID exactly as the filter does; only the false-positive
+//! uses a plain time-windowed `HashSet` guarded by a `parking_lot::Mutex` instead, swept once per
+//! window. It rejects a replayed AuthID exactly as the filter does; only the false-positive
 //! rate under extreme memory pressure differs, which is not wire-visible.
 
 use std::collections::HashMap;
@@ -59,13 +59,43 @@ impl core::fmt::Debug for UserEntry {
     }
 }
 
+/// The window an AuthID is remembered for, and the age past which a replay entry is dead.
+const REPLAY_WINDOW: Duration = Duration::from_secs(120);
+
+/// The sweep runs only when a window has passed since the last one, and the lookup ages the
+/// single entry it reads, so an entry that is present but stale is still treated as absent.
+#[derive(Debug)]
+struct ReplaySet {
+    seen: HashMap<[u8; 16], Instant>,
+    last_sweep: Instant,
+}
+
+impl ReplaySet {
+    fn new() -> Self {
+        Self { seen: HashMap::new(), last_sweep: Instant::now() }
+    }
+
+    fn check(&mut self, decoded_id: &[u8; 16]) -> bool {
+        let now = Instant::now();
+        if now.duration_since(self.last_sweep) > REPLAY_WINDOW {
+            self.seen.retain(|_, seen_at| now.duration_since(*seen_at) < REPLAY_WINDOW);
+            self.last_sweep = now;
+        }
+        if self.seen.get(decoded_id).is_some_and(|seen_at| now.duration_since(*seen_at) < REPLAY_WINDOW) {
+            return false;
+        }
+        self.seen.insert(*decoded_id, now);
+        true
+    }
+}
+
 /// The service's replay-relevant state, minus the legacy alter-id maps (see
 /// the module doc) and the mux/handler dispatch, which the caller (`listener::sing_vmess`) owns.
 #[derive(Debug)]
 pub struct Service {
     users: SyncMutex<Vec<UserEntry>>,
     time_func: fn() -> DateTime<Utc>,
-    replay: SyncMutex<HashMap<[u8; 16], Instant>>,
+    replay: SyncMutex<ReplaySet>,
 }
 
 /// The outcome of a successful accept: the caller dispatches on `command`.
@@ -88,7 +118,7 @@ impl core::fmt::Debug for Accepted {
 
 impl Service {
     pub fn new(time_func: fn() -> DateTime<Utc>) -> Self {
-        Self { users: SyncMutex::new(Vec::new()), time_func, replay: SyncMutex::new(HashMap::new()) }
+        Self { users: SyncMutex::new(Vec::new()), time_func, replay: SyncMutex::new(ReplaySet::new()) }
     }
 
     pub fn update_users(&self, usernames: &[String], uuids: &[String], alter_ids: &[i32]) -> Result<()> {
@@ -105,14 +135,7 @@ impl Service {
     }
 
     fn check_replay(&self, decoded_id: &[u8; 16]) -> bool {
-        let mut seen = self.replay.lock();
-        let now = Instant::now();
-        seen.retain(|_, t| now.duration_since(*t) < Duration::from_secs(120));
-        if seen.contains_key(decoded_id) {
-            return false;
-        }
-        seen.insert(*decoded_id, now);
-        true
+        self.replay.lock().check(decoded_id)
     }
 
     /// Accepts a connection (AEAD-2 branch only).
@@ -516,6 +539,35 @@ mod tests {
         }
     }
 
+    /// A stale replay entry must survive a check inside the window: the sweep is throttled to one
+    /// run per window, not one run per accepted connection.
+    #[test]
+    fn replay_check_sweeps_the_set_only_once_per_window() {
+        let service = Service::new(Utc::now);
+        let stale = [0xAA; 16];
+        service.replay.lock().seen.insert(stale, Instant::now() - Duration::from_secs(121));
+        assert!(service.check_replay(&[0xBB; 16]));
+        assert!(service.replay.lock().seen.contains_key(&stale), "a check inside the window must not sweep the set");
+
+        service.replay.lock().last_sweep = Instant::now() - Duration::from_secs(121);
+        assert!(service.check_replay(&[0xCC; 16]));
+        assert!(!service.replay.lock().seen.contains_key(&stale), "the first check past the window sweeps it");
+    }
+
+    /// The throttle must not weaken replay rejection: the same AuthID stays refused for the whole
+    /// window, and an entry past it stops being a replay even before a sweep drops it.
+    #[test]
+    fn replay_rejection_keeps_the_window_between_sweeps() {
+        let service = Service::new(Utc::now);
+        let id = [0x42; 16];
+        assert!(service.check_replay(&id), "first sighting is accepted");
+        assert!(!service.check_replay(&id), "the same AuthID inside the window is a replay");
+
+        let aged = [0x43; 16];
+        service.replay.lock().seen.insert(aged, Instant::now() - Duration::from_secs(121));
+        assert!(service.check_replay(&aged), "an entry past the window is no longer a replay, swept or not");
+    }
+
     /// `ReviewSingVmess` finding 7: `alter_id > 0` must load (via `update_users`), matching the
     /// refactor contract's frozen YAML-acceptance surface. Fails on
     /// 3cfb750b, which rejects the whole user list outright.
@@ -524,10 +576,7 @@ mod tests {
         let service = Service::new(Utc::now);
         let uuid = Uuid::new_v4().to_string();
         let result = service.update_users(&["alice".to_owned()], &[uuid], &[64]);
-        assert!(
-            result.is_ok(),
-            "alterId > 0 must load, not fail UpdateUsers: {result:?}"
-        );
+        assert!(result.is_ok(), "alterId > 0 must load, not fail UpdateUsers: {result:?}");
     }
 
     /// Companion to the above: accept matches AEAD AuthIDs across all users
