@@ -1,5 +1,7 @@
 use std::collections::VecDeque;
 
+use murmur_log::warnln;
+
 use super::strmatcher::Type;
 
 pub(crate) const VALID_CHAR_COUNT: usize = 53;
@@ -31,8 +33,7 @@ const fn new_node() -> [Edge; VALID_CHAR_COUNT] {
     [Edge { edge_type: FAIL_EDGE, next_node: 0 }; VALID_CHAR_COUNT]
 }
 
-/// `char2Index`: the array is sized by its largest key `'~'`, so a byte above that range indexes
-/// out of bounds.
+/// `char2Index`: the table's keys run to `'~'`, the largest byte an LDH host or pattern can carry.
 #[expect(
     clippy::indexing_slicing,
     clippy::cast_possible_truncation,
@@ -72,13 +73,9 @@ const CHAR2_INDEX: [u8; 127] = {
     t
 };
 
-#[expect(
-    clippy::indexing_slicing,
-    reason = "a byte above `~` is outside the table's 127 entries and must panic; a `get` fallback \
-              would silently fold every such byte onto slot 0"
-)]
-const fn char2_index(c: u8) -> usize {
-    CHAR2_INDEX[c as usize] as usize
+/// A byte at or above `0x7F` has no slot in the table.
+fn char2_index(c: u8) -> Option<usize> {
+    CHAR2_INDEX.get(c as usize).copied().map(usize::from)
 }
 
 #[must_use]
@@ -97,10 +94,16 @@ impl ACAutomaton {
                   both arrays are in bounds; a `get` fallback would silently drop an edge"
     )]
     pub fn add(&mut self, domain: &str, t: Type) {
+        if domain.as_bytes().iter().any(|&byte| char2_index(byte).is_none()) {
+            // `match_` rejects the same byte, so the pattern could never be matched; dropping it
+            // keeps the automaton ASCII-only instead of panicking at load.
+            warnln!("geosite pattern is not ASCII, dropped: {domain}");
+            return;
+        }
         let bytes = domain.as_bytes();
         let mut node = 0usize;
         for &byte in bytes.iter().rev() {
-            let idx = char2_index(byte);
+            let Some(idx) = char2_index(byte) else { return };
             if self.trie[node][idx].next_node == 0 {
                 self.count += 1;
                 if self.trie.len() < self.count + 1 {
@@ -115,7 +118,7 @@ impl ACAutomaton {
         self.exists[node] = MatchType { match_type: t, exist: true };
         if t == Type::Domain {
             self.exists[node] = MatchType { match_type: Type::Full, exist: true };
-            let idx = char2_index(b'.');
+            let Some(idx) = char2_index(b'.') else { return };
             if self.trie[node][idx].next_node == 0 {
                 self.count += 1;
                 if self.trie.len() < self.count + 1 {
@@ -164,7 +167,7 @@ impl ACAutomaton {
     #[must_use]
     #[expect(
         clippy::indexing_slicing,
-        reason = "`node` is a node id `add` allocated and `idx` comes from the char2Index table, so \
+        reason = "`node` is a node id `add` allocated and `idx` is a slot `char2_index` produced, so \
                   both rows are in bounds"
     )]
     pub fn match_(&self, s: &str) -> bool {
@@ -172,7 +175,7 @@ impl ACAutomaton {
         let mut node = 0usize;
         let mut full_match = true;
         for &byte in bytes.iter().rev() {
-            let idx = char2_index(byte);
+            let Some(idx) = char2_index(byte) else { return false };
             full_match = full_match && self.trie[node][idx].edge_type;
             node = self.trie[node][idx].next_node;
             if self.exists[node].match_type == Type::Substr {
@@ -183,5 +186,27 @@ impl ACAutomaton {
             }
         }
         full_match && self.exists[node].exist
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::Type;
+    use crate::strmatcher::mph_matcher::MphMatcherGroup;
+
+    #[test]
+    fn matching_a_non_ascii_host_reports_no_match_instead_of_panicking() {
+        let mut group = MphMatcherGroup::new_mph_matcher_group();
+        group.add_pattern("keyword", Type::Substr).unwrap();
+        group.build();
+        assert!(group.match_("例え.jp").is_empty());
+    }
+
+    #[test]
+    fn adding_a_non_ascii_pattern_does_not_panic() {
+        let mut group = MphMatcherGroup::new_mph_matcher_group();
+        group.add_pattern("例", Type::Substr).unwrap();
+        group.build();
+        assert!(group.match_("例").is_empty());
     }
 }
