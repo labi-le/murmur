@@ -2265,7 +2265,7 @@ mod tests {
     #[tokio::test]
     async fn a_device_reporting_more_than_the_buffer_holds_stops_the_reader() {
         let device = Arc::new(OversizedDevice::new(1500));
-        let stack = NetworkStack::spawn(Arc::clone(&device) as Arc<dyn IpStack>);
+        let stack = NetworkStack::spawn(Arc::clone(&device));
 
         assert!(
             matches!(
