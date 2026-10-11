@@ -791,7 +791,7 @@ pub mod connectip {
         send: Arc<tokio::sync::Mutex<h3::StreamSend>>,
         state: Arc<Mutex<ConnState>>,
         writes: mpsc::Sender<WriteCapsule>,
-        datagrams: mpsc::Receiver<Bytes>,
+        datagrams: h3::DatagramReceiver,
         close_notify: CancellationToken,
         hconn: Arc<h3::ClientConn>,
         stream_id: u64,
@@ -1053,7 +1053,7 @@ pub mod connectip {
     /// Receives one datagram, fed by the connection's datagram dispatcher.
     // cancel-safe: awaits only a token's `cancelled()` (or `pending()`) and a `recv()` on a channel, both of which can be dropped and re-polled.
     async fn receive_datagram(
-        datagrams: &mut mpsc::Receiver<Bytes>,
+        datagrams: &mut h3::DatagramReceiver,
         ctx: Option<&CancellationToken>,
     ) -> anyhow::Result<Bytes> {
         let received = tokio::select! {
@@ -1650,6 +1650,14 @@ pub mod h3 {
         Ok((frame_type, length))
     }
 
+    /// Drops the routing entries whose receiver is gone, so a table entry cannot outlive the code
+    /// that reads from it; returns how many were removed.
+    fn prune_closed_datagram_streams(streams: &mut HashMap<u64, mpsc::Sender<Bytes>>) -> usize {
+        let before = streams.len();
+        streams.retain(|_stream_id, sender| !sender.is_closed());
+        before - streams.len()
+    }
+
     #[derive(Debug, Clone, Default, PartialEq, Eq)]
     pub struct Settings {
         pub enable_datagrams: bool,
@@ -1883,10 +1891,17 @@ pub mod h3 {
             }
         }
 
-        fn register_datagram_stream(&self, stream_id: u64) -> mpsc::Receiver<Bytes> {
+        fn unregister_datagram_stream(&self, stream_id: u64) {
+            self.datagram_streams.lock().remove(&stream_id);
+        }
+
+        fn register_datagram_stream(self: &Arc<Self>, stream_id: u64) -> DatagramReceiver {
             let (sender, receiver) = mpsc::channel(STREAM_DATAGRAM_QUEUE_LEN);
-            self.datagram_streams.lock().insert(stream_id, sender);
-            receiver
+            let mut streams = self.datagram_streams.lock();
+            prune_closed_datagram_streams(&mut streams);
+            streams.insert(stream_id, sender);
+            drop(streams);
+            DatagramReceiver { conn: Arc::clone(self), stream_id, receiver }
         }
 
         /// Sends a datagram, prefixing the quarter stream ID.
@@ -2359,11 +2374,40 @@ pub mod h3 {
         valid_header_field_name(value)
     }
 
+    /// The receive half of a request stream's datagrams. It owns the connection's routing entry for
+    /// the stream, so dropping it removes that entry and the table stays bounded by the streams
+    /// that are still alive.
+    pub struct DatagramReceiver {
+        conn: Arc<ClientConn>,
+        stream_id: u64,
+        receiver: mpsc::Receiver<Bytes>,
+    }
+
+    impl fmt::Debug for DatagramReceiver {
+        fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+            f.debug_struct("DatagramReceiver").field("stream_id", &self.stream_id).finish_non_exhaustive()
+        }
+    }
+
+    impl DatagramReceiver {
+        /// The next datagram of the stream; `None` once the connection's dispatcher is gone.
+        // cancel-safe: a channel `recv` leaves the item queued, so a dropped call loses nothing.
+        pub async fn recv(&mut self) -> Option<Bytes> {
+            self.receiver.recv().await
+        }
+    }
+
+    impl Drop for DatagramReceiver {
+        fn drop(&mut self) {
+            self.conn.unregister_datagram_stream(self.stream_id);
+        }
+    }
+
     /// A request stream, with the request head written by [`RequestStream::send_request_header`].
     pub struct RequestStream {
         send: StreamSend,
         recv: StreamRecv,
-        datagrams: mpsc::Receiver<Bytes>,
+        datagrams: DatagramReceiver,
     }
 
     impl fmt::Debug for RequestStream {
@@ -2490,7 +2534,7 @@ pub mod h3 {
         }
 
         #[must_use]
-        pub fn split(self) -> (StreamSend, StreamRecv, mpsc::Receiver<Bytes>) {
+        pub fn split(self) -> (StreamSend, StreamRecv, DatagramReceiver) {
             (self.send, self.recv, self.datagrams)
         }
     }
@@ -3230,6 +3274,10 @@ pub mod h3 {
             (stream, send)
         }
 
+        fn datagram_stream_count(conn: &ClientConn) -> usize {
+            conn.datagram_streams.lock().len()
+        }
+
         #[tokio::test]
         async fn a_settings_frame_longer_than_the_cap_closes_the_connection_instead_of_allocating() {
             let pair = connect_pair().await;
@@ -3300,6 +3348,43 @@ pub mod h3 {
 
             let response = timeout(FRAME_TIMEOUT, stream.read_response()).await.expect("the response arrives");
             assert_eq!(response.expect("a response within the caps").status_code, 200);
+        }
+
+        #[tokio::test]
+        async fn a_closed_request_stream_releases_its_datagram_routing_entry() {
+            let pair = connect_pair().await;
+            for _ in 0..8 {
+                let stream = pair.client.open_request_stream(None).await.expect("open a request stream");
+                assert_eq!(datagram_stream_count(&pair.client), 1, "a live stream owns one routing entry");
+                let (_send, _recv, datagrams) = stream.split();
+                drop(datagrams);
+            }
+
+            assert_eq!(datagram_stream_count(&pair.client), 0, "every closed stream releases its routing entry");
+        }
+
+        #[tokio::test]
+        async fn dropping_a_request_stream_releases_its_datagram_routing_entry() {
+            let pair = connect_pair().await;
+            let stream = pair.client.open_request_stream(None).await.expect("open a request stream");
+            assert_eq!(datagram_stream_count(&pair.client), 1);
+
+            drop(stream);
+            assert_eq!(datagram_stream_count(&pair.client), 0);
+        }
+
+        #[test]
+        fn pruning_drops_only_the_routing_entries_whose_receiver_is_gone() {
+            let mut streams: HashMap<u64, mpsc::Sender<Bytes>> = HashMap::new();
+            let (live, _live_receiver) = mpsc::channel::<Bytes>(1);
+            let (dead, dead_receiver) = mpsc::channel::<Bytes>(1);
+            drop(dead_receiver);
+            streams.insert(4, live);
+            streams.insert(8, dead);
+
+            assert_eq!(prune_closed_datagram_streams(&mut streams), 1);
+            assert_eq!(streams.len(), 1);
+            assert!(streams.contains_key(&4));
         }
     }
 }
