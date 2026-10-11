@@ -47,14 +47,14 @@ pub(crate) fn new_system_client() -> Arc<dyn DnsClient> {
 #[async_trait]
 impl DnsClient for SystemClient {
     async fn exchange_context(&self, ctx: &CancellationToken, m: &Message) -> Result<Message> {
-        let (mut clients, mut err) = match self.get_dns_clients() {
-            Ok(clients) => (clients, None),
-            Err(err) => (Vec::new(), Some(err)),
-        };
-        if clients.is_empty() && !self.default_ns.is_empty() {
-            clients = self.default_ns.clone();
-            err = None;
+        let config_err = self.refresh_dns_config().await;
+        let mut clients = self.get_dns_clients();
+        let no_cache = clients.is_empty();
+        if no_cache && !self.default_ns.is_empty() {
+            clients.clone_from(&self.default_ns);
         }
+        // A read failure is only fatal when neither the cache nor the built-in set has anything.
+        let err = if no_cache && self.default_ns.is_empty() { config_err } else { None };
         if let Some(err) = err {
             return Err(err);
         }
@@ -63,7 +63,7 @@ impl DnsClient for SystemClient {
     }
 
     fn address(&self) -> String {
-        let mut clients = self.get_dns_clients().unwrap_or_default();
+        let mut clients = self.get_dns_clients();
         let is_default = if clients.is_empty() && !self.default_ns.is_empty() {
             clients.clone_from(&self.default_ns);
             "[defaultNS]"
@@ -107,4 +107,21 @@ pub fn init() {
     let mut resolvers = Resolvers::new(Config::default());
     resolvers.resolver.main = vec![c];
     set_system_resolver(Some(Arc::new(resolvers.resolver)));
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// `address` is synchronous, so the reopen of the flush window must not be served from the sync
+    /// accessor: it reports the cache, and the read belongs to `refresh_dns_config`.
+    #[test]
+    fn the_sync_accessor_reports_the_cache_without_reading_the_platform_configuration() {
+        let client = new_system_client_with_default_ns(Vec::new());
+
+        assert!(
+            client.get_dns_clients().is_empty(),
+            "the synchronous accessor answered from the platform configuration instead of the cache"
+        );
+    }
 }
