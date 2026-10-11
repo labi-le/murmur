@@ -2180,16 +2180,12 @@ mod tests {
     /// hostile device would; no shipped device does.
     struct OversizedDevice {
         mtu: u32,
-        reads: std::sync::atomic::AtomicUsize,
+        reads: Arc<std::sync::atomic::AtomicUsize>,
     }
 
     impl OversizedDevice {
         fn new(mtu: u32) -> Self {
-            Self { mtu, reads: std::sync::atomic::AtomicUsize::new(0) }
-        }
-
-        fn reads(&self) -> usize {
-            self.reads.load(Ordering::SeqCst)
+            Self { mtu, reads: Arc::new(std::sync::atomic::AtomicUsize::new(0)) }
         }
     }
 
@@ -2262,8 +2258,8 @@ mod tests {
     #[tokio::test]
     async fn a_device_reporting_more_than_the_buffer_holds_stops_the_reader() {
         let device = Arc::new(OversizedDevice::new(1500));
-        let reader: Arc<dyn IpStack> = Arc::clone(&device);
-        let stack = NetworkStack::spawn(reader);
+        let reads = Arc::clone(&device.reads);
+        let stack = NetworkStack::spawn(device);
 
         assert!(
             matches!(
@@ -2272,7 +2268,7 @@ mod tests {
             ),
             "the reader must stop instead of queueing a truncated frame"
         );
-        assert_eq!(device.reads(), 1, "the oversized report ended the read loop");
+        assert_eq!(reads.load(Ordering::SeqCst), 1, "the oversized report ended the read loop");
     }
 
     /// Abandoning a start must stop the runtime thread it spawned, or the next start runs a second
