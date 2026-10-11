@@ -4,6 +4,7 @@
 //! Linux batching and the out-of-band channel are out of scope: neither is part of the required
 //! trait surface, and an out-of-band packet from a peer is simply dropped.
 
+use std::collections::hash_map::Entry;
 use std::collections::HashMap;
 use std::io;
 use std::net::SocketAddr;
@@ -378,7 +379,16 @@ impl Shared {
             eng.kcp.flush(crate::core::FlushType::Full);
         }
         if let Some(listener) = &self.listener {
-            listener.sessions.lock().remove(&self.remote);
+            // Remove the entry only while it still is this session: a teardown parked between its
+            // cancel and this statement must not evict a replacement admitted for the same address
+            // meanwhile.
+            let this = std::ptr::from_ref(self);
+            let mut sessions = listener.sessions.lock();
+            if let Entry::Occupied(entry) = sessions.entry(self.remote) {
+                if std::ptr::eq(Arc::as_ptr(&entry.get().0), this) {
+                    entry.remove();
+                }
+            }
         } else if self.own_conn {
             let _ = self.conn.close();
         }
@@ -1108,5 +1118,45 @@ mod tests {
             tokio::time::sleep(Duration::from_millis(100)).await;
             assert_eq!(session_count(&listener), 2, "the refused clients keep retransmitting into a full table");
         }
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_replacement_admitted_during_a_teardown_survives_it() {
+        let (listener, addr) = listener_with(ListenerLimits::default()).await;
+        let stale = new_session(1, addr, Arc::clone(&listener.conn), false, None, 0, 0, Some(Arc::clone(&listener)));
+        listener.sessions.lock().insert(addr, stale.clone());
+        let replacement =
+            new_session(2, addr, Arc::clone(&listener.conn), false, None, 0, 0, Some(Arc::clone(&listener)));
+        let teardown = tokio::spawn({
+            let closing = stale.clone();
+            async move { closing.0.close_now() }
+        });
+
+        {
+            // The table lock is what the teardown re-enters after cancelling its token: holding it
+            // parks the teardown between its cancel and its removal, which is the racing window.
+            let mut table = listener.sessions.lock();
+            let deadline = Instant::now() + Duration::from_secs(5);
+            while !stale.0.closed.is_cancelled() {
+                assert!(Instant::now() < deadline, "the teardown never reached its removal");
+                std::thread::yield_now();
+            }
+            table.insert(addr, replacement.clone());
+        }
+
+        teardown.await.expect("teardown task");
+        let stored = listener.sessions.lock().get(&addr).map(|stored| stored.0.conv);
+        assert_eq!(stored, Some(2), "the replacement must survive the stale teardown");
+    }
+
+    #[tokio::test]
+    async fn a_teardown_removes_the_table_entry_it_owns() {
+        let (listener, addr) = listener_with(ListenerLimits::default()).await;
+        let session = new_session(1, addr, Arc::clone(&listener.conn), false, None, 0, 0, Some(Arc::clone(&listener)));
+        listener.sessions.lock().insert(addr, session.clone());
+
+        session.0.close_now();
+
+        assert_eq!(session_count(&listener), 0, "a teardown must remove its own entry");
     }
 }
