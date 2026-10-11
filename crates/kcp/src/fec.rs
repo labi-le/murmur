@@ -40,7 +40,7 @@ fn autotuned_split(
 ) -> Option<(usize, usize)> {
     let auto_data = usize::try_from(auto_data).ok()?;
     let auto_parity = usize::try_from(auto_parity).ok()?;
-    if auto_data == 0 || auto_parity == 0 || auto_data + auto_parity >= 256 {
+    if auto_data == 0 || auto_parity == 0 || auto_data + auto_parity > 256 {
         return None;
     }
     if auto_data == data_shards && auto_parity == parity_shards {
@@ -184,9 +184,12 @@ impl FecDecoder {
                     self.codec = codec;
                     let width = shard_size_u32(self.shard_size);
                     self.paws = u32::MAX / width * width;
-                    self.should_tune = false;
                 }
             }
+            // The attempt is done either way: `None` is "nothing to adopt", not "still tuning".
+            // Leaving this set would return early on every later packet and silently stop
+            // recovering lost shards.
+            self.should_tune = false;
             return Vec::new();
         }
 
@@ -398,4 +401,18 @@ impl FecEncoder {
 fn now_millis() -> i64 {
     use std::time::{SystemTime, UNIX_EPOCH};
     SystemTime::now().duration_since(UNIX_EPOCH).map_or(0, |d| i64::try_from(d.as_millis()).unwrap_or(i64::MAX))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// `FecDecoder::new` accepts a split summing to 256 shards, so the autotuner must not call the
+    /// same split unadoptable.
+    #[test]
+    fn a_split_summing_to_the_two_hundred_and_fifty_six_shard_ceiling_is_adoptable() {
+        assert_eq!(autotuned_split(200, 56, 3, 2), Some((200, 56)));
+        assert_eq!(autotuned_split(201, 56, 3, 2), None, "257 shards exceed the ceiling");
+        assert_eq!(autotuned_split(0, 56, 3, 2), None, "a zero shard count is not a split");
+    }
 }

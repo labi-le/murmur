@@ -25,7 +25,7 @@
     clippy::nursery
 )]
 
-use murmur_kcp::fec::{FecDecoder, FecEncoder, FEC_HEADER_SIZE_PLUS2};
+use murmur_kcp::fec::{FecDecoder, FecEncoder, FEC_HEADER_SIZE_PLUS2, TYPE_PARITY};
 
 fn make_packet(payload: &[u8]) -> Vec<u8> {
     let mut buf = vec![0u8; FEC_HEADER_SIZE_PLUS2 + payload.len()];
@@ -47,6 +47,41 @@ fn frame_of(payload: &[u8]) -> Vec<u8> {
 fn frame_prefix(shard: &[u8]) -> Vec<u8> {
     let sz = u16::from_le_bytes([shard[0], shard[1]]) as usize;
     shard[..sz].to_vec()
+}
+
+/// A shard whose seqid sits in the data range of a `(3, 2)` split but whose flag says parity: one
+/// sample the autotuner cannot turn into a period.
+fn mismatched_flag_packet(seqid: u32) -> Vec<u8> {
+    let mut buf = vec![0u8; FEC_HEADER_SIZE_PLUS2 + 8];
+    buf[..4].copy_from_slice(&seqid.to_le_bytes());
+    buf[4..6].copy_from_slice(&TYPE_PARITY.to_le_bytes());
+    buf
+}
+
+#[test]
+fn a_single_mismatching_shard_does_not_disable_fec_recovery_for_the_rest_of_the_session() {
+    let mut enc = FecEncoder::new(3, 2, 0).expect("encoder");
+    let mut dec = FecDecoder::new(3, 2).expect("decoder");
+
+    let payloads: [&[u8]; 3] = [b"first-data-shard-payload", b"second-data-shard-payload", b"third-shard!"];
+    let mut data_packets = Vec::new();
+    let mut parity_packets = Vec::new();
+    for payload in payloads {
+        let mut pkt = make_packet(payload);
+        let ecc = enc.encode(&mut pkt, 500);
+        data_packets.push(pkt);
+        parity_packets.extend(ecc);
+    }
+
+    assert!(dec.decode(&mismatched_flag_packet(1)).is_empty(), "the mismatching shard is not recovery on its own");
+
+    // Shard 0 plus both parities reach the drain threshold with data shard 1 withheld.
+    assert!(dec.decode(&data_packets[0]).is_empty());
+    assert!(dec.decode(&parity_packets[0]).is_empty());
+    let recovered = dec.decode(&parity_packets[1]);
+
+    assert_eq!(recovered.len(), 2, "recovery must still reconstruct the absent shards");
+    assert_eq!(frame_prefix(&recovered[0]), frame_of(payloads[1]), "the lost shard must reconstruct byte-for-byte");
 }
 
 #[test]
