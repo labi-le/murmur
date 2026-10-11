@@ -235,7 +235,7 @@ async fn pull_loop(shared: Arc<PollConnShared>) {
             return;
         }
 
-        match stream_pull_lines(&shared, resp.into_body()).await {
+        match stream_pull_lines(&shared.queued_conn, resp.into_body()).await {
             Ok(true) => {
                 shared.queued_conn.mark_read_eof();
                 return;
@@ -276,14 +276,20 @@ enum PullStreamError {
     DecodeFailed(anyhow::Error),
 }
 
+/// Caps the unterminated remainder of the pull line buffer. The server encodes at most one 32 KiB
+/// downlink read per line (43693 base64 bytes and the newline), so this accepts every line the
+/// protocol produces while bounding a peer that never sends a newline.
+const MAX_PULL_LINE_BYTES: usize = 64 * 1024;
+
 /// The line-scanner loop inside the pull loop: reads base64 lines from the streamed
 /// response body and forwards decoded payloads to `rxc`. Returns `Ok(true)` when the
 /// [`TUNNEL_STREAM_EOF_HEADER`] trailer marks the session closed, `Ok(false)` at a clean end of
 /// stream (poll again).
-async fn stream_pull_lines(
-    shared: &Arc<PollConnShared>,
-    mut body: hyper::body::Incoming,
-) -> Result<bool, PullStreamError> {
+async fn stream_pull_lines<B, E>(queued_conn: &Arc<QueuedConn>, mut body: B) -> Result<bool, PullStreamError>
+where
+    B: BodyExt<Data = Bytes, Error = E> + Unpin,
+    E: Into<anyhow::Error>,
+{
     let mut pending: Vec<u8> = Vec::new();
     let mut trailer_eof = false;
 
@@ -314,12 +320,17 @@ async fn stream_pull_lines(
 
         while let Some(pos) = pending.iter().position(|&b| b == b'\n') {
             let line: Vec<u8> = pending.drain(..=pos).collect();
-            deliver_pull_line(shared, &line).await?;
+            deliver_pull_line(queued_conn, &line).await?;
+        }
+        if pending.len() > MAX_PULL_LINE_BYTES {
+            return Err(PullStreamError::Fatal(anyhow::anyhow!(
+                "poll pull line exceeds {MAX_PULL_LINE_BYTES} bytes without a newline"
+            )));
         }
     }
 
     if !pending.is_empty() {
-        deliver_pull_line(shared, &pending).await?;
+        deliver_pull_line(queued_conn, &pending).await?;
         pending.clear();
     }
 
@@ -329,7 +340,7 @@ async fn stream_pull_lines(
 /// the inner line-scan body: decodes one base64 line (trailing `\r\n`/`\n` stripped) and
 /// forwards the payload to `rxc`.
 // NOT cancel-safe: the decoded line is dropped if the hand-off send is cancelled.
-async fn deliver_pull_line(shared: &Arc<PollConnShared>, raw_line: &[u8]) -> Result<(), PullStreamError> {
+async fn deliver_pull_line(queued_conn: &Arc<QueuedConn>, raw_line: &[u8]) -> Result<(), PullStreamError> {
     let line = raw_line.strip_suffix(b"\n").unwrap_or(raw_line);
     let line = line.strip_suffix(b"\r").unwrap_or(line);
     if line.is_empty() {
@@ -340,12 +351,12 @@ async fn deliver_pull_line(shared: &Arc<PollConnShared>, raw_line: &[u8]) -> Res
         Err(err) => return Err(PullStreamError::DecodeFailed(anyhow::anyhow!("poll pull decode failed: {err}"))),
     };
     tokio::select! {
-        res = shared.queued_conn.rxc_tx.send(Bytes::from(payload)) => {
+        res = queued_conn.rxc_tx.send(Bytes::from(payload)) => {
             if res.is_err() {
                 return Err(PullStreamError::Closed);
             }
         }
-        () = shared.queued_conn.closed.cancelled() => return Err(PullStreamError::Closed),
+        () = queued_conn.closed.cancelled() => return Err(PullStreamError::Closed),
     }
     Ok(())
 }
@@ -571,4 +582,76 @@ where
         *pending_raw += piece.len();
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use std::collections::VecDeque;
+    use std::pin::Pin;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::task::{Context, Poll};
+
+    use hyper::body::{Body, Frame};
+
+    use super::*;
+
+    /// A body that yields chunks of `A` — never a newline — and counts what it handed out.
+    struct NewlineFreeBody {
+        chunks: VecDeque<Bytes>,
+        delivered: Arc<AtomicUsize>,
+    }
+
+    impl Body for NewlineFreeBody {
+        type Data = Bytes;
+        type Error = io::Error;
+
+        fn poll_frame(
+            mut self: Pin<&mut Self>,
+            _cx: &mut Context<'_>,
+        ) -> Poll<Option<Result<Frame<Bytes>, io::Error>>> {
+            let Some(chunk) = self.chunks.pop_front() else {
+                return Poll::Ready(None);
+            };
+            self.delivered.fetch_add(chunk.len(), Ordering::SeqCst);
+            Poll::Ready(Some(Ok(Frame::data(chunk))))
+        }
+    }
+
+    const CHUNK: usize = 16 * 1024;
+
+    #[tokio::test]
+    async fn pull_lines_fail_closed_once_a_line_outgrows_the_cap() {
+        let queued_conn = Arc::new(QueuedConn::new());
+        let delivered = Arc::new(AtomicUsize::new(0));
+        let body = NewlineFreeBody {
+            chunks: (0..8).map(|_| Bytes::from_static(&[b'A'; CHUNK])).collect(),
+            delivered: Arc::clone(&delivered),
+        };
+
+        let err = stream_pull_lines(&queued_conn, body).await.expect_err("a newline-free body must fail the pull");
+
+        let PullStreamError::Fatal(err) = err else {
+            panic!("expected a fatal pull error, got a different PullStreamError");
+        };
+        assert!(err.to_string().contains("poll pull line exceeds"), "fatal pull error must name the cap, got: {err}");
+        assert_eq!(
+            delivered.load(Ordering::SeqCst),
+            5 * CHUNK,
+            "bytes polled from a {}-byte body with a {MAX_PULL_LINE_BYTES}-byte cap",
+            8 * CHUNK
+        );
+        assert!(!queued_conn.closed.is_cancelled(), "the scanner reports the failure, the caller closes the conn");
+    }
+
+    #[tokio::test]
+    async fn pull_lines_accepts_a_terminated_line() {
+        let queued_conn = Arc::new(QueuedConn::new());
+        let body = Full::new(Bytes::from_static(b"aGk=\n"));
+
+        let Ok(closed) = stream_pull_lines(&queued_conn, body).await else {
+            panic!("a terminated line must be accepted");
+        };
+
+        assert!(!closed, "a body without the EOF trailer reports a clean end of stream");
+    }
 }
