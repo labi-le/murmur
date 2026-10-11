@@ -28,6 +28,14 @@ use murmur_std_compat::net::Conn;
 
 const H2_DATAGRAM_CAPSULE_TYPE: u64 = 0;
 
+/// The largest DATAGRAM capsule payload accepted: 64 KiB, the largest IP datagram one can carry.
+///
+/// The length comes from the peer, so it is checked before anything is allocated for it.
+const MAX_DATAGRAM_CAPSULE_LEN: u64 = 64 * 1024;
+
+/// Bytes skipped at a time when dropping a capsule this client does not act on.
+const CAPSULE_DISCARD_CHUNK: usize = 4 * 1024;
+
 const IPV4_HEADER_LEN: usize = 20;
 
 const IPV6_HEADER_LEN: usize = 40;
@@ -435,6 +443,18 @@ pub(crate) async fn dial_h2(
     ))
 }
 
+/// Skips a capsule this client does not act on, through a fixed scratch buffer.
+async fn discard_capsule<R: AsyncRead + Unpin>(stream: &mut R, mut remaining: usize) -> anyhow::Result<()> {
+    let mut scratch = [0u8; CAPSULE_DISCARD_CHUNK];
+    while remaining > 0 {
+        let chunk_len = remaining.min(scratch.len());
+        let (chunk, _rest) = scratch.split_at_mut(chunk_len);
+        stream.read_exact(chunk).await?;
+        remaining -= chunk_len;
+    }
+    Ok(())
+}
+
 /// A datagram stream whose two halves are the upgraded request and response bodies.
 pub(crate) struct H2DatagramStream {
     request_body: tokio::sync::Mutex<Option<WriteHalf<DuplexBox>>>,
@@ -463,13 +483,17 @@ impl H2DatagramStream {
         loop {
             let capsule_type = quicvarint::read(stream).await?;
             let payload_len = quicvarint::read(stream).await?;
+            if payload_len > MAX_DATAGRAM_CAPSULE_LEN {
+                return Err(anyhow!("connect-ip: datagram capsule exceeds {MAX_DATAGRAM_CAPSULE_LEN} bytes"));
+            }
             let payload_len =
                 usize::try_from(payload_len).map_err(|_err| anyhow!("connect-ip: datagram capsule too large"))?;
-            let mut payload = vec![0u8; payload_len];
-            stream.read_exact(&mut payload).await?;
             if capsule_type != H2_DATAGRAM_CAPSULE_TYPE {
+                discard_capsule(stream, payload_len).await?;
                 continue;
             }
+            let mut payload = vec![0u8; payload_len];
+            stream.read_exact(&mut payload).await?;
             return Ok(payload);
         }
     }
@@ -686,5 +710,55 @@ mod tests {
             0x0a, 0x0c,
         ];
         assert_eq!(calculate_ipv4_checksum(&header), 0xb1e6);
+    }
+
+    /// A capsule whose declared length is past the cap must fail closed before the payload is
+    /// allocated: the peer here never writes that payload, so a run that reads it hangs.
+    #[tokio::test]
+    async fn a_datagram_capsule_past_the_cap_fails_closed_instead_of_allocating() {
+        let (response_body, mut peer) = tokio::io::duplex(64);
+        let (response_half, _write_half) = tokio::io::split::<DuplexBox>(Box::new(response_body));
+        let stream = H2DatagramStream {
+            request_body: tokio::sync::Mutex::new(None),
+            response_body: tokio::sync::Mutex::new(Some(response_half)),
+            cancel: CancellationToken::new(),
+        };
+
+        let mut header: Vec<u8> = Vec::new();
+        quicvarint::append(&mut header, H2_DATAGRAM_CAPSULE_TYPE);
+        quicvarint::append(&mut header, MAX_DATAGRAM_CAPSULE_LEN + 1);
+        peer.write_all(&header).await.expect("write the capsule header");
+
+        let result = tokio::time::timeout(Duration::from_secs(5), stream.receive_datagram(None)).await;
+        let err = result.expect("the capsule read is bounded").expect_err("a capsule past the cap is rejected");
+        assert!(err.to_string().contains("exceeds"), "unexpected error: {err}");
+    }
+
+    /// A capsule this client does not act on is skipped through a fixed buffer, and a following
+    /// datagram capsule is still returned.
+    #[tokio::test]
+    async fn an_unknown_capsule_is_skipped_without_losing_the_next_datagram() {
+        let (response_body, mut peer) = tokio::io::duplex(64);
+        let (response_half, _write_half) = tokio::io::split::<DuplexBox>(Box::new(response_body));
+        let stream = H2DatagramStream {
+            request_body: tokio::sync::Mutex::new(None),
+            response_body: tokio::sync::Mutex::new(Some(response_half)),
+            cancel: CancellationToken::new(),
+        };
+
+        let mut frames: Vec<u8> = Vec::new();
+        quicvarint::append(&mut frames, 0x21);
+        quicvarint::append(&mut frames, 4);
+        frames.extend_from_slice(b"skip");
+        quicvarint::append(&mut frames, H2_DATAGRAM_CAPSULE_TYPE);
+        quicvarint::append(&mut frames, 3);
+        frames.extend_from_slice(b"abc");
+        peer.write_all(&frames).await.expect("write the capsules");
+
+        let data = tokio::time::timeout(Duration::from_secs(5), stream.receive_datagram(None))
+            .await
+            .expect("the datagram arrives")
+            .expect("the capsule after the skipped one is returned");
+        assert_eq!(data, b"abc");
     }
 }

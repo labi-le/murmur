@@ -192,8 +192,8 @@ impl phy::Device for ChannelPhy {
     }
 }
 
-/// What a [`PacketDevice`] queues in each direction, and how many events one socket's read side
-/// buffers before its drain stops and leaves the rest in the `smoltcp` receive buffer.
+/// What a [`PacketDevice`] queues in each direction, and how many events a socket's reader may
+/// fall behind before the driver stops draining that socket.
 pub const PACKET_QUEUE_SIZE: usize = 256;
 
 /// The packet device behind [`Stack::with_packet_handle`]: a stack whose packets the caller
@@ -668,9 +668,6 @@ struct Entry {
     events: mpsc::Sender<Event>,
     signal: Arc<Signal>,
     actions: mpsc::UnboundedReceiver<Action>,
-    /// A close the bounded event queue had no room for: `drain_events` sends it once the reader
-    /// makes room, and only after the socket's data, so a reader sees EOF last.
-    pending: Option<Event>,
     /// Outbound bytes `smoltcp` has not accepted yet; its own send buffer supplies the
     /// backpressure, so this only holds what one `poll_write` handed over.
     outbox: VecDeque<u8>,
@@ -678,22 +675,21 @@ struct Entry {
     queued: Arc<std::sync::atomic::AtomicU64>,
     local: Arc<Mutex<SocketAddr>>,
     closing: bool,
+    /// An event the reader had no room for; it goes out as soon as the reader makes room.
+    pending: Option<Event>,
     connect: Option<Connect>,
     established: bool,
 }
 
 impl Entry {
-    /// Hand an event to the socket's task. A full queue holds a close back in `pending` rather
-    /// than dropping it; `drain_events` flushes it once the reader makes room. A closed queue
-    /// means the socket's task is gone, and the entry goes with it.
-    fn deliver(&mut self, event: Event) {
-        if let Err(mpsc::error::TrySendError::Full(event)) = self.events.try_send(event) {
-            self.pending = Some(event);
-        }
+    /// A close must not be lost behind a full queue: the reader's next read makes room and wakes
+    /// the driver, which delivers it then.
+    fn queue_closed(&mut self) {
+        self.pending = Some(Event::Closed);
+        self.deliver_pending();
     }
 
-    /// Send a close the full queue held back; a queue that is still full keeps holding it.
-    fn flush_pending(&mut self) {
+    fn deliver_pending(&mut self) {
         let Some(event) = self.pending.take() else {
             return;
         };
@@ -897,12 +893,12 @@ impl<D: phy::Device> Driver<D> {
                 events,
                 signal,
                 actions,
-                pending: None,
                 outbox: VecDeque::new(),
                 datagrams: VecDeque::new(),
                 queued,
                 local,
                 closing: false,
+                pending: None,
                 connect,
                 established,
             },
@@ -959,12 +955,12 @@ impl<D: phy::Device> Driver<D> {
                 events,
                 signal,
                 actions,
-                pending: None,
                 outbox: VecDeque::new(),
                 datagrams: VecDeque::new(),
                 queued,
                 local: Arc::new(Mutex::new(local_addr)),
                 closing: false,
+                pending: None,
                 connect: None,
                 established: true,
             },
@@ -993,19 +989,17 @@ impl<D: phy::Device> Driver<D> {
         self.entries.values().any(|entry| entry.local.lock().map_or(true, |local| local.port() == port))
     }
 
-    /// The per-socket read side: hand whatever `smoltcp` buffered to the socket's task, as far as
-    /// the bounded event queue has room for it. A full queue stops that socket's drain and leaves
-    /// the bytes in the `smoltcp` receive buffer, so the advertised window reflects the unread
-    /// backlog; a read is what re-arms it: `TcpConn::poll_read` and `UdpConn::recv_from` notify
-    /// the driver once they take an event out of the queue.
+    /// the per-socket read side: hand whatever `smoltcp` buffered to the socket's task, and stop
+    /// at a full queue so the window the stack advertises reflects what the reader has not taken.
     fn drain_events(&mut self) {
         let mtu = self.mtu;
         let Self { sockets, entries, .. } = &mut *self;
         for entry in entries.values_mut() {
             loop {
-                // Only pull a socket's bytes while its queue can take them: with the queue full
-                // the bytes have to stay in the `smoltcp` receive buffer, which is what the
-                // advertised window reflects. A reader that makes room notifies the driver.
+                // Stop before taking anything out of the socket: the `try_send` below would drop
+                // whatever it could not queue, and for TCP that event is the bytes themselves, so
+                // a chunk smoltcp had handed over would vanish from the stream. A full queue is
+                // the backpressure; the reader notifies the driver once it makes room.
                 if entry.events.capacity() == 0 {
                     break;
                 }
@@ -1044,7 +1038,11 @@ impl<D: phy::Device> Driver<D> {
                     }
                 }
             }
-            entry.flush_pending();
+        }
+        // After the data, so a reader that sees the close has already been handed everything the
+        // socket held.
+        for entry in entries.values_mut() {
+            entry.deliver_pending();
         }
     }
 
@@ -1069,10 +1067,16 @@ impl<D: phy::Device> Driver<D> {
                         break;
                     }
                     let chunk: Vec<u8> = entry.outbox.iter().take(TCP_SOCKET_BUFFER).copied().collect();
-                    if tcp.send_slice(&chunk).is_err() {
+                    // `send_slice` enqueues only what the transmit buffer has room for, so drop
+                    // only what it took and leave the rest for the next pass: the peer's
+                    // window has to be the backpressure, not a silent truncation.
+                    let Ok(accepted) = tcp.send_slice(&chunk) else {
+                        break;
+                    };
+                    if accepted == 0 {
                         break;
                     }
-                    entry.outbox.drain(..chunk.len());
+                    entry.outbox.drain(..accepted);
                 }
                 if entry.closing {
                     tcp.close();
@@ -1105,8 +1109,7 @@ impl<D: phy::Device> Driver<D> {
                     let closed = matches!(tcp.state(), tcp::State::CloseWait | tcp::State::Closed);
                     if closed {
                         entry.established = false;
-                        entry.deliver(Event::Closed);
-                        entry.signal.wake();
+                        entry.queue_closed();
                     }
                 }
                 continue;
@@ -1246,7 +1249,7 @@ impl tokio::io::AsyncRead for TcpConn {
         let take = buf.remaining().min(this.incoming.len());
         let chunk: Vec<u8> = this.incoming.drain(..take).collect();
         buf.put_slice(&chunk);
-        // The queue has room again: let the driver move the next `smoltcp` bytes into it.
+        // The driver stops draining a full queue, so a read is what lets it drain again.
         this.wake.notify();
         Poll::Ready(Ok(()))
     }
@@ -1366,7 +1369,7 @@ impl murmur_common::net::Datagram for UdpConn {
                     for (slot, byte) in buffer.iter_mut().zip(&data) {
                         *slot = *byte;
                     }
-                    // The queue has room again: let the driver move the next `smoltcp` datagram in.
+                    // A taken datagram makes room, so the driver may drain again.
                     self.wake.notify();
                     return Ok((length, from_smoltcp_endpoint(source)));
                 }

@@ -2,7 +2,6 @@
 
 use std::sync::{Arc, LazyLock};
 
-use anyhow::Result;
 use parking_lot::RwLock;
 
 use murmur_component::resolver::{clear_cache, reset_connection};
@@ -40,8 +39,18 @@ pub fn update_system_dns(addr: &[String]) {
 
 #[cfg(all(target_os = "android", feature = "cmfa"))]
 impl SystemClient {
-    pub(crate) fn get_dns_clients(&self) -> Result<Vec<Arc<dyn DnsClient>>> {
-        Ok(SYSTEM_RESOLVER.read().clone())
+    /// Android receives its resolver set from `update_system_dns`, so there is nothing to read off
+    /// the runtime; the signature matches the implementation the shared async caller awaits.
+    #[expect(
+        clippy::unused_async,
+        reason = "the shared async caller awaits this on every platform; the android build has no file to read"
+    )]
+    pub(crate) async fn refresh_dns_config(&self) -> Option<anyhow::Error> {
+        None
+    }
+
+    pub(crate) fn get_dns_clients(&self) -> Vec<Arc<dyn DnsClient>> {
+        SYSTEM_RESOLVER.read().clone()
     }
 
     pub(crate) fn reset_connection_impl(&self) {

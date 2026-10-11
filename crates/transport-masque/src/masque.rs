@@ -791,7 +791,7 @@ pub mod connectip {
         send: Arc<tokio::sync::Mutex<h3::StreamSend>>,
         state: Arc<Mutex<ConnState>>,
         writes: mpsc::Sender<WriteCapsule>,
-        datagrams: mpsc::Receiver<Bytes>,
+        datagrams: h3::DatagramReceiver,
         close_notify: CancellationToken,
         hconn: Arc<h3::ClientConn>,
         stream_id: u64,
@@ -1053,7 +1053,7 @@ pub mod connectip {
     /// Receives one datagram, fed by the connection's datagram dispatcher.
     // cancel-safe: awaits only a token's `cancelled()` (or `pending()`) and a `recv()` on a channel, both of which can be dropped and re-polled.
     async fn receive_datagram(
-        datagrams: &mut mpsc::Receiver<Bytes>,
+        datagrams: &mut h3::DatagramReceiver,
         ctx: Option<&CancellationToken>,
     ) -> anyhow::Result<Bytes> {
         let received = tokio::select! {
@@ -1562,6 +1562,18 @@ pub mod h3 {
     const MAX_QUARTER_STREAM_ID: u64 = (1 << 60) - 1;
     const STREAM_DATAGRAM_QUEUE_LEN: usize = 32;
 
+    /// A SETTINGS frame is (identifier, value) varint pairs of at most ten bytes each, so 16 KiB is
+    /// far above any real one, and the peer declares its length in two varint bytes.
+    const MAX_SETTINGS_FRAME_LEN: u64 = 16 * 1024;
+
+    /// The frames preceding the final response may not exceed the field-section size this client
+    /// advertises, which bounds both the allocation and the loop.
+    const MAX_RESPONSE_PREAMBLE_BYTES: u64 = DEFAULT_MAX_FIELD_SECTION_SIZE;
+
+    /// Informational responses are the only reason to loop here, and RFC 9110 does not require
+    /// handling more than one.
+    const MAX_INTERIM_RESPONSES: u64 = 2;
+
     /// The hop-by-hop request headers dropped when encoding.
     const CONNECTION_SPECIFIC: [&str; 5] =
         ["connection", "proxy-connection", "transfer-encoding", "upgrade", "keep-alive"];
@@ -1608,6 +1620,18 @@ pub mod h3 {
         }
     }
 
+    /// Reads one frame payload of the peer-declared `length`, which is bounded by `max_len` before
+    /// anything is allocated for it.
+    async fn read_payload_capped(recv: &mut RecvStream, length: u64, max_len: u64) -> anyhow::Result<Vec<u8>> {
+        if length > max_len {
+            return Err(anyhow!("http3: frame payload exceeds {max_len} bytes"));
+        }
+        let length = usize::try_from(length).map_err(|_err| anyhow!("http3: frame payload too large"))?;
+        let mut payload = vec![0u8; length];
+        read_full(recv, &mut payload).await?;
+        Ok(payload)
+    }
+
     async fn discard(recv: &mut RecvStream, length: u64) -> anyhow::Result<()> {
         let mut buf = [0u8; 1024];
         let mut remaining = length;
@@ -1624,6 +1648,14 @@ pub mod h3 {
         let frame_type = read_varint(recv).await?;
         let length = read_varint(recv).await?;
         Ok((frame_type, length))
+    }
+
+    /// Drops the routing entries whose receiver is gone, so a table entry cannot outlive the code
+    /// that reads from it; returns how many were removed.
+    fn prune_closed_datagram_streams(streams: &mut HashMap<u64, mpsc::Sender<Bytes>>) -> usize {
+        let before = streams.len();
+        streams.retain(|_stream_id, sender| !sender.is_closed());
+        before - streams.len()
     }
 
     #[derive(Debug, Clone, Default, PartialEq, Eq)]
@@ -1809,9 +1841,11 @@ pub mod h3 {
                 self.close_with_error(H3_MISSING_SETTINGS, "missing SETTINGS frame");
                 return Err(anyhow!("http3: missing SETTINGS frame"));
             }
-            let length = usize::try_from(length).map_err(|_err| anyhow!("http3: SETTINGS frame too large"))?;
-            let mut payload = vec![0u8; length];
-            read_full(recv, &mut payload).await?;
+            if length > MAX_SETTINGS_FRAME_LEN {
+                self.close_with_error(H3_EXCESSIVE_LOAD, "SETTINGS frame too large");
+                return Err(anyhow!("http3: SETTINGS frame exceeds {MAX_SETTINGS_FRAME_LEN} bytes"));
+            }
+            let payload = read_payload_capped(recv, length, MAX_SETTINGS_FRAME_LEN).await?;
             let settings = parse_settings(&payload).inspect_err(|_err| {
                 self.close_with_error(H3_SETTINGS_ERROR, "invalid SETTINGS frame");
             })?;
@@ -1857,10 +1891,17 @@ pub mod h3 {
             }
         }
 
-        fn register_datagram_stream(&self, stream_id: u64) -> mpsc::Receiver<Bytes> {
+        fn unregister_datagram_stream(&self, stream_id: u64) {
+            self.datagram_streams.lock().remove(&stream_id);
+        }
+
+        fn register_datagram_stream(self: &Arc<Self>, stream_id: u64) -> DatagramReceiver {
             let (sender, receiver) = mpsc::channel(STREAM_DATAGRAM_QUEUE_LEN);
-            self.datagram_streams.lock().insert(stream_id, sender);
-            receiver
+            let mut streams = self.datagram_streams.lock();
+            prune_closed_datagram_streams(&mut streams);
+            streams.insert(stream_id, sender);
+            drop(streams);
+            DatagramReceiver { conn: Arc::clone(self), stream_id, receiver }
         }
 
         /// Sends a datagram, prefixing the quarter stream ID.
@@ -2202,10 +2243,7 @@ pub mod h3 {
         }
 
         async fn read_payload(&mut self, length: u64) -> anyhow::Result<Vec<u8>> {
-            let length = usize::try_from(length).map_err(|_err| anyhow!("http3: frame payload too large"))?;
-            let mut payload = vec![0u8; length];
-            read_full(&mut self.recv, &mut payload).await?;
-            Ok(payload)
+            read_payload_capped(&mut self.recv, length, DEFAULT_MAX_FIELD_SECTION_SIZE).await
         }
     }
 
@@ -2336,11 +2374,41 @@ pub mod h3 {
         valid_header_field_name(value)
     }
 
+    /// The receive half of a request stream's datagrams, owning the connection's routing entry.
+    ///
+    /// Dropping it removes that entry, so the table stays bounded by the streams that are still
+    /// alive.
+    pub struct DatagramReceiver {
+        conn: Arc<ClientConn>,
+        stream_id: u64,
+        receiver: mpsc::Receiver<Bytes>,
+    }
+
+    impl fmt::Debug for DatagramReceiver {
+        fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+            f.debug_struct("DatagramReceiver").field("stream_id", &self.stream_id).finish_non_exhaustive()
+        }
+    }
+
+    impl DatagramReceiver {
+        /// The next datagram of the stream; `None` once the connection's dispatcher is gone.
+        // cancel-safe: a channel `recv` leaves the item queued, so a dropped call loses nothing.
+        pub async fn recv(&mut self) -> Option<Bytes> {
+            self.receiver.recv().await
+        }
+    }
+
+    impl Drop for DatagramReceiver {
+        fn drop(&mut self) {
+            self.conn.unregister_datagram_stream(self.stream_id);
+        }
+    }
+
     /// A request stream, with the request head written by [`RequestStream::send_request_header`].
     pub struct RequestStream {
         send: StreamSend,
         recv: StreamRecv,
-        datagrams: mpsc::Receiver<Bytes>,
+        datagrams: DatagramReceiver,
     }
 
     impl fmt::Debug for RequestStream {
@@ -2371,17 +2439,24 @@ pub mod h3 {
         }
 
         pub async fn read_response(&mut self) -> anyhow::Result<HttpResponse> {
+            let mut preamble_bytes: u64 = 0;
+            let mut interim_responses: u64 = 0;
             loop {
                 let Some((frame_type, length)) = self.recv.next_frame().await? else {
                     self.send.conn.close_with_error(H3_REQUEST_INCOMPLETE, "request stream closed before response");
                     return Err(anyhow!("http3: request stream closed before response"));
                 };
+                if frame_type == FRAME_HEADERS && length > DEFAULT_MAX_FIELD_SECTION_SIZE {
+                    self.send.conn.close_with_error(H3_EXCESSIVE_LOAD, "response headers too large");
+                    return Err(anyhow!("http3: response headers too large"));
+                }
+                preamble_bytes = preamble_bytes.saturating_add(length);
+                if preamble_bytes > MAX_RESPONSE_PREAMBLE_BYTES {
+                    self.send.conn.close_with_error(H3_EXCESSIVE_LOAD, "response preamble too large");
+                    return Err(anyhow!("http3: response frames exceed {MAX_RESPONSE_PREAMBLE_BYTES} bytes"));
+                }
                 match frame_type {
                     FRAME_HEADERS => {
-                        if length > DEFAULT_MAX_FIELD_SECTION_SIZE {
-                            self.send.conn.close_with_error(H3_EXCESSIVE_LOAD, "response headers too large");
-                            return Err(anyhow!("http3: response headers too large"));
-                        }
                         let block = self.recv.read_payload(length).await?;
                         let fields = qpack::decode_headers(&block).inspect_err(|_err| {
                             self.send
@@ -2390,6 +2465,13 @@ pub mod h3 {
                         })?;
                         let status_code = status_from_fields(&fields)?;
                         if (100..200).contains(&status_code) {
+                            interim_responses += 1;
+                            if interim_responses > MAX_INTERIM_RESPONSES {
+                                self.send.conn.close_with_error(H3_EXCESSIVE_LOAD, "too many informational responses");
+                                return Err(anyhow!(
+                                    "http3: more than {MAX_INTERIM_RESPONSES} informational responses before the final response"
+                                ));
+                            }
                             // Informational responses precede the final one.
                             continue;
                         }
@@ -2453,7 +2535,7 @@ pub mod h3 {
         }
 
         #[must_use]
-        pub fn split(self) -> (StreamSend, StreamRecv, mpsc::Receiver<Bytes>) {
+        pub fn split(self) -> (StreamSend, StreamRecv, DatagramReceiver) {
             (self.send, self.recv, self.datagrams)
         }
     }
@@ -3037,6 +3119,271 @@ pub mod h3 {
                 return Err(anyhow!("qpack: invalid Huffman padding"));
             }
             Ok(out)
+        }
+    }
+
+    #[cfg(test)]
+    mod stream_tests {
+        use std::collections::HashMap;
+        use std::sync::Arc;
+        use std::time::Duration;
+
+        use bytes::Bytes;
+        use quinn::{ConnectionError, Endpoint, SendStream, VarInt};
+        use tokio::sync::mpsc;
+        use tokio::time::timeout;
+
+        use super::qpack;
+        use super::*;
+        use crate::masque::{generate_cert, prepare_tls_config, EcdsaPrivateKey, EcdsaPublicKey, NEXT_PROTO_H3};
+
+        /// A loopback round trip takes milliseconds; this only has to be short enough that a missing
+        /// frame bound fails the test instead of hanging the suite.
+        const FRAME_TIMEOUT: Duration = Duration::from_secs(10);
+
+        struct TestPair {
+            client: Arc<ClientConn>,
+            server: quinn::Connection,
+            _client_endpoint: Endpoint,
+            _server_endpoint: Endpoint,
+        }
+
+        /// A P-256 key in the SEC1 DER the crate's certificate helpers take.
+        fn private_key() -> EcdsaPrivateKey {
+            loop {
+                let mut seed = [0u8; 32];
+                rand::RngCore::fill_bytes(&mut rand::rng(), &mut seed);
+                if let Ok(secret) = p256::SecretKey::from_bytes(&seed.into()) {
+                    let der = secret.to_sec1_der().expect("encode sec1 der");
+                    return EcdsaPrivateKey::parse_ec_private_key(&der).expect("parse the key just generated");
+                }
+            }
+        }
+
+        fn public_key(private: &EcdsaPrivateKey) -> EcdsaPublicKey {
+            use murmur_component_ca::keypair::OID_PRIME256V1;
+            let secret = p256::SecretKey::from_sec1_der(private.der()).expect("sec1 private key");
+            let signing = p256::ecdsa::SigningKey::from(&secret);
+            EcdsaPublicKey {
+                curve: OID_PRIME256V1.to_vec(),
+                point: signing.verifying_key().to_sec1_point(false).as_ref().to_vec(),
+            }
+        }
+
+        /// The client under test over a real QUIC connection, with the server side held by the test
+        /// so it can write what a masque server would.
+        async fn connect_pair() -> TestPair {
+            murmur_testsupport_probe::ensure_test_crypto_provider();
+
+            let server_key = private_key();
+            let server_certs: Vec<rustls::pki_types::CertificateDer<'static>> = generate_cert(&server_key)
+                .expect("server cert")
+                .into_iter()
+                .map(rustls::pki_types::CertificateDer::from)
+                .collect();
+            let server_private = rustls::pki_types::PrivateKeyDer::Sec1(rustls::pki_types::PrivateSec1KeyDer::from(
+                server_key.der().to_vec(),
+            ));
+            let mut server_tls = rustls::ServerConfig::builder()
+                .with_no_client_auth()
+                .with_single_cert(server_certs, server_private)
+                .expect("build the test server config");
+            server_tls.alpn_protocols = vec![NEXT_PROTO_H3.to_vec()];
+            let server_crypto =
+                quinn::crypto::rustls::QuicServerConfig::try_from(server_tls).expect("quinn accepts the server config");
+            let server_endpoint = Endpoint::server(
+                quinn::ServerConfig::with_crypto(Arc::new(server_crypto)),
+                "127.0.0.1:0".parse().expect("loopback address"),
+            )
+            .expect("bind the server endpoint");
+            let addr = server_endpoint.local_addr().expect("the server endpoint has an address");
+
+            let client_key = private_key();
+            let tls = prepare_tls_config(&client_key, &public_key(&server_key), "example.com", false)
+                .expect("prepare the client tls config");
+            let client_crypto =
+                quinn::crypto::rustls::QuicClientConfig::try_from(tls.config).expect("quinn accepts the client config");
+            let client_endpoint =
+                Endpoint::client("127.0.0.1:0".parse().expect("loopback address")).expect("bind the client endpoint");
+            let server_name = tls.server_name.to_str().into_owned();
+            let connecting = client_endpoint
+                .connect_with(quinn::ClientConfig::new(Arc::new(client_crypto)), addr, &server_name)
+                .expect("dial the server");
+            let accepting = async {
+                server_endpoint
+                    .accept()
+                    .await
+                    .expect("the server endpoint is still accepting")
+                    .await
+                    .expect("the server handshake completes")
+            };
+            let (client_conn, server_conn) = futures::join!(connecting, accepting);
+            let client_conn = client_conn.expect("the client handshake completes");
+
+            let client = Transport::new(true, Vec::new())
+                .new_client_conn(client_conn)
+                .await
+                .expect("the client connection is created");
+            TestPair {
+                client,
+                server: server_conn,
+                _client_endpoint: client_endpoint,
+                _server_endpoint: server_endpoint,
+            }
+        }
+
+        /// Starts a server control stream and writes its stream type.
+        async fn open_control_stream(pair: &TestPair) -> SendStream {
+            let mut control = pair.server.open_uni().await.expect("open the server control stream");
+            let mut stream_type: Vec<u8> = Vec::new();
+            quicvarint::append(&mut stream_type, STREAM_TYPE_CONTROL);
+            control.write_all(&stream_type).await.expect("write the control stream type");
+            control
+        }
+
+        /// Writes one HTTP/3 frame header declaring `length`, with no payload.
+        async fn write_frame_header(send: &mut SendStream, frame_type: u64, length: u64) {
+            let mut header: Vec<u8> = Vec::new();
+            quicvarint::append(&mut header, frame_type);
+            quicvarint::append(&mut header, length);
+            send.write_all(&header).await.expect("write the frame header");
+        }
+
+        async fn write_headers(send: &mut SendStream, status: &str) {
+            let block = qpack::encode_fields(&[(":status".to_owned(), status.to_owned())]);
+            let mut frame: Vec<u8> = Vec::new();
+            quicvarint::append(&mut frame, FRAME_HEADERS);
+            quicvarint::append(&mut frame, block.len() as u64);
+            frame.extend_from_slice(&block);
+            send.write_all(&frame).await.expect("write the HEADERS frame");
+        }
+
+        /// Opens a request stream and takes the server-side half a masque server would answer on.
+        /// The request head has to be written first: a QUIC stream only exists for the peer once
+        /// bytes arrive on it.
+        async fn open_response_stream(pair: &TestPair) -> (RequestStream, SendStream) {
+            let mut stream = pair.client.open_request_stream(None).await.expect("open a request stream");
+            let head = RequestHead {
+                method: http::Method::CONNECT,
+                proto: String::new(),
+                host: "example.com".to_owned(),
+                header: http::HeaderMap::new(),
+                url: http::Uri::from_static("https://example.com"),
+            };
+            stream.send_request_header(&head).await.expect("write the request head");
+            let (send, _recv) = pair.server.accept_bi().await.expect("the server accepts the request stream");
+            (stream, send)
+        }
+
+        fn datagram_stream_count(conn: &ClientConn) -> usize {
+            conn.datagram_streams.lock().len()
+        }
+
+        #[tokio::test]
+        async fn a_settings_frame_longer_than_the_cap_closes_the_connection_instead_of_allocating() {
+            let pair = connect_pair().await;
+            let mut control = open_control_stream(&pair).await;
+            write_frame_header(&mut control, FRAME_SETTINGS, 1 << 30).await;
+
+            let closed = timeout(FRAME_TIMEOUT, pair.server.closed())
+                .await
+                .expect("the client fails closed on a SETTINGS frame past the cap");
+            let ConnectionError::ApplicationClosed(app) = closed else {
+                panic!("expected an application close, got {closed}");
+            };
+            assert_eq!(app.error_code, VarInt::from_u32(H3_EXCESSIVE_LOAD));
+            assert_eq!(String::from_utf8_lossy(&app.reason), "SETTINGS frame too large");
+        }
+
+        #[tokio::test]
+        async fn a_settings_frame_within_the_cap_is_parsed() {
+            let pair = connect_pair().await;
+            let mut control = open_control_stream(&pair).await;
+            let mut payload: Vec<u8> = Vec::new();
+            quicvarint::append(&mut payload, SETTING_MAX_FIELD_SECTION_SIZE);
+            quicvarint::append(&mut payload, 4096);
+            write_frame_header(&mut control, FRAME_SETTINGS, payload.len() as u64).await;
+            control.write_all(&payload).await.expect("write the SETTINGS payload");
+
+            let settings = timeout(FRAME_TIMEOUT, pair.client.received_settings())
+                .await
+                .expect("a SETTINGS frame within the cap is accepted");
+            assert_eq!(settings.max_field_section_size, 4096);
+        }
+
+        #[tokio::test]
+        async fn more_informational_responses_than_the_cap_fail_closed() {
+            let pair = connect_pair().await;
+            let (mut stream, mut server_send) = open_response_stream(&pair).await;
+            for _ in 0..=MAX_INTERIM_RESPONSES {
+                write_headers(&mut server_send, "103").await;
+            }
+
+            let result = timeout(FRAME_TIMEOUT, stream.read_response()).await.expect("the response loop is bounded");
+            let err = result.expect_err("an unlimited run of informational responses is rejected");
+            assert!(err.to_string().contains("informational responses"), "unexpected error: {err}");
+        }
+
+        #[tokio::test]
+        async fn a_response_preamble_past_the_cap_fails_closed_without_reading_the_frames() {
+            let pair = connect_pair().await;
+            let (mut stream, mut server_send) = open_response_stream(&pair).await;
+            write_headers(&mut server_send, "103").await;
+            write_frame_header(&mut server_send, 0x21, MAX_RESPONSE_PREAMBLE_BYTES).await;
+
+            let result = timeout(FRAME_TIMEOUT, stream.read_response()).await.expect("the response loop is bounded");
+            let err = result.expect_err("a preamble past the byte cap is rejected");
+            assert!(err.to_string().contains("exceed"), "unexpected error: {err}");
+        }
+
+        #[tokio::test]
+        async fn informational_responses_up_to_the_cap_precede_the_final_response() {
+            let pair = connect_pair().await;
+            let (mut stream, mut server_send) = open_response_stream(&pair).await;
+            for _ in 0..MAX_INTERIM_RESPONSES {
+                write_headers(&mut server_send, "103").await;
+            }
+            write_headers(&mut server_send, "200").await;
+
+            let response = timeout(FRAME_TIMEOUT, stream.read_response()).await.expect("the response arrives");
+            assert_eq!(response.expect("a response within the caps").status_code, 200);
+        }
+
+        #[tokio::test]
+        async fn a_closed_request_stream_releases_its_datagram_routing_entry() {
+            let pair = connect_pair().await;
+            for _ in 0..8 {
+                let stream = pair.client.open_request_stream(None).await.expect("open a request stream");
+                assert_eq!(datagram_stream_count(&pair.client), 1, "a live stream owns one routing entry");
+                let (_send, _recv, datagrams) = stream.split();
+                drop(datagrams);
+            }
+
+            assert_eq!(datagram_stream_count(&pair.client), 0, "every closed stream releases its routing entry");
+        }
+
+        #[tokio::test]
+        async fn dropping_a_request_stream_releases_its_datagram_routing_entry() {
+            let pair = connect_pair().await;
+            let stream = pair.client.open_request_stream(None).await.expect("open a request stream");
+            assert_eq!(datagram_stream_count(&pair.client), 1);
+
+            drop(stream);
+            assert_eq!(datagram_stream_count(&pair.client), 0);
+        }
+
+        #[test]
+        fn pruning_drops_only_the_routing_entries_whose_receiver_is_gone() {
+            let mut streams: HashMap<u64, mpsc::Sender<Bytes>> = HashMap::new();
+            let (live, _live_receiver) = mpsc::channel::<Bytes>(1);
+            let (dead, dead_receiver) = mpsc::channel::<Bytes>(1);
+            drop(dead_receiver);
+            streams.insert(4, live);
+            streams.insert(8, dead);
+
+            assert_eq!(prune_closed_datagram_streams(&mut streams), 1);
+            assert_eq!(streams.len(), 1);
+            assert!(streams.contains_key(&4));
         }
     }
 }

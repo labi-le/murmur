@@ -28,7 +28,7 @@ murmur-ntp = { path = "../ntp" }
 
 [dev-dependencies]
 base64.workspace = true
-tokio = { workspace = true, features = ["macros", "rt-multi-thread", "net", "time"] }
+tokio = { workspace = true, features = ["macros", "rt-multi-thread", "net", "time", "test-util"] }
 
 [lints]
 workspace = true

@@ -29,11 +29,18 @@ struct DhcpClientState {
     err: Option<String>,
 }
 
+#[cfg(test)]
+type BeforeWaitHook = Box<dyn FnOnce() + Send>;
+
 pub(crate) struct DhcpClient {
     iface_name: String,
     state: Mutex<DhcpClientState>,
     notify: Notify,
     self_ref: Weak<Self>,
+    /// Test-only: runs between the state snapshot and the wait, so a test can drive a completion at
+    /// the interleaving that used to lose the wakeup.
+    #[cfg(test)]
+    before_wait: Mutex<Option<BeforeWaitHook>>,
 }
 
 pub(crate) fn new_dhcp_client(addr: &str) -> Arc<dyn DnsClient> {
@@ -48,6 +55,8 @@ pub(crate) fn new_dhcp_client(addr: &str) -> Arc<dyn DnsClient> {
             err: None,
         }),
         notify: Notify::new(),
+        #[cfg(test)]
+        before_wait: Mutex::new(None),
         self_ref: Weak::clone(weak),
     })
 }
@@ -92,15 +101,25 @@ impl DhcpClient {
         }
 
         loop {
+            // `notify_waiters` stores no permit, so the future must be armed before the state read:
+            // a completion landing between the read and the wait would otherwise be lost.
+            let mut notified = std::pin::pin!(self.notify.notified());
+            notified.as_mut().enable();
+
             let (clients, err, resolving) = {
                 let state = self.state.lock();
                 (state.clients.clone(), state.err.clone(), state.resolving)
             };
 
+            #[cfg(test)]
+            if let Some(hook) = self.before_wait.lock().take() {
+                hook();
+            }
+
             if clients.is_none() && err.is_none() {
                 if resolving {
                     tokio::select! {
-                        () = self.notify.notified() => continue,
+                        () = notified.as_mut() => continue,
                         () = ctx.cancelled() => return Err(anyhow!("context canceled")),
                     }
                 }
@@ -187,4 +206,46 @@ fn spawn_resolve(client: Arc<DhcpClient>) {
         }
         client.notify.notify_waiters();
     });
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn client_with_a_pending_resolution() -> Arc<DhcpClient> {
+        Arc::new(DhcpClient {
+            iface_name: "lo".to_owned(),
+            state: Mutex::new(DhcpClientState {
+                // Keeps `invalidate` off the machine, so this test only exercises the wait.
+                iface_invalidate: Some(Instant::now() + IFACE_TTL),
+                dns_invalidate: None,
+                iface_addr: None,
+                resolving: true,
+                clients: None,
+                err: None,
+            }),
+            notify: Notify::new(),
+            before_wait: Mutex::new(None),
+            self_ref: Weak::new(),
+        })
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn resolve_returns_when_the_completion_lands_after_the_state_read() {
+        let client = client_with_a_pending_resolution();
+        let complete = Arc::clone(&client);
+        *client.before_wait.lock() = Some(Box::new(move || {
+            let mut state = complete.state.lock();
+            state.resolving = false;
+            state.clients = Some(Vec::new());
+            drop(state);
+            complete.notify.notify_waiters();
+        }));
+
+        let ctx = CancellationToken::new();
+        let resolved = tokio::time::timeout(Duration::from_secs(1), client.resolve(&ctx))
+            .await
+            .expect("resolve never returned: the completion's wakeup was lost");
+        assert!(resolved.is_ok(), "resolve failed despite the completion landing: {:?}", resolved.err());
+    }
 }

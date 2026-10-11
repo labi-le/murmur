@@ -35,6 +35,7 @@ use murmur_component_wireguard::keys::{PresharedKey, StaticKey};
 use murmur_component_wireguard::stack::{Events, Stack, StackConfig, PACKET_QUEUE_SIZE, UDP_SOCKET_PACKETS};
 use smoltcp::phy::{self, DeviceCapabilities, Medium};
 use smoltcp::time::Instant as SmolInstant;
+use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
 /// One direction of a wire: a queue the driver drains, and the peer's queue to fill. The
 /// events handle belongs to the stack that drains the queue, exactly as a packet device
@@ -176,53 +177,6 @@ async fn a_udp_datagram_crosses_the_stack() {
     assert_eq!(&buffer[..size], b"ping");
     assert_eq!(source.ip(), IpAddr::V4(Ipv4Addr::new(10, 0, 0, 2)));
     assert_ne!(source.port(), 0, "the client socket must hold a real ephemeral port");
-}
-
-/// A socket whose reader has stopped polling must not let the peer's stream pile up in this
-/// process. The read side drains `smoltcp`'s receive buffer into the per-socket event queue, so
-/// that queue's bound is what stops the drain once the consumer stalls: the backlog the socket
-/// will hand over stays at the queue plus the `smoltcp` buffer rather than growing with the
-/// sender's stream, and reading again restarts the drain.
-#[tokio::test]
-async fn a_non_reading_socket_bounds_the_backlog_the_stack_keeps() {
-    const SENT: usize = 4096;
-    let (_, server_end, _, server_events) = linked();
-    let server = Stack::with_device(
-        StackConfig { local_addresses: vec![prefix("10.0.0.1/32")], mtu: 1500 },
-        loopback(&server_end, 1500),
-        server_events,
-    )
-    .expect("server stack");
-
-    let bound = SocketAddr::new(IpAddr::V4(Ipv4Addr::new(10, 0, 0, 1)), 9);
-    let listener = with_timeout("listen_udp", server.listen_udp(Some(bound))).await.expect("bind");
-
-    // The reader never runs while the peer writes, which is the stalled-consumer case. The
-    // packets are paced so the driver moves each one off the wire before the next arrives:
-    // only the event queue's bound can then stop the stack emptying the receive buffer.
-    for _ in 0..SENT {
-        server_end.inbound.push(udp_packet(Ipv4Addr::new(10, 0, 0, 2), Ipv4Addr::new(10, 0, 0, 1), b"x"));
-        tokio::time::sleep(Duration::from_micros(200)).await;
-    }
-    // Let the tail of the stream arrive and be dropped by the socket's own `smoltcp` buffer, so
-    // nothing is left in flight when the reader starts.
-    tokio::time::sleep(Duration::from_millis(200)).await;
-
-    let mut buffer = [0u8; 64];
-    let mut received = 0usize;
-    loop {
-        match tokio::time::timeout(Duration::from_secs(1), listener.recv_from(&mut buffer)).await {
-            Ok(Ok(_)) => received += 1,
-            Ok(Err(_)) | Err(_) => break,
-        }
-        assert!(received <= SENT, "the sender only wrote {SENT} datagrams");
-    }
-    assert!(received > PACKET_QUEUE_SIZE, "reading must restart the drain, got {received}");
-    assert!(
-        received <= PACKET_QUEUE_SIZE + 2 * UDP_SOCKET_PACKETS,
-        "a stalled reader must bound the backlog to the queue and the socket's own buffer, \
-         not to the sender's whole stream: got {received} of {SENT}"
-    );
 }
 
 /// A minimal IPv4 + UDP packet; the device only reads the IP header and the length.
@@ -675,4 +629,125 @@ async fn a_dropped_tun_stops_the_device() {
     tokio::time::timeout(Duration::from_secs(5), closed.notified())
         .await
         .expect("the device task must stop when its tun handle is dropped");
+}
+
+/// A socket whose reader stops reading has to bound what the stack keeps for it: the driver
+/// stops draining at a full event queue and lets the socket's own receive buffer fill, instead
+/// of buffering the sender's whole stream in this process.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_non_reading_socket_bounds_the_backlog_the_stack_keeps() {
+    let (a, b, a_events, b_events) = linked();
+    let client = Stack::with_device(
+        StackConfig { local_addresses: vec![prefix("10.0.0.2/32")], mtu: 1500 },
+        loopback(&a, 1500),
+        a_events,
+    )
+    .expect("client stack");
+    let server = Stack::with_device(
+        StackConfig { local_addresses: vec![prefix("10.0.0.1/32")], mtu: 1500 },
+        loopback(&b, 1500),
+        b_events,
+    )
+    .expect("server stack");
+
+    let listener = with_timeout("listen_udp", server.listen_udp(None)).await.expect("bind");
+    let destination = SocketAddr::new(IpAddr::V4(Ipv4Addr::new(10, 0, 0, 1)), listener.local_endpoint().port());
+    let sender = with_timeout("dial_udp", client.dial_udp(None, destination)).await.expect("dial");
+
+    const SENT: usize = 4096;
+    for sequence in 0..SENT {
+        Datagram::send_to(&sender, &(sequence as u32).to_be_bytes(), destination).await.expect("send");
+        // Paced, so the sender is not the reason the stack stops taking datagrams.
+        if sequence % 128 == 127 {
+            tokio::time::sleep(Duration::from_millis(1)).await;
+        }
+    }
+    // Let the wire settle: what the queue and the socket's own buffer could not take is dropped
+    // by then, so what the reader sees is the backlog the stack chose to keep.
+    tokio::time::sleep(Duration::from_millis(250)).await;
+
+    let mut buffer = [0u8; 64];
+    let mut received = 0usize;
+    while let Ok(Ok(_)) = tokio::time::timeout(Duration::from_secs(2), listener.recv_from(&mut buffer)).await {
+        received += 1;
+    }
+
+    assert!(
+        received > PACKET_QUEUE_SIZE,
+        "a full event queue must not starve the reader of what the socket still holds: {received} datagrams"
+    );
+    assert!(
+        received <= PACKET_QUEUE_SIZE + 2 * UDP_SOCKET_PACKETS,
+        "the backlog must be bounded by the queue and the socket's own buffer, not by the \
+         sender's stream: {received} of {SENT} datagrams"
+    );
+}
+
+/// Every byte a writer hands to a TCP socket has to reach the peer, including while the
+/// peer's window is closed: `smoltcp`'s transmit buffer takes only what it has room for, so
+/// the driver may drop from the outbox only what `send_slice` accepted, and the peer's window
+/// has to supply the backpressure instead of the unwritten bytes being discarded.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_closed_window_keeps_the_writers_bytes_queued() {
+    const PORT: u16 = 51_900;
+    const CHUNK: usize = 4096;
+    const TOTAL: usize = 4 * 1024 * 1024;
+    const PATTERN: usize = 251;
+
+    let (a, b, a_events, b_events) = linked();
+    let client = Stack::with_device(
+        StackConfig { local_addresses: vec![prefix("10.0.0.2/32")], mtu: 1500 },
+        loopback(&a, 1500),
+        a_events,
+    )
+    .expect("client stack");
+    let server = Stack::with_device(
+        StackConfig { local_addresses: vec![prefix("10.0.0.1/32")], mtu: 1500 },
+        loopback(&b, 1500),
+        b_events,
+    )
+    .expect("server stack");
+    let destination = SocketAddr::new(IpAddr::V4(Ipv4Addr::new(10, 0, 0, 1)), PORT);
+    with_timeout("arm_tcp_port", server.arm_tcp_port(PORT)).await.expect("arm");
+
+    // The reader accepts at once but waits before it reads, so the receive window it
+    // advertises closes while the writer still has bytes to hand over.
+    let reader = tokio::spawn({
+        let server = Arc::clone(&server);
+        async move {
+            let mut conn = with_timeout("accept_tcp", server.accept_tcp()).await.expect("accept");
+            tokio::time::sleep(Duration::from_millis(250)).await;
+            let mut buffer = vec![0u8; 64 * 1024];
+            let mut received = 0usize;
+            let mut mismatch = None;
+            while received < TOTAL {
+                match tokio::time::timeout(Duration::from_secs(5), conn.read(&mut buffer)).await {
+                    Ok(Ok(size)) if size > 0 => {
+                        if let Some(offset) =
+                            (0..size).find(|&offset| buffer[offset] != ((received + offset) % PATTERN) as u8)
+                        {
+                            mismatch = Some(received + offset);
+                            break;
+                        }
+                        received += size;
+                    }
+                    _ => break,
+                }
+            }
+            (received, mismatch)
+        }
+    });
+
+    let mut conn = with_timeout("dial_tcp", client.dial_tcp(None, destination)).await.expect("dial");
+    let mut chunk = vec![0u8; CHUNK];
+    for round in 0..TOTAL / CHUNK {
+        for (offset, byte) in chunk.iter_mut().enumerate() {
+            *byte = ((round * CHUNK + offset) % PATTERN) as u8;
+        }
+        with_timeout("write", conn.write_all(&chunk)).await.expect("the writer must not stall");
+    }
+
+    let (received, mismatch) = with_timeout("reader", reader).await.expect("reader task");
+    assert_eq!(mismatch, None, "the reader saw the wrong byte at stream offset {mismatch:?}");
+    assert_eq!(received, TOTAL, "the reader must see every byte the writer handed over");
 }

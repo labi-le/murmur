@@ -278,7 +278,8 @@ impl<T: Clone + Send + Sync + 'static> Group<T> {
 
     /// Like [`Group::do_`] but returns a channel that receives the result when it is ready.
     ///
-    /// The call is completed by a spawned task, so the group has to be held in an `Arc`.
+    /// The call is completed by a spawned task, so the group has to be held in an `Arc`. A call
+    /// retained by `store_result` answers a later caller with its stored result.
     pub fn do_chan<F, Fut>(self: &Arc<Self>, key: &str, f: F) -> oneshot::Receiver<Result<T>>
     where
         F: FnOnce() -> Fut + Send + 'static,
@@ -289,7 +290,23 @@ impl<T: Clone + Send + Sync + 'static> Group<T> {
             let mut m = self.mu.lock();
             if let Some(call) = m.get(key) {
                 call.dups.fetch_add(1, Ordering::SeqCst);
-                call.chans.lock().push(tx);
+                // `chans` is held across the read of `done`, so the drain in `CallGuard::finish`
+                // cannot miss a sender registered here.
+                let mut chans = call.chans.lock();
+                let published = call.done.borrow().clone();
+                match published {
+                    // A call retained by `store_result` was drained once already, so its stored
+                    // result answers this caller instead of a sender nobody will drain.
+                    Some(result) => {
+                        drop(chans);
+                        let _ = tx.send(Result {
+                            val: result.val.clone(),
+                            err: result.err.clone(),
+                            shared: result.shared,
+                        });
+                    }
+                    None => chans.push(tx),
+                }
                 return rx;
             }
             let call = Arc::new(Call::new());
@@ -352,5 +369,29 @@ impl<T: Clone + Send + Sync + 'static> Group<T> {
 
     pub fn reset(&self) {
         *self.mu.lock() = HashMap::new();
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::task::Poll;
+
+    use super::*;
+
+    #[tokio::test]
+    async fn do_chan_delivers_a_result_published_before_the_caller_arrived() {
+        let Group { mu, .. } = Group::<i32>::default();
+        let group = Arc::new(Group { mu, store_result: true });
+
+        let first = group.do_chan("k", || async { Ok(1) });
+        assert_eq!(first.await.expect("the first call resolves").outcome().unwrap(), 1);
+
+        let mut second = group.do_chan("k", || async { Ok(2) });
+        let got = match futures::poll!(&mut second) {
+            Poll::Ready(Ok(result)) => result,
+            Poll::Ready(Err(err)) => panic!("the second receiver was dropped without a result: {err}"),
+            Poll::Pending => panic!("the retained call left the second receiver with no sender to wake it"),
+        };
+        assert_eq!(got.outcome().unwrap(), 1, "the stored result answers, not the closure's");
     }
 }

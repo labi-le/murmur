@@ -359,24 +359,27 @@ impl NetworkConfigData {
 
     /// Applies the network's own rules before any delegated capability rules.
     #[must_use]
-    #[expect(
+    #[allow(
         clippy::needless_pass_by_value,
-        reason = "crate API: the rule context is a caller-owned value; each rule set clones it rather than moving it"
+        reason = "crate API: the rule context is a caller-owned value, as the reference's matcher takes it"
     )]
-    pub fn filter_frame(&self, frame: &Frame, context: FrameRuleContext) -> FrameRuleDecision {
-        let mut network_context = context.clone();
-        let mut decision = self.evaluate_rules(&self.rules, frame, &mut network_context);
+    pub fn filter_frame(&self, frame: &Frame, mut context: FrameRuleContext) -> FrameRuleDecision {
+        // Evaluation only mutates `super_accept`, so one context serves every rule set; the
+        // capability list moves out because the loop needs it borrowed while the context is mutable.
+        let capabilities = std::mem::take(&mut context.capabilities);
+        let super_accept = context.super_accept;
+        let mut decision = self.evaluate_rules(&self.rules, frame, &mut context);
         if decision.result != RuleResult::NoMatch {
             return decision;
         }
-        for capability in &context.capabilities {
+        for capability in &capabilities {
             if context.inbound
                 && absolute_difference(capability.timestamp, self.timestamp) > self.credential_time_max_delta
             {
                 continue;
             }
-            let mut capability_context = context.clone();
-            let mut capability_decision = self.evaluate_rules(&capability.rules, frame, &mut capability_context);
+            context.super_accept = super_accept;
+            let mut capability_decision = self.evaluate_rules(&capability.rules, frame, &mut context);
             if capability_decision.result == RuleResult::Accept {
                 capability_decision.capability_rule_log = std::mem::take(&mut capability_decision.rule_log);
                 capability_decision.rule_log = std::mem::take(&mut decision.rule_log);
@@ -884,24 +887,24 @@ impl NetworkConfigData {
         } else {
             match find_tag(&context.local_tags, id, self, false) {
                 Some(tag) => tag.value == expected,
-                None => false,
+                None => not_applicable,
             }
         }
     }
 }
 
-/// Locates a tag, applying remote credential freshness to the remote table.
+/// Locates a tag. The remote table mirrors the reference's id -> tag map, whose entry is the newest
+/// record for the id; the local table is read from the front, as its lower bound does.
 fn find_tag<'a>(tags: &'a [Tag], id: u32, config: &NetworkConfigData, remote: bool) -> Option<&'a Tag> {
-    for tag in tags {
-        if tag.id != id {
-            continue;
-        }
-        if remote && absolute_difference(tag.timestamp, config.timestamp) > config.credential_time_max_delta {
-            return None;
-        }
-        return Some(tag);
+    let tag = if remote {
+        tags.iter().filter(|tag| tag.id == id).max_by_key(|tag| tag.timestamp)?
+    } else {
+        tags.iter().find(|tag| tag.id == id)?
+    };
+    if remote && absolute_difference(tag.timestamp, config.timestamp) > config.credential_time_max_delta {
+        return None;
     }
-    None
+    Some(tag)
 }
 
 /// Extracts the asserted source IP from IPv4, IPv6, NDP, or ARP.
@@ -1246,6 +1249,37 @@ mod tests {
         assert!(config.allows_frame(&frame, FrameRuleContext::default()));
     }
 
+    /// Every rule set starts from the caller's `super_accept`, not from what the network rule set or
+    /// a previous capability left behind.
+    #[test]
+    fn each_rule_set_starts_from_the_callers_super_accept() {
+        let local = Address::new(2);
+        let mut raises_super_accept = Capability::default();
+        raises_super_accept.rules = vec![
+            NetworkRule { rule_type: RULE_MATCH_ETHER_TYPE, value: 0x1234u16.to_be_bytes().to_vec() },
+            NetworkRule { rule_type: RULE_ACTION_TEE, value: forward_rule_value(local, 0) },
+            NetworkRule { rule_type: RULE_ACTION_DROP, value: Vec::new() },
+        ];
+        let mut reads_super_accept = Capability::default();
+        reads_super_accept.rules = vec![
+            NetworkRule { rule_type: RULE_MATCH_TAG_SENDER, value: vec![0, 0, 0, 7, 0, 0, 0, 1] },
+            NetworkRule { rule_type: RULE_ACTION_ACCEPT, value: Vec::new() },
+        ];
+        let config =
+            NetworkConfigData { capabilities: vec![raises_super_accept, reads_super_accept], ..Default::default() };
+        let context = FrameRuleContext {
+            inbound: true,
+            source_zt: Address::new(1),
+            destination_zt: local,
+            ..Default::default()
+        };
+
+        assert!(
+            !config.allows_frame(&frame(ETHER_TYPE_IPV4, 20), context),
+            "the second capability must not inherit the first one's super_accept"
+        );
+    }
+
     #[test]
     fn capability_accept_preserves_both_base_and_capability_tee() {
         let base_target = Address::new(3);
@@ -1304,6 +1338,98 @@ mod tests {
         let mut outbound = context();
         outbound.local_tags = vec![local];
         assert!(config.allows_frame(&frame(ETHER_TYPE_IPV4, 20), outbound));
+    }
+
+    /// A NOT-flagged tag rule does not apply to a tag the network never issued.
+    #[test]
+    fn a_not_flagged_tag_rule_does_not_apply_to_an_absent_local_tag() {
+        let config = NetworkConfigData {
+            rules: vec![
+                NetworkRule {
+                    rule_type: RULE_MATCH_TAG_SENDER | RULE_FLAG_NOT,
+                    value: vec![0, 0, 0, 9, 0, 0, 0, 42],
+                },
+                NetworkRule { rule_type: RULE_ACTION_ACCEPT, value: Vec::new() },
+                NetworkRule { rule_type: RULE_ACTION_DROP, value: Vec::new() },
+            ],
+            ..Default::default()
+        };
+        let mut context = context();
+        context.local_tags = vec![tag(7, 42, 0)];
+
+        assert!(
+            !config.allows_frame(&frame(ETHER_TYPE_IPV4, 20), context),
+            "an unissued tag leaves the rule inapplicable, so the NOT flag must not make it match"
+        );
+    }
+
+    /// The same rule with the tag present compares the value in both directions.
+    #[test]
+    fn a_not_flagged_tag_rule_compares_a_present_local_tag() {
+        let config = NetworkConfigData {
+            rules: vec![
+                NetworkRule {
+                    rule_type: RULE_MATCH_TAG_SENDER | RULE_FLAG_NOT,
+                    value: vec![0, 0, 0, 7, 0, 0, 0, 42],
+                },
+                NetworkRule { rule_type: RULE_ACTION_ACCEPT, value: Vec::new() },
+                NetworkRule { rule_type: RULE_ACTION_DROP, value: Vec::new() },
+            ],
+            ..Default::default()
+        };
+        let mut equal = context();
+        equal.local_tags = vec![tag(7, 42, 0)];
+        assert!(!config.allows_frame(&frame(ETHER_TYPE_IPV4, 20), equal), "the value matches, so the NOT rule does not");
+
+        let mut different = context();
+        different.local_tags = vec![tag(7, 7, 0)];
+        assert!(
+            config.allows_frame(&frame(ETHER_TYPE_IPV4, 20), different),
+            "the value differs, so the NOT rule matches"
+        );
+    }
+
+    /// A plain tag rule matches a present tag and leaves an absent one inapplicable.
+    #[test]
+    fn a_plain_tag_rule_matches_only_a_present_local_tag() {
+        let config = NetworkConfigData {
+            rules: vec![
+                NetworkRule { rule_type: RULE_MATCH_TAG_SENDER, value: vec![0, 0, 0, 7, 0, 0, 0, 42] },
+                NetworkRule { rule_type: RULE_ACTION_ACCEPT, value: Vec::new() },
+                NetworkRule { rule_type: RULE_ACTION_DROP, value: Vec::new() },
+            ],
+            ..Default::default()
+        };
+        let mut present = context();
+        present.local_tags = vec![tag(7, 42, 0)];
+        assert!(config.allows_frame(&frame(ETHER_TYPE_IPV4, 20), present));
+
+        assert!(!config.allows_frame(&frame(ETHER_TYPE_IPV4, 20), context()));
+    }
+
+    /// The reference keeps remote credentials in an id -> tag map whose entry is the newest
+    /// accepted record, so the freshness check applies to that record alone.
+    #[test]
+    fn a_fresh_remote_tag_behind_a_stale_one_is_still_found() {
+        let config = NetworkConfigData { timestamp: 10, credential_time_max_delta: 1, ..Default::default() };
+        let remote = vec![tag(7, 1, 0), tag(7, 2, 10)];
+        assert_eq!(find_tag(&remote, 7, &config, true).map(|tag| tag.value), Some(2));
+    }
+
+    /// An older record never displaces a newer one, whatever order the wire carried them in.
+    #[test]
+    fn an_older_remote_tag_does_not_displace_a_newer_one() {
+        let config = NetworkConfigData { timestamp: 10, credential_time_max_delta: 1, ..Default::default() };
+        let remote = vec![tag(7, 2, 10), tag(7, 1, 0)];
+        assert_eq!(find_tag(&remote, 7, &config, true).map(|tag| tag.value), Some(2));
+    }
+
+    /// The local table is the configuration's list, which the reference reads with a lower bound.
+    #[test]
+    fn the_local_tag_table_reads_the_first_record_for_an_id() {
+        let config = NetworkConfigData::default();
+        let local = vec![tag(7, 1, 0), tag(7, 2, 0)];
+        assert_eq!(find_tag(&local, 7, &config, false).map(|tag| tag.value), Some(1));
     }
 
     /// Bits 8..11 carry the low nibble of the TCP data-offset byte, as ZeroTier One's matcher does.
