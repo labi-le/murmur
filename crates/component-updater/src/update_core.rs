@@ -21,6 +21,8 @@ use murmur_constant::version::VERSION;
 use murmur_constant_features::{AMD64_LEVEL, ARM_VERSION, MIPS_FLOAT};
 use murmur_log::{debugln, errorln, infoln, warnln};
 
+use crate::utils::in_dest;
+
 const BASE_RELEASE_URL: &str = "https://github.com/labi-le/murmur/releases/latest/download/";
 const VERSION_RELEASE_URL: &str = "https://github.com/labi-le/murmur/releases/latest/download/version.txt";
 
@@ -357,6 +359,10 @@ fn gz_file_unpack(gzfile: &Path, out_dir: &Path, file_mode: u32) -> Result<PathB
         });
 
     let output_name = out_dir.join(&original_name);
+    if !in_dest(&output_name, out_dir) {
+        return Err(anyhow!("invalid file path: {}", output_name.display()));
+    }
+
     let mut wc = open_write_mode(&output_name, file_mode)
         .map_err(|err| anyhow!("os.OpenFile({}): {err}", output_name.display()))?;
     std::io::copy(&mut gz_reader, &mut wc).map_err(|err| anyhow!("copy: {err}"))?;
@@ -415,6 +421,57 @@ fn copy_file(src: &Path, dst: &Path) -> Result<()> {
 
 #[cfg(test)]
 mod tests {
+    use std::io::Write as _;
+    use std::path::PathBuf;
+
+    use super::unpack;
+
+    fn test_dir(name: &str) -> PathBuf {
+        let dir = std::env::temp_dir().join(format!("murmur-{name}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).expect("create test dir");
+        dir
+    }
+
+    /// A gzip whose header names `name`, filled with `len` zero bytes: a few KiB of compressed
+    /// input that inflates to `len`.
+    fn gzip(name: &str, len: usize) -> Vec<u8> {
+        let mut encoder = flate2::GzBuilder::new().filename(name).write(Vec::new(), flate2::Compression::fast());
+        let chunk = vec![0u8; 64 * 1024];
+        let mut written = 0;
+        while written < len {
+            let n = (len - written).min(chunk.len());
+            encoder.write_all(&chunk[..n]).expect("gzip write");
+            written += n;
+        }
+        encoder.finish().expect("gzip finish")
+    }
+
+    #[test]
+    fn gz_unpack_rejects_a_name_that_leaves_the_update_directory() {
+        let root = test_dir("gz-unpack-traversal");
+        let out = root.join("meta-update");
+        std::fs::create_dir_all(&out).expect("create update dir");
+        let package = out.join("murmur-linux-amd64-1.0.gz");
+
+        std::fs::write(&package, gzip("../escaped.bin", 16)).expect("write package");
+        let err = unpack(&out, &package, 0o644).expect_err("a name that leaves the directory is rejected");
+        assert!(err.to_string().contains("invalid file path"), "{err}");
+        assert!(!root.join("escaped.bin").exists());
+
+        let absolute = root.join("absolute-escaped.bin");
+        std::fs::write(&package, gzip(&absolute.to_string_lossy(), 16)).expect("write package");
+        let err = unpack(&out, &package, 0o644).expect_err("an absolute name is rejected");
+        assert!(err.to_string().contains("invalid file path"), "{err}");
+        assert!(!absolute.exists());
+
+        std::fs::write(&package, gzip("murmur-linux-amd64", 16)).expect("write package");
+        unpack(&out, &package, 0o644).expect("a plain name still unpacks");
+        assert_eq!(16, std::fs::metadata(out.join("murmur-linux-amd64")).expect("unpacked file").len());
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
     /// Expected value derived from `CoreUpdater::core_base_name`: `murmur-<os>-<arch>-<AMD64_LEVEL>`
     /// for the `amd64` non-android case, with `AMD64_LEVEL` empty unless that env var was set at
     /// build time.
