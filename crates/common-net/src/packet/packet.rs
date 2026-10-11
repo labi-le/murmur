@@ -85,7 +85,7 @@ impl PacketConn for EnhancePacketConnImpl {
 
 #[async_trait]
 impl WaitReadFrom for EnhancePacketConnImpl {
-    // cancel-safe: forwards to the wrapped conn's `wait_read_from` and owns no state of its own, so dropping this future is exactly dropping the inner call.
+    // NOT cancel-safe: forwards to the free `wait_read_from`, which awaits the wrapped `PacketConn::read_from`; a conn that consumes framing across several reads (sing's length-prefixed read) loses that packet when the call is dropped.
     async fn wait_read_from(
         &self,
     ) -> (Vec<u8>, Option<Box<dyn FnOnce() + Send>>, Option<Box<dyn Addr>>, io::Result<()>) {

@@ -75,7 +75,7 @@ impl NetPacketWriter for RefSingPacketConn {
 
 #[async_trait]
 impl WaitReadFrom for RefSingPacketConn {
-    // cancel-safe: forwards to the wrapped conn's `wait_read_from` and owns no state of its own, so dropping this future is exactly dropping the inner call.
+    // NOT cancel-safe: reaches `RefPacketConn`'s `dyn EnhancePacketConn`, which can be the framing-consuming `EnhancePacketConnImpl`; a dropped call loses that packet.
     async fn wait_read_from(
         &self,
     ) -> (Vec<u8>, Option<Box<dyn FnOnce() + Send>>, Option<Box<dyn Addr>>, io::Result<()>) {
