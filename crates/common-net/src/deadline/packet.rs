@@ -106,9 +106,8 @@ impl PacketConn for NetPacketConn {
         self.packet_conn.set_write_deadline(deadline)
     }
 
-    /// Sets the read deadline. Note that, unlike `deadline::conn::Conn`'s
-    /// equivalent, this never arms `deadline_token`, so `with_read_deadline`'s race never actually
-    /// times out; a pre-existing defect, reported rather than fixed per the refactor contract.
+    /// A deadline set while a read is already parked cannot interrupt that read, so that case hands
+    /// the deadline to the wrapped conn and stops racing the token.
     fn set_read_deadline(&self, deadline: Option<Instant>) -> io::Result<()> {
         if self.disable_pipe.load() {
             return self.packet_conn.set_read_deadline(deadline);
@@ -116,6 +115,7 @@ impl PacketConn for NetPacketConn {
             self.disable_pipe.store(true);
             return self.packet_conn.set_read_deadline(deadline);
         }
+        self.deadline_token.set(deadline);
         self.has_deadline.store(deadline.is_some());
         Ok(())
     }
@@ -136,5 +136,79 @@ impl ReaderWithUpstream for NetPacketConn {
 impl WriterWithUpstream for NetPacketConn {
     fn writer_replaceable(&self) -> bool {
         true
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::future::pending;
+    use std::net::{Ipv4Addr, SocketAddr};
+    use std::time::Duration;
+
+    use murmur_std_compat::net::UdpAddr;
+
+    use super::*;
+
+    /// A conn whose read never completes, so only a read deadline can end it.
+    struct NeverReadyPacketConn;
+
+    #[async_trait]
+    impl PacketConn for NeverReadyPacketConn {
+        async fn read_from(&self, _buf: &mut [u8]) -> io::Result<(usize, Box<dyn Addr>)> {
+            pending().await
+        }
+
+        async fn write_to(&self, _buf: &[u8], _addr: &dyn Addr) -> io::Result<usize> {
+            Ok(0)
+        }
+
+        fn local_addr(&self) -> io::Result<Box<dyn Addr>> {
+            Ok(Box::new(UdpAddr::from(SocketAddr::from((Ipv4Addr::LOCALHOST, 0)))))
+        }
+
+        fn close(&self) -> io::Result<()> {
+            Ok(())
+        }
+    }
+
+    fn exceeded<T, E>(result: &Result<io::Result<T>, E>) -> bool {
+        matches!(result, Ok(Err(err)) if err.kind() == io::ErrorKind::TimedOut)
+    }
+
+    #[tokio::test]
+    async fn an_elapsed_read_deadline_ends_the_read_with_deadline_exceeded() {
+        let conn = new_net_packet_conn(Arc::new(NeverReadyPacketConn));
+        conn.set_read_deadline(Some(Instant::now() - Duration::from_secs(1))).expect("set the read deadline");
+
+        let mut buf = [0u8; 1500];
+        let result = tokio::time::timeout(Duration::from_secs(2), conn.read_from(&mut buf)).await;
+        assert!(exceeded(&result), "an elapsed read deadline must end the read, got {result:?}");
+    }
+
+    #[tokio::test]
+    async fn a_future_read_deadline_ends_the_read_when_it_elapses_and_not_before() {
+        let conn = new_net_packet_conn(Arc::new(NeverReadyPacketConn));
+        conn.set_read_deadline(Some(Instant::now() + Duration::from_millis(600))).expect("set the read deadline");
+
+        let mut buf = [0u8; 1500];
+        let early = tokio::select! {
+            result = conn.read_from(&mut buf) => Some(result),
+            () = tokio::time::sleep(Duration::from_millis(100)) => None,
+        };
+        assert!(early.is_none(), "a read deadline 600ms out must not end the read after 100ms");
+
+        let result = tokio::time::timeout(Duration::from_secs(5), conn.read_from(&mut buf)).await;
+        assert!(exceeded(&result), "the read deadline must end the read once it elapses, got {result:?}");
+    }
+
+    #[tokio::test]
+    async fn clearing_the_read_deadline_leaves_the_read_unbounded() {
+        let conn = new_net_packet_conn(Arc::new(NeverReadyPacketConn));
+        conn.set_read_deadline(Some(Instant::now() + Duration::from_millis(200))).expect("set the read deadline");
+        conn.set_read_deadline(None).expect("clear the read deadline");
+
+        let mut buf = [0u8; 1500];
+        let result = tokio::time::timeout(Duration::from_millis(500), conn.read_from(&mut buf)).await;
+        assert!(result.is_err(), "a cleared read deadline must leave the read unbounded, got {result:?}");
     }
 }

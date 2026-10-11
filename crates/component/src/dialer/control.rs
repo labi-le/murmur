@@ -789,14 +789,14 @@ impl StdListenConfig {
         }
         #[cfg(any(target_os = "linux", target_os = "android"))]
         if !self.disable_tfo {
-            set_tfo_listener(&socket).map_err(|err| anyhow::anyhow!("setsockopt(TCP_FASTOPEN): {err}"))?;
+            set_tfo_listener(&socket, backlog).map_err(|err| anyhow::anyhow!("setsockopt(TCP_FASTOPEN): {err}"))?;
         }
 
         socket.bind(&SockAddr::from(bind_addr))?;
         socket.listen(listener_backlog())?;
 
         let listener = TcpListener::from_std(std::net::TcpListener::from(socket))?;
-        Ok(Box::new(TcpAcceptor::new(listener)))
+        Ok(Box::new(KeepAliveAcceptor::new(Box::new(TcpAcceptor::new(listener)), self.keep_alive_config)))
     }
 
     pub async fn listen_packet(
