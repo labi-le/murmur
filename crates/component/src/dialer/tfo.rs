@@ -465,7 +465,9 @@ fn set_tfo_dialer(fd: usize) -> anyhow::Result<()> {
     Ok(setsockopt_int(fd, libc::TCP_FASTOPEN, 1)?)
 }
 
-/// The TFO dialer socket option on Windows.
+/// The TFO dialer socket option on Windows. MSDN's IPPROTO_TCP options list `TCP_FASTOPEN`
+/// (Windows 10 1607) for that platform, the client's early data going through `ConnectEx`;
+/// `TCP_FASTOPEN_CONNECT` is the Linux client-side option, not a Windows one.
 #[cfg(windows)]
 const TFO_DIALER_SOCKOPT: &str = "TCP_FASTOPEN";
 
@@ -503,6 +505,22 @@ const TFO_DIALER_SOCKOPT: &str = "TCP_FASTOPEN";
 #[cfg(not(any(target_os = "linux", target_os = "android", target_os = "macos", target_os = "freebsd", windows)))]
 fn set_tfo_dialer(_fd: usize) -> anyhow::Result<()> {
     Ok(())
+}
+
+#[cfg(all(test, windows))]
+mod windows_dialer_option_tests {
+    use windows_sys::Win32::Networking::WinSock::TCP_FASTOPEN;
+
+    use super::TFO_DIALER_SOCKOPT;
+
+    /// The error message names the option the arm sets, and MSDN's IPPROTO_TCP options define
+    /// that option as `TCP_FASTOPEN` (15); a `TCP_FASTOPEN_CONNECT` (30) here would be the Linux
+    /// client-side option, which Windows refuses.
+    #[test]
+    fn the_dialer_sets_the_option_msdn_documents_for_windows() {
+        assert_eq!(TFO_DIALER_SOCKOPT, "TCP_FASTOPEN");
+        assert_eq!(TCP_FASTOPEN, 15);
+    }
 }
 
 #[cfg(test)]
