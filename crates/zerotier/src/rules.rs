@@ -890,18 +890,18 @@ impl NetworkConfigData {
     }
 }
 
-/// Locates a tag, applying remote credential freshness to the remote table.
+/// Locates a tag. The remote table mirrors the reference's id -> tag map, whose entry is the newest
+/// record for the id; the local table is read from the front, as its lower bound does.
 fn find_tag<'a>(tags: &'a [Tag], id: u32, config: &NetworkConfigData, remote: bool) -> Option<&'a Tag> {
-    for tag in tags {
-        if tag.id != id {
-            continue;
-        }
-        if remote && absolute_difference(tag.timestamp, config.timestamp) > config.credential_time_max_delta {
-            return None;
-        }
-        return Some(tag);
+    let tag = if remote {
+        tags.iter().filter(|tag| tag.id == id).max_by_key(|tag| tag.timestamp)?
+    } else {
+        tags.iter().find(|tag| tag.id == id)?
+    };
+    if remote && absolute_difference(tag.timestamp, config.timestamp) > config.credential_time_max_delta {
+        return None;
     }
-    None
+    Some(tag)
 }
 
 /// Extracts the asserted source IP from IPv4, IPv6, NDP, or ARP.
@@ -1304,6 +1304,31 @@ mod tests {
         let mut outbound = context();
         outbound.local_tags = vec![local];
         assert!(config.allows_frame(&frame(ETHER_TYPE_IPV4, 20), outbound));
+    }
+
+    /// The reference keeps remote credentials in an id -> tag map whose entry is the newest
+    /// accepted record, so the freshness check applies to that record alone.
+    #[test]
+    fn a_fresh_remote_tag_behind_a_stale_one_is_still_found() {
+        let config = NetworkConfigData { timestamp: 10, credential_time_max_delta: 1, ..Default::default() };
+        let remote = vec![tag(7, 1, 0), tag(7, 2, 10)];
+        assert_eq!(find_tag(&remote, 7, &config, true).map(|tag| tag.value), Some(2));
+    }
+
+    /// An older record never displaces a newer one, whatever order the wire carried them in.
+    #[test]
+    fn an_older_remote_tag_does_not_displace_a_newer_one() {
+        let config = NetworkConfigData { timestamp: 10, credential_time_max_delta: 1, ..Default::default() };
+        let remote = vec![tag(7, 2, 10), tag(7, 1, 0)];
+        assert_eq!(find_tag(&remote, 7, &config, true).map(|tag| tag.value), Some(2));
+    }
+
+    /// The local table is the configuration's list, which the reference reads with a lower bound.
+    #[test]
+    fn the_local_tag_table_reads_the_first_record_for_an_id() {
+        let config = NetworkConfigData::default();
+        let local = vec![tag(7, 1, 0), tag(7, 2, 0)];
+        assert_eq!(find_tag(&local, 7, &config, false).map(|tag| tag.value), Some(1));
     }
 
     /// Bits 8..11 carry the low nibble of the TCP data-offset byte, as ZeroTier One's matcher does.
