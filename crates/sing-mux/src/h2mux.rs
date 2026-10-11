@@ -39,6 +39,14 @@ use murmur_log::warnln;
 /// to send.
 const MAX_FRAME_SIZE: u32 = 32 * 1024;
 
+/// The streams one carrier may hold open at once: the h2 `SETTINGS_MAX_CONCURRENT_STREAMS` a peer
+/// is told, which h2 enforces by resetting anything past it.
+const MAX_CONCURRENT_STREAMS: u32 = 1024;
+
+/// The inbound queue depth: the accept loop stops admitting while the service is this far behind,
+/// the way the smux session's accept queue does.
+const ACCEPT_BACKLOG: usize = 256;
+
 struct RecvHalf {
     stream: RecvStream,
     pending: Bytes,
@@ -246,7 +254,7 @@ impl<R: H2ReadHalf + Unpin> AsyncWrite for H2Stream<R> {
 
 #[derive(Debug)]
 pub struct H2MuxServerSession {
-    inbound: AsyncMutex<mpsc::UnboundedReceiver<Box<dyn MuxStream>>>,
+    inbound: AsyncMutex<mpsc::Receiver<Box<dyn MuxStream>>>,
     active: Arc<AtomicUsize>,
     done: Arc<AtomicBool>,
     task: JoinHandle<()>,
@@ -255,13 +263,18 @@ pub struct H2MuxServerSession {
 impl H2MuxServerSession {
     #[must_use]
     pub fn new(conn: Box<dyn MuxConn>) -> Self {
-        let (tx, rx) = mpsc::unbounded_channel();
+        let (tx, rx) = mpsc::channel(ACCEPT_BACKLOG);
         let active = Arc::new(AtomicUsize::new(0));
         let task_active = Arc::clone(&active);
         let done = Arc::new(AtomicBool::new(false));
         let task_done = Arc::clone(&done);
         let task = tokio::spawn(async move {
-            let mut connection = match server::Builder::new().max_frame_size(MAX_FRAME_SIZE).handshake(conn).await {
+            let mut connection = match server::Builder::new()
+                .max_frame_size(MAX_FRAME_SIZE)
+                .max_concurrent_streams(MAX_CONCURRENT_STREAMS)
+                .handshake(conn)
+                .await
+            {
                 Ok(connection) => connection,
                 Err(err) => {
                     warnln!("sing-mux: h2mux server handshake failed: {err}");
@@ -286,7 +299,7 @@ impl H2MuxServerSession {
                         let send = SendHalf { stream: send_stream, end_of_stream: false };
                         let stream: Box<dyn MuxStream> =
                             Box::new(H2Stream { recv, send, active: Arc::clone(&task_active) });
-                        if tx.send(stream).is_err() {
+                        if tx.send(stream).await.is_err() {
                             break;
                         }
                     }
@@ -348,8 +361,12 @@ pub struct H2MuxClientSession {
 
 impl H2MuxClientSession {
     pub async fn new(conn: Box<dyn MuxConn>) -> io::Result<Self> {
-        let (send_request, connection) =
-            client::Builder::new().max_frame_size(MAX_FRAME_SIZE).handshake(conn).await.map_err(io::Error::other)?;
+        let (send_request, connection) = client::Builder::new()
+            .max_frame_size(MAX_FRAME_SIZE)
+            .max_concurrent_streams(MAX_CONCURRENT_STREAMS)
+            .handshake(conn)
+            .await
+            .map_err(io::Error::other)?;
         let done = Arc::new(AtomicBool::new(false));
         let task_done = Arc::clone(&done);
         let task = tokio::spawn(async move {
@@ -414,7 +431,10 @@ mod tests {
 
     use tokio::io::{duplex, AsyncReadExt, AsyncWriteExt};
 
-    use super::{H2MuxClientSession, H2MuxServerSession};
+    use super::{
+        client, Bytes, H2MuxClientSession, H2MuxServerSession, Method, Request, ResponseFuture, SendStream, Uri,
+        ACCEPT_BACKLOG, MAX_CONCURRENT_STREAMS,
+    };
     use crate::padding::new_padding_conn;
     use crate::session::MuxConn;
     use crate::session::Session;
@@ -489,5 +509,60 @@ mod tests {
         let accept_err = client.accept().await.err().expect("client accept is unsupported");
         assert_eq!(open_err.kind(), std::io::ErrorKind::Unsupported);
         assert_eq!(accept_err.kind(), std::io::ErrorKind::Unsupported);
+    }
+
+    /// Waits for the session's admitted-stream count to stop moving, then reports it.
+    async fn settled_num_streams(server: &H2MuxServerSession) -> usize {
+        let mut last = 0;
+        let mut stable = 0;
+        for _ in 0..300 {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+            let now = server.num_streams();
+            stable = if now == last { stable + 1 } else { 0 };
+            if stable >= 5 {
+                break;
+            }
+            last = now;
+        }
+        server.num_streams()
+    }
+
+    /// A peer that opens streams faster than the service drains them cannot drive the session's
+    /// admitted set: the queue stops the accept loop and the peer is told a ceiling instead of
+    /// unlimited concurrency.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_peer_cannot_admit_more_streams_than_the_backlog() {
+        let (client_io, server_io) = duplex(256 * 1024);
+        let server = H2MuxServerSession::new(Box::new(server_io));
+
+        let (mut send_request, connection) =
+            client::Builder::new().handshake(client_io).await.expect("client handshake");
+        tokio::spawn(async move {
+            let _ = connection.await;
+        });
+
+        // Kept alive, so the peer holds every stream it opened; nothing ever accepts them.
+        let mut held: Vec<(ResponseFuture, SendStream<Bytes>)> = Vec::new();
+        while held.len() < ACCEPT_BACKLOG + 64 {
+            let mut ready = send_request.ready().await.expect("another stream fits");
+            let request = Request::builder()
+                .method(Method::CONNECT)
+                .uri(Uri::from_static("https://localhost"))
+                .body(())
+                .expect("request");
+            held.push(ready.send_request(request, true).expect("send"));
+            send_request = ready;
+        }
+
+        let admitted = settled_num_streams(&server).await;
+        assert!(
+            admitted <= ACCEPT_BACKLOG + 1,
+            "the session admits at most its backlog plus its hand-off, got {admitted}"
+        );
+        assert_eq!(
+            send_request.current_max_send_streams(),
+            MAX_CONCURRENT_STREAMS as usize,
+            "the peer must be told a ceiling rather than unlimited concurrency"
+        );
     }
 }
