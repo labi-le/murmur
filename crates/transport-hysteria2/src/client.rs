@@ -490,14 +490,18 @@ impl AsyncRead for ClientStream {
 impl AsyncWrite for ClientStream {
     fn poll_write(mut self: Pin<&mut Self>, cx: &mut Context<'_>, buf: &[u8]) -> Poll<io::Result<usize>> {
         if !self.request_written {
-            self.request_written = true;
             let frame = protocol::write_tcp_request(&self.destination, buf);
+            let frame_len = frame.len();
             return match AsyncWrite::poll_write(Pin::new(&mut self.stream.send), cx, &frame) {
-                Poll::Ready(Ok(written)) if written == frame.len() => Poll::Ready(Ok(buf.len())),
+                Poll::Ready(Ok(written)) if written == frame_len => {
+                    self.request_written = true;
+                    Poll::Ready(Ok(buf.len()))
+                }
                 Poll::Ready(Ok(_)) => {
                     Poll::Ready(Err(io::Error::other("hysteria2: short write of the stream request")))
                 }
                 Poll::Ready(Err(err)) => Poll::Ready(Err(err)),
+                // Nothing was accepted, so the header still has to go out on the next poll.
                 Poll::Pending => Poll::Pending,
             };
         }
@@ -567,6 +571,10 @@ fn cancelled() -> io::Error {
 
 #[cfg(test)]
 mod tests {
+    use base64::Engine as _;
+    use murmur_component_ca::keypair::{new_random_tls_key_pair, KeyPairType};
+    use rustls::pki_types::{CertificateDer, PrivateKeyDer, PrivatePkcs8KeyDer};
+
     use super::*;
 
     async fn base() -> ClientOptions {
@@ -755,5 +763,129 @@ mod tests {
         let client = Client::new(base().await).unwrap();
         client.close_with_error("proxy removed").unwrap();
         client.close_with_error("proxy removed").unwrap();
+    }
+
+    /// The generated certificate carries no SAN, so the peer accepts it through a verifier rather
+    /// than a name check; the loopback only needs *a* TLS 1.3 handshake, not identity.
+    #[derive(Debug)]
+    struct AcceptAnyCertificate;
+
+    impl rustls::client::danger::ServerCertVerifier for AcceptAnyCertificate {
+        fn verify_server_cert(
+            &self,
+            _end_entity: &CertificateDer<'_>,
+            _intermediates: &[CertificateDer<'_>],
+            _server_name: &rustls::pki_types::ServerName<'_>,
+            _ocsp_response: &[u8],
+            _now: rustls::pki_types::UnixTime,
+        ) -> std::result::Result<rustls::client::danger::ServerCertVerified, rustls::Error> {
+            Ok(rustls::client::danger::ServerCertVerified::assertion())
+        }
+
+        fn verify_tls12_signature(
+            &self,
+            _message: &[u8],
+            _cert: &CertificateDer<'_>,
+            _dss: &rustls::DigitallySignedStruct,
+        ) -> std::result::Result<rustls::client::danger::HandshakeSignatureValid, rustls::Error> {
+            Ok(rustls::client::danger::HandshakeSignatureValid::assertion())
+        }
+
+        fn verify_tls13_signature(
+            &self,
+            _message: &[u8],
+            _cert: &CertificateDer<'_>,
+            _dss: &rustls::DigitallySignedStruct,
+        ) -> std::result::Result<rustls::client::danger::HandshakeSignatureValid, rustls::Error> {
+            Ok(rustls::client::danger::HandshakeSignatureValid::assertion())
+        }
+
+        fn supported_verify_schemes(&self) -> Vec<rustls::SignatureScheme> {
+            rustls::crypto::aws_lc_rs::default_provider().signature_verification_algorithms.supported_schemes()
+        }
+    }
+
+    /// `component-ca` generates PEM, rustls wants DER.
+    fn pem_to_der(pem: &str, label: &str) -> Vec<u8> {
+        let body = pem
+            .split_once(&format!("-----BEGIN {label}-----"))
+            .and_then(|(_, rest)| rest.split_once(&format!("-----END {label}-----")))
+            .map(|(body, _)| body)
+            .unwrap_or_else(|| panic!("no {label} block in PEM"));
+        let unwrapped: String = body.chars().filter(|c| !c.is_whitespace()).collect();
+        base64::engine::general_purpose::STANDARD.decode(unwrapped).expect("the PEM body is base64")
+    }
+
+    fn provider() -> Arc<rustls::crypto::CryptoProvider> {
+        Arc::new(rustls::crypto::aws_lc_rs::default_provider())
+    }
+
+    fn server_tls() -> Arc<rustls::ServerConfig> {
+        let (certificate_pem, private_key_pem, _) =
+            new_random_tls_key_pair(KeyPairType::P256).expect("generate a server key pair");
+        let certificate = CertificateDer::from(pem_to_der(&certificate_pem, "CERTIFICATE"));
+        let key = PrivateKeyDer::Pkcs8(PrivatePkcs8KeyDer::from(pem_to_der(&private_key_pem, "PRIVATE KEY")));
+        let mut config = rustls::ServerConfig::builder_with_provider(provider())
+            .with_protocol_versions(&[&rustls::version::TLS13])
+            .expect("tls 1.3 only")
+            .with_no_client_auth()
+            .with_single_cert(vec![certificate], key)
+            .expect("build the server tls config");
+        config.alpn_protocols = vec![b"h3".to_vec()];
+        Arc::new(config)
+    }
+
+    fn client_tls() -> Arc<rustls::ClientConfig> {
+        let mut config = rustls::ClientConfig::builder_with_provider(provider())
+            .with_protocol_versions(&[&rustls::version::TLS13])
+            .expect("tls 1.3 only")
+            .dangerous()
+            .with_custom_certificate_verifier(Arc::new(AcceptAnyCertificate))
+            .with_no_client_auth();
+        config.alpn_protocols = vec![b"h3".to_vec()];
+        Arc::new(config)
+    }
+
+    /// The server advertises a zero stream receive window, so the client's first write is accepted
+    /// by nothing; the request frame has to stay pending for the poll that follows.
+    #[tokio::test]
+    async fn a_pending_first_write_keeps_the_request_frame_pending() {
+        murmur_testsupport_probe::ensure_test_crypto_provider();
+
+        let mut transport = quinn::TransportConfig::default();
+        transport.stream_receive_window(quinn::VarInt::from_u32(0));
+        let crypto =
+            quinn::crypto::rustls::QuicServerConfig::try_from((*server_tls()).clone()).expect("quinn takes the config");
+        let mut server_config = quinn::ServerConfig::with_crypto(Arc::new(crypto));
+        server_config.transport_config(Arc::new(transport));
+        let endpoint = quinn::Endpoint::server(server_config, "127.0.0.1:0".parse().unwrap()).unwrap();
+        let addr = endpoint.local_addr().unwrap();
+
+        let client_endpoint = quinn::Endpoint::client("127.0.0.1:0".parse().unwrap()).unwrap();
+        let crypto =
+            quinn::crypto::rustls::QuicClientConfig::try_from((*client_tls()).clone()).expect("quinn takes the config");
+        let connecting = client_endpoint
+            .connect_with(quinn::ClientConfig::new(Arc::new(crypto)), addr, "localhost")
+            .expect("dial the server");
+        // The server answers the handshake only once the application takes the connection.
+        let accepting = async {
+            endpoint
+                .accept()
+                .await
+                .expect("the server endpoint is still accepting")
+                .await
+                .expect("the server handshake completes")
+        };
+        let (connection, _server_connection) = futures::join!(connecting, accepting);
+        let connection = connection.expect("the client handshake completes");
+        let (send, recv) = connection.open_bi().await.expect("open a proxy stream");
+
+        let mut stream = ClientStream::new(QuicStream { send, recv }, "example.com:443".to_owned());
+        let mut cx = Context::from_waker(futures::task::noop_waker_ref());
+        assert!(
+            Pin::new(&mut stream).poll_write(&mut cx, b"payload").is_pending(),
+            "a zero receive window leaves the first write unaccepted"
+        );
+        assert!(!stream.request_written, "nothing was accepted, so the next poll still has to send the request");
     }
 }
