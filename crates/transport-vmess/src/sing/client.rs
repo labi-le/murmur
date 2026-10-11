@@ -452,7 +452,7 @@ impl Codec {
         plaintext: &[u8],
     ) -> io::Result<()> {
         let sealed = match &mut self.body_writer {
-            Some(body) => body.seal(plaintext),
+            Some(body) => body.seal(plaintext)?,
             None => plaintext.to_vec(),
         };
         match &mut self.frame_writer {

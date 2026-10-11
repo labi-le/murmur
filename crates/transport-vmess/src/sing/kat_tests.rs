@@ -56,8 +56,8 @@ fn aes_128_gcm_plain_body_matches_known_answer() {
     let iv = hex(NONCE16);
     let mut w = AeadBodyWriter::new(Cipher::new_aes_128_gcm(&key).expect("valid key"), &iv);
 
-    assert_eq!(w.seal(&seq_bytes(5)), hex("3f5a245feac623f35797f61f43a4d87c7100d022c0"));
-    assert_eq!(w.seal(&seq_bytes(10)), hex("8fea14c603ef108e9b6729e79d5cfdd92fe08432722a30744886"));
+    assert_eq!(w.seal(&seq_bytes(5)).expect("seal"), hex("3f5a245feac623f35797f61f43a4d87c7100d022c0"));
+    assert_eq!(w.seal(&seq_bytes(10)).expect("seal"), hex("8fea14c603ef108e9b6729e79d5cfdd92fe08432722a30744886"));
 }
 
 #[test]
@@ -66,7 +66,7 @@ fn chacha20_poly1305_plain_body_matches_known_answer() {
     let iv = hex(NONCE16);
     let mut w = AeadBodyWriter::new(Cipher::new_chacha20_poly1305(&key).expect("valid key"), &iv);
 
-    assert_eq!(w.seal(&seq_bytes(5)), hex("7952311ab3f25e86969581249e2db8daab4b9fed3b"));
+    assert_eq!(w.seal(&seq_bytes(5)).expect("seal"), hex("7952311ab3f25e86969581249e2db8daab4b9fed3b"));
 }
 
 #[tokio::test]
@@ -77,12 +77,12 @@ async fn aes_128_gcm_auth_len_body_matches_known_answer() {
     let mut framer =
         AeadChunkWriter::new(Cipher::new_aes_128_gcm(&auth_len_key(&body_key)).expect("valid key"), &iv, None);
 
-    let sealed0 = body.seal(&seq_bytes(5));
+    let sealed0 = body.seal(&seq_bytes(5)).expect("seal");
     let mut out0 = Vec::new();
     framer.write(&mut out0, &sealed0).await.expect("write chunk0");
     assert_eq!(out0, hex("caf0f181fd6c4676288742cf6817c134734a3f5a245feac623f35797f61f43a4d87c7100d022c0"));
 
-    let sealed1 = body.seal(&seq_bytes(10));
+    let sealed1 = body.seal(&seq_bytes(10)).expect("seal");
     let mut out1 = Vec::new();
     framer.write(&mut out1, &sealed1).await.expect("write chunk1");
     assert_eq!(out1, hex("7577e07974c6bc9f1dd75b116cad6ca6d21b8fea14c603ef108e9b6729e79d5cfdd92fe08432722a30744886"));
@@ -95,12 +95,12 @@ async fn stream_chunk_writer_masking_matches_known_answer() {
     let mut body = AeadBodyWriter::new(Cipher::new_aes_128_gcm(&key).expect("valid key"), &iv);
     let framer = StreamChunkWriter::new(Some(new_shake(&iv)), None);
 
-    let sealed0 = body.seal(&seq_bytes(5));
+    let sealed0 = body.seal(&seq_bytes(5)).expect("seal");
     let mut out0 = Vec::new();
     framer.write(&mut out0, &sealed0).await.expect("write chunk0");
     assert_eq!(out0, hex("3fd13f5a245feac623f35797f61f43a4d87c7100d022c0"));
 
-    let sealed1 = body.seal(&seq_bytes(10));
+    let sealed1 = body.seal(&seq_bytes(10)).expect("seal");
     let mut out1 = Vec::new();
     framer.write(&mut out1, &sealed1).await.expect("write chunk1");
     assert_eq!(out1, hex("64528fea14c603ef108e9b6729e79d5cfdd92fe08432722a30744886"));
@@ -113,7 +113,7 @@ async fn stream_chunk_writer_chacha_matches_known_answer() {
     let mut body = AeadBodyWriter::new(Cipher::new_chacha20_poly1305(&key).expect("valid key"), &iv);
     let framer = StreamChunkWriter::new(Some(new_shake(&iv)), None);
 
-    let sealed0 = body.seal(&seq_bytes(5));
+    let sealed0 = body.seal(&seq_bytes(5)).expect("seal");
     let mut out0 = Vec::new();
     framer.write(&mut out0, &sealed0).await.expect("write chunk0");
     assert_eq!(out0, hex("3fd17952311ab3f25e86969581249e2db8daab4b9fed3b"));

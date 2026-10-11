@@ -55,22 +55,32 @@ impl AeadCipher {
     }
 }
 
+/// One key and IV carry exactly this many chunks: the 16-bit count is the whole of the nonce's
+/// variable part, and the wire format defines no re-key.
+const MAX_CHUNKS_PER_KEY: u32 = u16::MAX as u32 + 1;
+
 /// The nonce's first two bytes hold the
-/// big-endian chunk count and the remaining ten the IV's bytes 2..12.
-fn build_nonce(iv: &[u8], count: u16) -> [u8; 12] {
+/// big-endian chunk count and the remaining ten the IV's bytes 2..12. A count past the wire
+/// field is an error rather than a repeat of a nonce already used under this key.
+fn build_nonce(iv: &[u8], count: u32) -> io::Result<[u8; 12]> {
+    let count = u16::try_from(count).map_err(|_| {
+        io::Error::other(format!(
+            "vmess: AEAD nonce counter exhausted after {MAX_CHUNKS_PER_KEY} chunks; refusing to reuse a nonce"
+        ))
+    })?;
     let mut nonce = [0u8; 12];
     let (count_field, iv_field) = nonce.split_at_mut(2);
     count_field.copy_from_slice(&count.to_be_bytes());
     let (_, iv_tail) = iv.split_at(2);
     let (iv_tail, _) = iv_tail.split_at(iv_field.len());
     iv_field.copy_from_slice(iv_tail);
-    nonce
+    Ok(nonce)
 }
 
 pub(crate) struct AeadWriter {
     cipher: AeadCipher,
     iv: Vec<u8>,
-    count: u16,
+    count: u32,
 }
 
 impl AeadWriter {
@@ -90,9 +100,9 @@ impl AeadWriter {
             let (_, remaining) = b.split_at(n);
             let (plaintext, _) = remaining.split_at(read_len);
 
-            let nonce = build_nonce(&self.iv, self.count);
+            let nonce = build_nonce(&self.iv, self.count)?;
             let sealed = self.cipher.seal(nonce, plaintext)?;
-            self.count = self.count.wrapping_add(1);
+            self.count += 1;
 
             let mut frame = Vec::with_capacity(LEN_SIZE + sealed.len());
             #[expect(
@@ -116,7 +126,7 @@ pub(crate) struct AeadReader {
     buf: Option<Vec<u8>>,
     offset: usize,
     iv: Vec<u8>,
-    count: u16,
+    count: u32,
 }
 
 impl AeadReader {
@@ -142,14 +152,15 @@ impl AeadReader {
             return Err(io::Error::other("buffer is larger than standard"));
         }
 
+        let nonce = build_nonce(&self.iv, self.count)?;
+        self.count += 1;
+
         let mut buf = pool::get(size);
         if let Err(err) = r.read_exact(&mut buf).await {
             let _ = pool::put(buf);
             return Err(err);
         }
 
-        let nonce = build_nonce(&self.iv, self.count);
-        self.count = self.count.wrapping_add(1);
         let opened = match self.cipher.open(nonce, &buf) {
             Ok(opened) => opened,
             Err(err) => {
@@ -176,4 +187,73 @@ fn copy_bytes(dst: &mut [u8], src: &[u8]) -> usize {
     let (src, _) = src.split_at(n);
     dst.copy_from_slice(src);
     n
+}
+
+#[cfg(test)]
+mod tests {
+    use std::collections::HashSet;
+
+    use aes_gcm::KeyInit as _;
+
+    use super::*;
+
+    const IV: [u8; 16] = *b"0123456789abcdef";
+    const KEY: [u8; 16] = *b"fedcba9876543210";
+    /// One `write` call per chunk: a payload under the per-chunk cap emits exactly one frame.
+    const ONE_CHUNK: [u8; 16] = [0x5a; 16];
+
+    fn cipher() -> AeadCipher {
+        AeadCipher::Aes128Gcm(Aes128Gcm::new_from_slice(&KEY).expect("16-byte key"))
+    }
+
+    fn sealed_frame(sealed: &[u8]) -> Vec<u8> {
+        let mut frame = u16::try_from(sealed.len()).expect("short frame").to_be_bytes().to_vec();
+        frame.extend_from_slice(sealed);
+        frame
+    }
+
+    #[tokio::test]
+    async fn aead_writer_seals_65536_chunks_then_refuses_to_repeat_a_nonce() {
+        let mut writer = AeadWriter::new(cipher(), IV.to_vec());
+        let mut frames = HashSet::new();
+        for chunk in 0..=u16::MAX {
+            let mut out = Vec::new();
+            writer.write(&mut out, &ONE_CHUNK).await.expect("chunk inside the nonce space");
+            assert!(frames.insert(out), "chunk {chunk} sealed under a nonce already used");
+        }
+        let err = writer.write(&mut Vec::new(), &ONE_CHUNK).await.expect_err("no unused nonce for chunk 65537");
+        assert!(err.to_string().contains("nonce counter exhausted"), "{err}");
+    }
+
+    #[tokio::test]
+    async fn aead_reader_refuses_a_chunk_beyond_the_nonce_space() {
+        let mut writer = AeadWriter::new(cipher(), IV.to_vec());
+        let mut wire = Vec::new();
+        for _ in 0..=u16::MAX {
+            writer.write(&mut wire, &ONE_CHUNK).await.expect("chunk inside the nonce space");
+        }
+        // The frame the writer now refuses to produce: chunk 1's nonce again.
+        let sealed =
+            cipher().seal(build_nonce(&IV, 0).expect("first nonce"), &ONE_CHUNK).expect("seal under the first nonce");
+        wire.extend_from_slice(&sealed_frame(&sealed));
+
+        let mut reader = AeadReader::new(cipher(), IV.to_vec());
+        let mut cursor: &[u8] = &wire;
+        let mut out = [0u8; 64];
+        for chunk in 0..=u16::MAX {
+            let read = reader.read(&mut cursor, &mut out).await.expect("chunk inside the nonce space");
+            assert_eq!(read, ONE_CHUNK.len(), "chunk {chunk}");
+        }
+        let err = reader.read(&mut cursor, &mut out).await.expect_err("no unused nonce for chunk 65537");
+        assert!(err.to_string().contains("nonce counter exhausted"), "{err}");
+    }
+
+    /// The nonce's first two bytes are the chunk count, so the space ends exactly at the `u16`.
+    #[test]
+    fn the_nonce_space_ends_at_the_u16_chunk_count() {
+        assert_eq!(build_nonce(&IV, 0).expect("first chunk")[..2], [0x00, 0x00]);
+        assert_eq!(build_nonce(&IV, MAX_CHUNKS_PER_KEY - 1).expect("last chunk")[..2], [0xff, 0xff]);
+        let err = build_nonce(&IV, MAX_CHUNKS_PER_KEY).expect_err("chunk 65537 has no nonce");
+        assert!(err.to_string().contains("nonce counter exhausted"), "{err}");
+    }
 }
