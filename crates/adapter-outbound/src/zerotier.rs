@@ -1803,6 +1803,7 @@ fn warn_about_wire_options(option: &ZeroTierOption) {
 mod tests {
     use std::net::Ipv4Addr;
     use std::path::PathBuf;
+    #[cfg(target_os = "linux")]
     use std::task::Poll;
     use std::time::Instant;
 
