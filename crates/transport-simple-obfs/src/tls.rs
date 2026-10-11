@@ -194,6 +194,9 @@ pub struct TLSObfs {
     first_response: bool,
     read_op: Option<TlsReadOp>,
     write_op: Option<TlsWriteOp>,
+    /// Record bytes that did not fit the reading caller's buffer, served before the next conn read.
+    leftover: Option<Vec<u8>>,
+    leftover_offset: usize,
 }
 
 impl core::fmt::Debug for TLSObfs {
@@ -261,6 +264,18 @@ impl AsyncRead for TLSObfs {
     fn poll_read(self: Pin<&mut Self>, cx: &mut Context<'_>, buf: &mut ReadBuf<'_>) -> Poll<io::Result<()>> {
         let this = self.get_mut();
 
+        if let Some(cached) = this.leftover.take() {
+            let n = std::cmp::min(buf.remaining(), cached.len() - this.leftover_offset);
+            buf.put_slice(cached.get(this.leftover_offset..this.leftover_offset + n).unwrap_or_default());
+            this.leftover_offset += n;
+            if this.leftover_offset < cached.len() {
+                this.leftover = Some(cached);
+            } else {
+                this.leftover_offset = 0;
+            }
+            return Poll::Ready(Ok(()));
+        }
+
         if this.remain > 0 {
             let length = std::cmp::min(usize::try_from(this.remain).unwrap_or(usize::MAX), buf.remaining());
             if this.read_op.is_none() {
@@ -307,7 +322,12 @@ impl TLSObfs {
             None => {}
         }
         self.read_op = None;
-        buf.put_slice(data.get(..std::cmp::min(data.len(), buf.remaining())).unwrap_or_default());
+        let fit = std::cmp::min(data.len(), buf.remaining());
+        buf.put_slice(data.get(..fit).unwrap_or_default());
+        if fit < data.len() {
+            self.leftover = Some(data);
+            self.leftover_offset = fit;
+        }
         Poll::Ready(Ok(()))
     }
 }
@@ -391,6 +411,8 @@ pub fn new_tls_obfs(conn: Box<dyn Conn>, server: String) -> Box<dyn Conn> {
         first_response: true,
         read_op: None,
         write_op: None,
+        leftover: None,
+        leftover_offset: 0,
     }))
 }
 
@@ -477,6 +499,10 @@ fn make_client_hello_msg(data: &[u8], server: &str) -> Vec<u8> {
 
 #[cfg(test)]
 mod tests {
+    use std::time::Duration;
+
+    use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
+
     use super::*;
 
     /// The client-hello generator has no injectable randomness source: the 4-byte timestamp, the
@@ -554,6 +580,43 @@ mod tests {
             self.closes.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
             Ok(())
         }
+    }
+
+    /// Bug #112: the parked read op kept the first poll's buffer size, and the completion truncated
+    /// the record to whatever the resuming poll's buffer held, dropping the tail while still
+    /// accounting it as delivered.
+    #[tokio::test]
+    async fn a_resumed_read_serves_the_whole_record_to_a_smaller_buffer() {
+        let (client_side, server_side) = tokio::io::duplex(1 << 16);
+        let mut peer = client_side;
+        let closes = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let flag = FlagConn { inner: server_side, closes };
+        let mut obfs = new_tls_obfs(Box::new(flag), "example.com".to_owned());
+
+        peer.write_all(&vec![0u8; 105]).await.expect("write discard filler");
+        peer.write_all(&[0x00, 0x04]).await.expect("write record length");
+
+        let mut big = [0u8; 4096];
+        assert!(
+            tokio::time::timeout(Duration::from_millis(200), obfs.read(&mut big)).await.is_err(),
+            "the read must stay pending until the record payload arrives"
+        );
+
+        peer.write_all(b"abcd").await.expect("write payload");
+
+        let mut one = [0u8; 1];
+        tokio::time::timeout(Duration::from_secs(5), obfs.read(&mut one))
+            .await
+            .expect("read must not hang")
+            .expect("read one byte");
+        assert_eq!(&one, b"a");
+
+        let mut rest = [0u8; 4096];
+        let read = tokio::time::timeout(Duration::from_secs(5), obfs.read(&mut rest))
+            .await
+            .expect("a resumed read must not hang on bytes the record already carried")
+            .expect("read the tail");
+        assert_eq!(&rest[..read], b"bcd");
     }
 
     /// Regression for `agent://ReviewS9Obfs`'s finding: `close()` through
