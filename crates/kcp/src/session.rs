@@ -31,6 +31,14 @@ const CONV_SIZE: usize = 4;
 const DEV_BACKLOG: usize = 2048;
 /// The listener's accept queue depth.
 const ACCEPT_BACKLOG: usize = 128;
+/// The listener's session idle timeout: an entry with no inbound packet for this long closes
+/// itself, and that is what removes it from the table. `transport-mkcp` ages an active conn out
+/// at the same 30 s.
+const SESSION_IDLE_TIMEOUT: Duration = Duration::from_secs(30);
+/// The most entries the listener's session table holds: past this, a packet from an unknown
+/// source address is dropped instead of allocating a session, so a spoofed-address flood cannot
+/// outrun the idle eviction.
+const MAX_LISTENER_SESSIONS: usize = 4096;
 /// The fixed "non-continuous data" threshold passed to the FEC encoder, in milliseconds.
 const MAX_FEC_ENCODE_LATENCY_MS: u32 = 500;
 /// The minimum accepted packet size: the smaller of the FEC header plus conv size and the KCP
@@ -211,6 +219,8 @@ struct Engine {
     recv_len: usize,
     ack_no_delay: bool,
     write_delay: bool,
+    /// When the last inbound packet reached this engine; the listener's idle eviction reads it.
+    last_inbound: Instant,
 }
 
 impl Engine {
@@ -255,6 +265,7 @@ impl Engine {
     /// Feeds a decrypted, crc32-checked packet into KCP, unwrapping FEC framing
     /// first if present.
     fn kcp_input(&mut self, data: &[u8]) {
+        self.last_inbound = Instant::now();
         if data.len() < CONV_SIZE + 2 {
             return;
         }
@@ -330,6 +341,9 @@ struct Shared {
     rate_limiter: Arc<StdMutex<RateLimiter>>,
     socket_read_error: Mutex<Option<io::Error>>,
     listener: Option<Arc<ListenerShared>>,
+    /// `None` for a session that owns its socket: nothing holds a strong handle to such a
+    /// session, so `Drop for Shared` reaches its teardown and only a listener table entry leaks.
+    idle_timeout: Option<Duration>,
     /// The postprocess task: given a bounded grace period to drain whatever `flush` above
     /// already queued onto the wire (`Close` keeps its post-processing task alive until that
     /// queue is empty) before it is force-aborted.
@@ -346,6 +360,13 @@ struct Shared {
 const CLOSE_DRAIN_GRACE: Duration = Duration::from_millis(200);
 
 impl Shared {
+    fn idle_expired(&self) -> bool {
+        let Some(idle_timeout) = self.idle_timeout else {
+            return false;
+        };
+        self.engine.lock().last_inbound.elapsed() >= idle_timeout
+    }
+
     /// Closes: flushes pending output, then tears down. Idempotent.
     fn close_now(&self) {
         if self.closed.is_cancelled() {
@@ -585,6 +606,21 @@ struct ListenerShared {
     accept_rx: tokio::sync::Mutex<mpsc::Receiver<Session>>,
     closed: CancellationToken,
     tasks: Mutex<Vec<tokio::task::JoinHandle<()>>>,
+    limits: ListenerLimits,
+}
+
+/// The listener's table bounds. `serve_conn` uses the crate defaults; tests drive the same path
+/// with tighter ones.
+#[derive(Clone, Copy)]
+struct ListenerLimits {
+    idle_timeout: Duration,
+    max_sessions: usize,
+}
+
+impl Default for ListenerLimits {
+    fn default() -> Self {
+        Self { idle_timeout: SESSION_IDLE_TIMEOUT, max_sessions: MAX_LISTENER_SESSIONS }
+    }
 }
 
 pub struct KcpListener(Arc<ListenerShared>);
@@ -664,6 +700,7 @@ fn new_engine(
         recv_len: 0,
         ack_no_delay: false,
         write_delay: false,
+        last_inbound: Instant::now(),
     }
 }
 
@@ -728,7 +765,8 @@ async fn postprocess_task(
 /// The per-session periodic flush loop, using the flush's own computed
 /// next-update delay to reschedule itself (exactly like the timer reset), rather than a fixed
 /// tick.
-// cancel-safe: a flush is synchronous, so a dropped sleep only delays the next one.
+// cancel-safe: a flush is synchronous, so a dropped sleep only delays the next one. The idle
+// check is what evicts a listener session the table's own clone would otherwise pin forever.
 async fn updater_task(shared: Arc<Shared>) {
     loop {
         let delay = {
@@ -741,6 +779,10 @@ async fn updater_task(shared: Arc<Shared>) {
             }
             interval
         };
+        if shared.idle_expired() {
+            shared.close_now();
+            return;
+        }
         tokio::select! {
             () = tokio::time::sleep(Duration::from_millis(u64::from(delay))) => {}
             () = shared.closed.cancelled() => return,
@@ -860,6 +902,12 @@ async fn listener_monitor(listener: Arc<ListenerShared>) {
             continue;
         }
 
+        // At the cap, a new source address is refused rather than evicting an entry a peer is
+        // already using.
+        if listener.sessions.lock().len() >= listener.limits.max_sessions {
+            continue;
+        }
+
         let session = new_session(
             conv,
             from,
@@ -898,6 +946,7 @@ fn new_session(
     let engine = new_engine(conv, data_shards, parity_shards, tx, layout.total_header);
 
     let rate_limiter = Arc::new(StdMutex::new(RateLimiter::unlimited()));
+    let idle_timeout = listener.as_ref().map(|listener| listener.limits.idle_timeout);
     let shared = Arc::new(Shared {
         conv,
         remote,
@@ -910,6 +959,7 @@ fn new_session(
         rate_limiter: Arc::clone(&rate_limiter),
         socket_read_error: Mutex::new(None),
         listener,
+        idle_timeout,
         postprocess_task: Mutex::new(None),
         tasks: Mutex::new(Vec::new()),
     });
@@ -945,6 +995,10 @@ pub fn new_conn4(
 /// Unlike the public `serve_conn` (which leaves ownership with the caller), the `conn` here is
 /// moved in — the caller has no handle left, so
 /// the listener owns it and closes it on [`Listener::close`].
+///
+/// The listener's session table is bounded: an entry with no inbound packet for
+/// `SESSION_IDLE_TIMEOUT` closes itself and leaves the table, and a packet from an unknown source
+/// address is dropped while the table already holds `MAX_LISTENER_SESSIONS` entries.
 pub fn serve_conn(
     block: Option<Arc<dyn BlockCrypt>>,
     data_shards: i32,
@@ -952,6 +1006,16 @@ pub fn serve_conn(
     conn: Box<dyn Datagram>,
 ) -> Result<Box<dyn Listener>> {
     let conn: Arc<dyn Datagram> = Arc::from(conn);
+    Ok(Box::new(KcpListener(new_listener(block, data_shards, parity_shards, conn, ListenerLimits::default()))))
+}
+
+fn new_listener(
+    block: Option<Arc<dyn BlockCrypt>>,
+    data_shards: i32,
+    parity_shards: i32,
+    conn: Arc<dyn Datagram>,
+    limits: ListenerLimits,
+) -> Arc<ListenerShared> {
     let (accept_tx, accept_rx) = mpsc::channel(ACCEPT_BACKLOG);
     let listener = Arc::new(ListenerShared {
         conn,
@@ -963,8 +1027,86 @@ pub fn serve_conn(
         accept_rx: tokio::sync::Mutex::new(accept_rx),
         closed: CancellationToken::new(),
         tasks: Mutex::new(Vec::new()),
+        limits,
     });
     let mon = tokio::spawn(listener_monitor(Arc::clone(&listener)));
     listener.tasks.lock().push(mon);
-    Ok(Box::new(KcpListener(listener)))
+    listener
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use tokio::io::AsyncWriteExt;
+    use tokio::net::UdpSocket;
+
+    async fn bound_socket() -> (UdpSocket, SocketAddr) {
+        let sock = UdpSocket::bind("127.0.0.1:0").await.expect("bind loopback udp socket");
+        let addr = sock.local_addr().expect("local_addr");
+        (sock, addr)
+    }
+
+    async fn listener_with(limits: ListenerLimits) -> (Arc<ListenerShared>, SocketAddr) {
+        let (sock, addr) = bound_socket().await;
+        let conn: Box<dyn Datagram> = Box::new(sock);
+        (new_listener(None, 0, 0, Arc::from(conn), limits), addr)
+    }
+
+    fn session_count(listener: &Arc<ListenerShared>) -> usize {
+        listener.sessions.lock().len()
+    }
+
+    async fn wait_until(deadline: Duration, what: &str, mut predicate: impl FnMut() -> bool + Send) {
+        let waited = tokio::time::timeout(deadline, async {
+            while !predicate() {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await;
+        assert!(waited.is_ok(), "{what} did not happen within {deadline:?}");
+    }
+
+    /// Dials the listener from a socket of its own and writes one payload. The caller holds the
+    /// returned session: dropping it closes the client's socket.
+    async fn dial(addr: SocketAddr, conv: u32) -> Box<dyn UdpSession> {
+        let (sock, _) = bound_socket().await;
+        let mut client = new_conn4(conv, addr, None, 0, 0, true, Box::new(sock)).expect("new_conn4");
+        client.write_all(&[0x5au8; 64]).await.expect("client write_all");
+        client
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_listener_session_that_goes_idle_leaves_the_session_table() {
+        let limits = ListenerLimits { idle_timeout: Duration::from_millis(500), max_sessions: MAX_LISTENER_SESSIONS };
+        let (listener, addr) = listener_with(limits).await;
+
+        let mut clients = Vec::new();
+        for conv in 1..=8 {
+            clients.push(dial(addr, conv).await);
+        }
+        wait_until(Duration::from_secs(5), "eight sessions entering the table", || session_count(&listener) == 8).await;
+
+        let accepted = KcpListener(Arc::clone(&listener)).accept_kcp().await.expect("accept_kcp");
+        drop(accepted);
+        assert_eq!(session_count(&listener), 8, "an accepted handle the table does not hold must not evict");
+
+        wait_until(Duration::from_secs(10), "the idle entries being evicted", || session_count(&listener) == 0).await;
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn the_session_table_refuses_an_unknown_address_at_the_cap() {
+        let limits = ListenerLimits { idle_timeout: SESSION_IDLE_TIMEOUT, max_sessions: 2 };
+        let (listener, addr) = listener_with(limits).await;
+
+        let mut clients = Vec::new();
+        for conv in 1..=5 {
+            clients.push(dial(addr, conv).await);
+        }
+        wait_until(Duration::from_secs(5), "the table reaching its cap", || session_count(&listener) >= 2).await;
+
+        for _ in 0..10 {
+            tokio::time::sleep(Duration::from_millis(100)).await;
+            assert_eq!(session_count(&listener), 2, "the refused clients keep retransmitting into a full table");
+        }
+    }
 }
