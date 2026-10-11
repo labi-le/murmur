@@ -52,11 +52,12 @@ impl H3Recv {
         Self { inner, prefix: Bytes::new() }
     }
 
-    /// Appends a freshly read chunk *before* the bytes already held.
+    /// Appends a freshly read chunk after the bytes already held: a QUIC stream delivers bytes in
+    /// wire order, and every consumer here reads `prefix` as wire order.
     fn push(&mut self, chunk: &[u8]) {
         let mut bytes = BytesMut::with_capacity(chunk.len() + self.prefix.len());
-        bytes.extend_from_slice(chunk);
         bytes.extend_from_slice(&self.prefix);
+        bytes.extend_from_slice(chunk);
         self.prefix = bytes.freeze();
     }
 }

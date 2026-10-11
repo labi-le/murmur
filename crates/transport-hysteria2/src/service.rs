@@ -820,6 +820,62 @@ mod tests {
         (addr, endpoint)
     }
 
+    /// A peer may split a stream's first varint across STREAM frames, so the classifier reads the
+    /// stream in two chunks and still has to replay them in wire order.
+    #[tokio::test]
+    async fn a_request_frame_type_split_across_reads_still_diverts_the_stream() {
+        murmur_testsupport_probe::ensure_test_crypto_provider();
+        let crypto = quinn::crypto::rustls::QuicServerConfig::try_from((*server_tls()).clone())
+            .expect("quinn accepts the rustls server config");
+        let endpoint = quinn::Endpoint::server(
+            quinn::ServerConfig::with_crypto(Arc::new(crypto)),
+            "127.0.0.1:0".parse().expect("loopback address"),
+        )
+        .expect("bind the server endpoint");
+        let addr = endpoint.local_addr().expect("the endpoint has a local address");
+
+        let client_endpoint =
+            quinn::Endpoint::client("127.0.0.1:0".parse().expect("loopback address")).expect("bind the client endpoint");
+        let crypto = quinn::crypto::rustls::QuicClientConfig::try_from((*client_tls()).clone())
+            .expect("quinn accepts the rustls client config");
+        let connecting = client_endpoint
+            .connect_with(quinn::ClientConfig::new(Arc::new(crypto)), addr, SERVER_NAME)
+            .expect("dial the server");
+        // The server answers the handshake only once the application takes the connection.
+        let accepting = async {
+            endpoint
+                .accept()
+                .await
+                .expect("the server endpoint is still accepting")
+                .await
+                .expect("the server handshake completes")
+        };
+        let (client_connection, server_connection) = futures::join!(connecting, accepting);
+        let client_connection = client_connection.expect("the client handshake completes");
+
+        // The sniff runs before authentication, so a bare QUIC connection reaches it.
+        let (mut dispatch, mut proxy_streams) = DispatchConnection::new(server_connection);
+        tokio::spawn(async move {
+            let _ = futures::future::poll_fn(|cx| {
+                h3::quic::Connection::<Bytes>::poll_accept_bidi(&mut dispatch, cx)
+            })
+            .await;
+        });
+
+        let (mut send, _recv) = client_connection.open_bi().await.expect("open a proxy stream");
+        // `0x401` is the two wire bytes `44 01`; the second goes out only after the classifier polled.
+        send.write_all(&[0x44]).await.expect("write the first varint byte");
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        send.write_all(&[0x01, 0xAA]).await.expect("write the rest of the frame");
+
+        let proxy = tokio::time::timeout(HANDSHAKE, proxy_streams.recv())
+            .await
+            .expect("the classifier diverts the stream in time")
+            .expect("the stream is diverted out of h3");
+        let (_, _, prefix) = proxy.into_parts();
+        assert_eq!(prefix, vec![0x44, 0x01, 0xAA], "the sniffed bytes have to be replayed in wire order");
+    }
+
     #[tokio::test]
     async fn a_client_authenticates_and_carries_a_stream_and_a_datagram() {
         murmur_testsupport_probe::ensure_test_crypto_provider();
