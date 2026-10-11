@@ -188,6 +188,8 @@ pub(crate) struct FallbackThrottle<T> {
     inner: T,
     free: u64,
     bucket: Option<TokenBucket>,
+    /// The charge for bytes already handed up: the wait is owed by the *next* read, since returning
+    /// `Pending` once the inner read has filled `buf` would promise the caller nothing was read.
     delay: Option<Pin<Box<tokio::time::Sleep>>>,
 }
 
@@ -201,31 +203,31 @@ impl<T> FallbackThrottle<T> {
 impl<T: AsyncRead + Unpin> AsyncRead for FallbackThrottle<T> {
     fn poll_read(self: Pin<&mut Self>, cx: &mut Context<'_>, buf: &mut ReadBuf<'_>) -> Poll<io::Result<()>> {
         let this = self.get_mut();
-        loop {
-            if let Some(delay) = this.delay.as_mut() {
-                match delay.as_mut().poll(cx) {
-                    Poll::Pending => return Poll::Pending,
-                    Poll::Ready(()) => this.delay = None,
-                }
-            }
-            let filled = buf.filled().len();
-            let result = match Pin::new(&mut this.inner).poll_read(cx, buf) {
+        if let Some(delay) = this.delay.as_mut() {
+            match delay.as_mut().poll(cx) {
                 Poll::Pending => return Poll::Pending,
-                Poll::Ready(result) => result,
-            };
-            let read = buf.filled().len() - filled;
-            if let Err(err) = result {
-                return Poll::Ready(Err(err));
-            }
-            if this.free > 0 {
-                this.free = this.free.saturating_sub(u64::try_from(read).unwrap_or(u64::MAX));
-                return Poll::Ready(Ok(()));
-            }
-            match this.bucket.as_mut().and_then(|bucket| bucket.charge(u64::try_from(read).unwrap_or(u64::MAX))) {
-                Some(delay) => this.delay = Some(Box::pin(tokio::time::sleep(delay))),
-                None => return Poll::Ready(Ok(())),
+                Poll::Ready(()) => this.delay = None,
             }
         }
+        let filled = buf.filled().len();
+        let result = match Pin::new(&mut this.inner).poll_read(cx, buf) {
+            Poll::Pending => return Poll::Pending,
+            Poll::Ready(result) => result,
+        };
+        let read = buf.filled().len() - filled;
+        if let Err(err) = result {
+            return Poll::Ready(Err(err));
+        }
+        if this.free > 0 {
+            this.free = this.free.saturating_sub(u64::try_from(read).unwrap_or(u64::MAX));
+            return Poll::Ready(Ok(()));
+        }
+        if let Some(delay) =
+            this.bucket.as_mut().and_then(|bucket| bucket.charge(u64::try_from(read).unwrap_or(u64::MAX)))
+        {
+            this.delay = Some(Box::pin(tokio::time::sleep(delay)));
+        }
+        Poll::Ready(Ok(()))
     }
 }
 

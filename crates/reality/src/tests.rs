@@ -472,6 +472,33 @@ async fn the_fallback_free_allowance_is_not_metered() {
     assert_eq!(&buf, b"0123");
 }
 
+/// `AsyncRead::poll_read` returning `Pending` promises no bytes were read, but `CopyBuffer` -- the
+/// relay's own `copy_bidirectional` -- only records a filled length on `Ready`, so bytes read out
+/// of the socket and then held back by the rate limit are dropped instead of relayed.
+#[tokio::test(start_paused = true)]
+async fn the_fallback_throttle_relays_the_bytes_it_meters() {
+    let (source, mut sink) = tokio::io::duplex(64);
+    tokio::spawn(async move {
+        let _ = sink.write_all(b"0123").await;
+        tokio::time::sleep(Duration::from_secs(1)).await;
+        let _ = sink.write_all(b"456789").await;
+        let _ = sink.shutdown().await;
+    });
+    let limit = FallbackLimit { after_bytes: 4, bytes_per_sec: 1, burst_bytes_per_sec: 1 };
+    let mut throttled = FallbackThrottle::new(source, limit);
+    let (mut relayed, mut collected) = tokio::io::duplex(64);
+    let relay = tokio::spawn(async move {
+        let copied = tokio::io::copy(&mut throttled, &mut relayed).await.expect("relay the fallback bytes");
+        let _ = relayed.shutdown().await;
+        copied
+    });
+
+    let mut bytes = Vec::new();
+    collected.read_to_end(&mut bytes).await.expect("read the relayed stream");
+    assert_eq!(bytes, b"0123456789");
+    assert_eq!(relay.await.expect("relay task must not panic"), 10);
+}
+
 /// The record framing a REALITY server puts on the wire: a plaintext `ServerHello`, a dummy
 /// plaintext `ChangeCipherSpec`, then the server flight under the handshake keys -- one record when
 /// `dest` sent one, one per message when it sent several -- each zero-padded to the length `dest`'s
