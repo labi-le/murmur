@@ -39,7 +39,7 @@ fn get_orig_dst(fd: RawFd) -> std::io::Result<std::net::SocketAddr> {
     // Safety: `libc::sockaddr_in` is plain-old-data; zero-initializing it is valid, and
     // `getsockopt` fills it in place, staying within the buffer described by `len`.
     let mut addr: libc::sockaddr_in = unsafe { std::mem::zeroed() };
-    let mut len = std::mem::size_of::<libc::sockaddr_in>() as libc::socklen_t;
+    let mut len = size_of::<libc::sockaddr_in>() as libc::socklen_t;
     let rc = unsafe {
         libc::getsockopt(
             fd,
@@ -62,7 +62,7 @@ fn get_orig_dst6(fd: RawFd) -> std::io::Result<std::net::SocketAddr> {
     // Safety: `libc::sockaddr_in6` is plain-old-data; zero-initializing it is valid, and
     // `getsockopt` fills it in place, staying within the buffer described by `len`.
     let mut addr: libc::sockaddr_in6 = unsafe { std::mem::zeroed() };
-    let mut len = std::mem::size_of::<libc::sockaddr_in6>() as libc::socklen_t;
+    let mut len = size_of::<libc::sockaddr_in6>() as libc::socklen_t;
     let rc = unsafe {
         libc::getsockopt(
             fd,

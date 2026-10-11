@@ -31,7 +31,7 @@ struct PfiocNatlook {
     direction: u8,
 }
 
-const LEN: u32 = std::mem::size_of::<PfiocNatlook>() as u32;
+const LEN: u32 = size_of::<PfiocNatlook>() as u32;
 
 const DIOCNATLOOK: u64 = (IOC_INOUT | ((LEN & IOC_PARM_MASK) << 16) | (('D' as u32) << 8) | 23) as u64;
 
