@@ -1352,10 +1352,7 @@ fn parse_tls(cfg: &RawConfig) -> TLS {
 }
 
 fn parse_clash_for_android(cfg: &RawClashForAndroid) -> ClashForAndroid {
-    ClashForAndroid {
-        append_system_dns: cfg.append_system_dns,
-        ui_subtitle_pattern: cfg.ui_subtitle_pattern.clone(),
-    }
+    ClashForAndroid { append_system_dns: cfg.append_system_dns, ui_subtitle_pattern: cfg.ui_subtitle_pattern.clone() }
 }
 
 /// Exposed as `pub(crate)` so `config::utils`'s test can call it directly.
@@ -2888,8 +2885,7 @@ mod tests {
 
     #[test]
     fn parse_clash_for_android_carries_both_fields_onto_the_runtime_config() {
-        let raw =
-            RawClashForAndroid { append_system_dns: true, ui_subtitle_pattern: "subtitle".to_owned() };
+        let raw = RawClashForAndroid { append_system_dns: true, ui_subtitle_pattern: "subtitle".to_owned() };
 
         let got = parse_clash_for_android(&raw);
 
