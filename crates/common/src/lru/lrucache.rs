@@ -308,8 +308,9 @@ impl<K: Eq + Hash + Clone, V: Clone> LruCache<K, V> {
     }
 
     /// Returns any representation of a cached response, the expected expires, and a bool set to
-    /// true if the key was found. This method will NOT check the maxAge of element and will NOT
-    /// update the expires.
+    /// true if the key was found. An entry past `max_age` is absent (`None`, `false`) and is
+    /// removed, unless `with_stale(true)` is set; its expiry is extended when
+    /// `with_update_age_on_get` is set.
     #[expect(
         clippy::needless_pass_by_value,
         reason = "the API takes the key by value; `&K` would change the public signature"
@@ -707,6 +708,27 @@ mod tests {
         assert!(res.is_none());
         assert_eq!(None, expires);
         assert!(!exist);
+    }
+
+    #[test]
+    fn get_with_expire_checks_and_extends_the_expiry_it_reports() {
+        let c = new::<String, String>(vec![with_age(86400), with_update_age_on_get()]);
+
+        c.set("foo".to_owned(), "bar".to_owned());
+        let stale = now_unix() + 1;
+        cached_entry(&c, &"foo".to_owned()).set_expires(stale);
+
+        let (value, expires, ok) = c.get_with_expire("foo".to_owned());
+        assert!(ok);
+        assert_eq!(value, "bar");
+        assert!(expires.expect("a live entry reports its expiry").timestamp() > stale);
+
+        cached_entry(&c, &"foo".to_owned()).set_expires(now_unix() - 1);
+        let (value, expires, ok) = c.get_with_expire("foo".to_owned());
+        assert!(!ok);
+        assert_eq!(value, "");
+        assert_eq!(expires, None);
+        assert_eq!(lru_len(&c), 0);
     }
 
     #[test]
