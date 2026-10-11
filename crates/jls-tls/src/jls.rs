@@ -65,10 +65,11 @@ fn derive_nonce_and_key(user: &JlsUser, auth_data: &[u8]) -> ([u8; 32], [u8; 32]
 
     (nonce, key)
 }
+/// Encrypts `random16` (the low half of the yet-to-be-sent hello random) under the per-user
+/// key/nonce derived from `auth_data`.
 ///
-/// Encrypts `random16` (the low half of the yet-to-be-sent hello random) under
-/// the per-user key/nonce derived from `auth_data`, redrawing `random16` from
-/// `rng` whenever the result would end in a forbidden downgrade/HRR suffix.
+/// `random16` is redrawn from `rng` whenever the result would end in a forbidden downgrade/HRR
+/// suffix.
 pub fn jls_build_fake_random(
     user: &JlsUser,
     random16: &[u8; RANDOM_SEED_LEN],
