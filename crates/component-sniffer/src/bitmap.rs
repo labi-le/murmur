@@ -16,11 +16,9 @@ impl Bitmap {
 
         let word_count = (end - 1) / 64 + 1;
         if word_count > self.words.len() {
+            // `end <= isize::MAX` caps `word_count` at 2^57, so the round-up shift cannot overflow.
             let bit_len = usize::BITS - (word_count - 1).leading_zeros();
-            let mut new_word_count = 1usize << bit_len;
-            if new_word_count > usize::MAX >> 1 {
-                new_word_count = word_count;
-            }
+            let new_word_count = 1usize << bit_len;
             let mut words = vec![0u64; new_word_count];
             if let Some(head) = words.get_mut(..self.words.len()) {
                 head.copy_from_slice(&self.words);
