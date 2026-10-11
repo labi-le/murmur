@@ -180,7 +180,7 @@ impl CProxy for Proxy {
     }
 
     fn alive_for_test_url(&self, url: &str) -> bool {
-        if let Some(state) = self.extra.load(&url.to_owned()) {
+        if let Some(state) = self.extra.load(url) {
             return state.alive.load();
         }
         self.alive.load()
@@ -202,7 +202,7 @@ impl CProxy for Proxy {
     fn last_delay_for_test_url(&self, url: &str) -> u16 {
         const MAX_DELAY: u16 = 0xffff;
 
-        let state = self.extra.load(&url.to_owned());
+        let state = self.extra.load(url);
         let alive = state.as_ref().is_some_and(|state| state.alive.load());
         let delay = state.as_ref().map_or(0, |state| state.history.last().map_or(0, |history| history.delay));
 
@@ -526,5 +526,25 @@ mod tests {
             body.contains(&format!(r#""{url}":{{"alive":true,"history":[{{"time":"{stamp}","delay":7}}]}}"#)),
             "{body}"
         );
+    }
+
+    /// The per-test-URL state is keyed by the owned `String` while the dial path holds only the
+    /// borrowed `&str`, so the lookups have to reach the entry stored under the equal owned key.
+    #[test]
+    fn test_url_state_is_reachable_through_a_borrowed_query() {
+        let url = "http://192.0.2.1/";
+        let other = "http://192.0.2.2/";
+        let time = Utc.with_ymd_and_hms(2026, 9, 24, 13, 0, 0).unwrap();
+        let proxy = Proxy::new(Arc::new(StubAdapter));
+        proxy.put_extra_history_for_test(
+            url,
+            ProxyState { alive: true, history: vec![DelayHistory { time, delay: 12 }] },
+        );
+        proxy.alive.store(false);
+
+        assert!(proxy.alive_for_test_url(url));
+        assert_eq!(proxy.last_delay_for_test_url(url), 12);
+        assert!(!proxy.alive_for_test_url(other));
+        assert_eq!(proxy.last_delay_for_test_url(other), u16::MAX);
     }
 }

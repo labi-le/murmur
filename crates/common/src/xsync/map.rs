@@ -13,6 +13,7 @@
 //! bucket is guarded together with its chained buckets by one `parking_lot::Mutex`, so the
 //! readers take the chain lock rather than staying lock-free.
 
+use std::borrow::Borrow;
 use std::collections::HashMap;
 use std::fmt;
 use std::hash::{Hash, Hasher};
@@ -1126,10 +1127,14 @@ impl<K: MapKey, V> Map<K, V> {
 }
 
 impl<K: MapKey, V: Clone> Map<K, V> {
-    /// Load returns the value stored in the map for a key, or zero value
+    /// Load returns the value stored in the map for a borrowed key, or zero value
     /// of type V if no value is present.
     /// The ok result indicates whether value was found in the map.
-    pub fn load(&self, key: &K) -> Option<V> {
+    pub fn load<Q>(&self, key: &Q) -> Option<V>
+    where
+        K: Borrow<Q>,
+        Q: ?Sized + MapKeyQuery,
+    {
         self.init_once.call_once(|| self.init());
         let table = self.table_load();
         let hash = key.hash_with_seed(table.seed);
@@ -1146,7 +1151,7 @@ impl<K: MapKey, V: Clone> Map<K, V> {
                 let idx = first_marked_byte_index(markedw);
                 markedw &= markedw - 1;
                 if let Some(e) = b.entries.get(idx).and_then(Option::as_ref) {
-                    if e.key == *key {
+                    if e.key.borrow() == key {
                         return Some(e.value.clone());
                     }
                 }
@@ -1415,6 +1420,29 @@ pub trait MapKey: Eq + Clone + Hash {
     }
 }
 
+/// A borrowed query key for [`Map::load`]: it must hash exactly like the equal [`MapKey`] it
+/// borrows from, or the lookup lands in another bucket.
+///
+/// Every `K: MapKey` is a query key of itself, hashing through the map's own [`MapKey`] path
+/// (the integer fast path included); `str` covers the borrowed form of a `String` key, whose
+/// `Hash` is `str`'s.
+pub trait MapKeyQuery: Eq + Hash {
+    fn hash_with_seed(&self, seed: u64) -> u64 {
+        let mut hasher = std::collections::hash_map::DefaultHasher::new();
+        seed.hash(&mut hasher);
+        self.hash(&mut hasher);
+        hasher.finish()
+    }
+}
+
+impl<K: MapKey> MapKeyQuery for K {
+    fn hash_with_seed(&self, seed: u64) -> u64 {
+        MapKey::hash_with_seed(self, seed)
+    }
+}
+
+impl MapKeyQuery for str {}
+
 /// the `toUint64[K]`: the key reinterpreted as a `uint64` by its width.
 trait ToUint64 {
     fn to_uint64(&self) -> u64;
@@ -1613,6 +1641,17 @@ mod tests {
             assert!(loaded, "value was not found for {i}");
             assert!(m.load(&to_key(i)).is_none(), "value was not expected for {i}");
         }
+    }
+
+    #[test]
+    fn test_map_load_by_borrowed_str() {
+        let m = Map::<String, i32>::new(&[]);
+        m.store("foo".to_owned(), 42);
+        m.store("bar".to_owned(), 7);
+
+        assert_eq!(m.load("foo"), Some(42), "the borrowed query did not find the owned key");
+        assert_eq!(m.load(&"bar".to_owned()), Some(7), "the owned query did not find the owned key");
+        assert_eq!(m.load("baz"), None, "a missing borrowed key was found");
     }
 
     #[test]
