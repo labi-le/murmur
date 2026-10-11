@@ -368,8 +368,15 @@ impl Datagram for Socks5PacketConn {
         let received = buf.get(..n).ok_or_else(|| io::Error::other("received more bytes than the buffer holds"))?;
         let (addr, payload_start, payload_len) = {
             let (addr, payload) = socks5t::decode_udp_packet(received).map_err(io::Error::other)?;
-            let start = payload.as_ptr() as usize - buf.as_ptr() as usize;
-            (addr, start, payload.len())
+            // The decoder's payload borrows from `received`; a checked re-derivation keeps a
+            // decoder that ever stops returning a subslice from indexing `buf` out of range.
+            let payload_start = payload
+                .as_ptr()
+                .addr()
+                .checked_sub(buf.as_ptr().addr())
+                .filter(|start| start.checked_add(payload.len()).is_some_and(|end| end <= n))
+                .ok_or_else(|| io::Error::other("decoded payload is not a subslice of the read buffer"))?;
+            (addr, payload_start, payload.len())
         };
         let udp_addr = addr.udp_addr().ok_or_else(|| io::Error::other("parse udp addr error"))?;
         buf.copy_within(payload_start..payload_start + payload_len, 0);
@@ -441,5 +448,55 @@ mod socks5_packet_conn_tests {
 
         let waited = tokio::time::timeout(Duration::from_secs(5), done.notified()).await;
         assert!(waited.is_ok(), "closing the packet conn must end the watch task within a bounded time");
+    }
+
+    struct SinglePacketDatagram {
+        packet: Vec<u8>,
+    }
+
+    #[async_trait]
+    impl Datagram for SinglePacketDatagram {
+        async fn recv_from(&self, buf: &mut [u8]) -> io::Result<(usize, std::net::SocketAddr)> {
+            let n = self.packet.len();
+            let out = buf.get_mut(..n).ok_or_else(|| io::Error::other("the caller's buffer is too small"))?;
+            out.copy_from_slice(&self.packet);
+            Ok((n, std::net::SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 0)))
+        }
+
+        async fn send_to(&self, buf: &[u8], _addr: std::net::SocketAddr) -> io::Result<usize> {
+            Ok(buf.len())
+        }
+
+        fn local_addr(&self) -> io::Result<std::net::SocketAddr> {
+            Ok(std::net::SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 0))
+        }
+    }
+
+    /// `decode_udp_packet` returns a subslice of the buffer it was handed, and the payload starts
+    /// past the packet's address header; `recv_from` copies the payload down from that offset.
+    #[tokio::test]
+    async fn recv_from_copies_the_payload_down_from_its_offset() {
+        let payload = b"proxied datagram".as_slice();
+        let udp_addr = std::net::SocketAddr::new(IpAddr::V4(Ipv4Addr::new(192, 0, 2, 1)), 8080);
+        let socks_addr = socks5t::parse_addr_to_socks_addr(&murmur_common_net::io::udp_addr_from_socket_addr(udp_addr))
+            .expect("the socks address encodes");
+        let packet = socks5t::encode_udp_packet(&socks_addr, payload).expect("the udp packet encodes");
+
+        let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).await.expect("bind loopback listener");
+        let listener_addr = listener.local_addr().expect("listener addr");
+        let (tcp_conn, accepted) = tokio::join!(TcpStream::connect(listener_addr), listener.accept());
+        drop(accepted);
+        let pc = Socks5PacketConn {
+            inner: Arc::new(SinglePacketDatagram { packet }),
+            remote_addr: udp_addr,
+            tcp_conn: SharedConn::from_boxed(Box::new(tcp_conn.expect("client connect"))),
+        };
+
+        let mut buf = [0u8; 64];
+        let (len, from) = pc.recv_from(&mut buf).await.expect("recv_from decodes the packet");
+
+        assert_eq!(len, payload.len(), "the payload length is off");
+        assert_eq!(buf.get(..len), Some(payload), "the payload was not copied down to the front of the buffer");
+        assert_eq!(from, udp_addr);
     }
 }
