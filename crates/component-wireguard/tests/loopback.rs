@@ -35,6 +35,7 @@ use murmur_component_wireguard::keys::{PresharedKey, StaticKey};
 use murmur_component_wireguard::stack::{Events, Stack, StackConfig, PACKET_QUEUE_SIZE, UDP_SOCKET_PACKETS};
 use smoltcp::phy::{self, DeviceCapabilities, Medium};
 use smoltcp::time::Instant as SmolInstant;
+use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
 /// One direction of a wire: a queue the driver drains, and the peer's queue to fill. The
 /// events handle belongs to the stack that drains the queue, exactly as a packet device
@@ -680,4 +681,73 @@ async fn a_non_reading_socket_bounds_the_backlog_the_stack_keeps() {
         "the backlog must be bounded by the queue and the socket's own buffer, not by the \
          sender's stream: {received} of {SENT} datagrams"
     );
+}
+
+/// Every byte a writer hands to a TCP socket has to reach the peer, including while the
+/// peer's window is closed: `smoltcp`'s transmit buffer takes only what it has room for, so
+/// the driver may drop from the outbox only what `send_slice` accepted, and the peer's window
+/// has to supply the backpressure instead of the unwritten bytes being discarded.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_closed_window_keeps_the_writers_bytes_queued() {
+    const PORT: u16 = 51_900;
+    const CHUNK: usize = 4096;
+    const TOTAL: usize = 4 * 1024 * 1024;
+    const PATTERN: usize = 251;
+
+    let (a, b, a_events, b_events) = linked();
+    let client = Stack::with_device(
+        StackConfig { local_addresses: vec![prefix("10.0.0.2/32")], mtu: 1500 },
+        loopback(&a, 1500),
+        a_events,
+    )
+    .expect("client stack");
+    let server = Stack::with_device(
+        StackConfig { local_addresses: vec![prefix("10.0.0.1/32")], mtu: 1500 },
+        loopback(&b, 1500),
+        b_events,
+    )
+    .expect("server stack");
+    let destination = SocketAddr::new(IpAddr::V4(Ipv4Addr::new(10, 0, 0, 1)), PORT);
+    with_timeout("arm_tcp_port", server.arm_tcp_port(PORT)).await.expect("arm");
+
+    // The reader accepts at once but waits before it reads, so the receive window it
+    // advertises closes while the writer still has bytes to hand over.
+    let reader = tokio::spawn({
+        let server = Arc::clone(&server);
+        async move {
+            let mut conn = with_timeout("accept_tcp", server.accept_tcp()).await.expect("accept");
+            tokio::time::sleep(Duration::from_millis(250)).await;
+            let mut buffer = vec![0u8; 64 * 1024];
+            let mut received = 0usize;
+            let mut mismatch = None;
+            while received < TOTAL {
+                match tokio::time::timeout(Duration::from_secs(5), conn.read(&mut buffer)).await {
+                    Ok(Ok(size)) if size > 0 => {
+                        if let Some(offset) =
+                            (0..size).find(|&offset| buffer[offset] != ((received + offset) % PATTERN) as u8)
+                        {
+                            mismatch = Some(received + offset);
+                            break;
+                        }
+                        received += size;
+                    }
+                    _ => break,
+                }
+            }
+            (received, mismatch)
+        }
+    });
+
+    let mut conn = with_timeout("dial_tcp", client.dial_tcp(None, destination)).await.expect("dial");
+    let mut chunk = vec![0u8; CHUNK];
+    for round in 0..TOTAL / CHUNK {
+        for (offset, byte) in chunk.iter_mut().enumerate() {
+            *byte = ((round * CHUNK + offset) % PATTERN) as u8;
+        }
+        with_timeout("write", conn.write_all(&chunk)).await.expect("the writer must not stall");
+    }
+
+    let (received, mismatch) = with_timeout("reader", reader).await.expect("reader task");
+    assert_eq!(mismatch, None, "the reader saw the wrong byte at stream offset {mismatch:?}");
+    assert_eq!(received, TOTAL, "the reader must see every byte the writer handed over");
 }

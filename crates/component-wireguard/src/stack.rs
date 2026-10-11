@@ -1060,10 +1060,16 @@ impl<D: phy::Device> Driver<D> {
                         break;
                     }
                     let chunk: Vec<u8> = entry.outbox.iter().take(TCP_SOCKET_BUFFER).copied().collect();
-                    if tcp.send_slice(&chunk).is_err() {
+                    // `send_slice` enqueues only what the transmit buffer has room for, so drop
+                    // only what it took and leave the rest for the next pass: the peer's
+                    // window has to be the backpressure, not a silent truncation.
+                    let Ok(accepted) = tcp.send_slice(&chunk) else {
+                        break;
+                    };
+                    if accepted == 0 {
                         break;
                     }
-                    entry.outbox.drain(..chunk.len());
+                    entry.outbox.drain(..accepted);
                 }
                 if entry.closing {
                     tcp.close();
