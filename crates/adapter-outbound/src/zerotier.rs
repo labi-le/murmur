@@ -509,6 +509,25 @@ impl RuntimeHandle {
     }
 }
 
+/// The runtime a start attempt owns until it hands the handle to the adapter. Dropping it cancels
+/// and joins the thread, so abandoning the start cannot leave a runtime nothing can reach.
+struct RuntimeStart(Option<RuntimeHandle>);
+
+impl RuntimeStart {
+    #[expect(clippy::expect_used, reason = "the guard holds the runtime until it is disarmed")]
+    fn disarm(mut self) -> RuntimeHandle {
+        self.0.take().expect("the guard holds the runtime until it is disarmed")
+    }
+}
+
+impl Drop for RuntimeStart {
+    fn drop(&mut self) {
+        if let Some(handle) = self.0.take() {
+            handle.close();
+        }
+    }
+}
+
 /// Reports a cancelled dial context.
 #[derive(Debug, thiserror::Error)]
 #[error("context canceled or deadline exceeded")]
@@ -600,8 +619,8 @@ impl ZeroTier {
     /// Starts the runtime, retried per call rather than latched, so a transient bind failure does
     /// not poison the outbound.
     pub(crate) async fn start(&self) -> Result<()> {
-        // NOT cancel-safe: it delegates to `start_runtime`, whose spawned runtime thread outlives a
-        // dropped future.
+        // cancel-safe: it delegates to `start_runtime`, which closes the runtime thread it spawned
+        // when the call is dropped.
         if self.ctx.is_cancelled() || self.shared.state.lock().closed {
             return Err(anyhow!("{OUTBOUND_CLOSED}"));
         }
@@ -635,8 +654,8 @@ impl ZeroTier {
     }
 
     async fn start_runtime(&self) -> Result<()> {
-        // NOT cancel-safe: the runtime thread it spawns is only reachable through the handle stored
-        // on success, so a drop leaves that thread running with no way to cancel it.
+        // cancel-safe: a drop closes the runtime the guard below holds, so the spawned thread never
+        // outlives the call and the next `start` starts a fresh one.
         // The state directory holds the node identity and membership data, so it is created
         // owner-only as the reference does.
         create_state_dir(&self.state_dir).await?;
@@ -661,28 +680,22 @@ impl ZeroTier {
                 runtime.block_on(run_runtime(shared, host, inputs, thread_cancel, ready_tx));
             })
             .map_err(|err| anyhow!("spawn ZeroTier runtime thread: {err}"))?;
+        let runtime = RuntimeStart(Some(RuntimeHandle { cancel, thread }));
         match ready_rx.await {
             Ok(Ok(())) => {
-                *self.runtime.lock() = Some(RuntimeHandle { cancel, thread });
+                *self.runtime.lock() = Some(runtime.disarm());
                 Ok(())
             }
-            Ok(Err(err)) => {
-                cancel.cancel();
-                Err(anyhow!("{err}"))
-            }
-            Err(_) => {
-                cancel.cancel();
-                Err(anyhow!("ZeroTier runtime thread exited before the node was up"))
-            }
+            Ok(Err(err)) => Err(anyhow!("{err}")),
+            Err(_) => Err(anyhow!("ZeroTier runtime thread exited before the node was up")),
         }
     }
 
     /// Ensures the runtime is started. The explicit network retry is folded into the runtime loop,
     /// which retries the configuration the node keeps re-requesting.
     pub(crate) async fn ensure_started(&self, ctx: &CancellationToken) -> Result<()> {
-        // NOT cancel-safe: it delegates to `start`, which reaches a runtime thread a dropped future
-        // leaves unreachable. The wait below is the safe half: it only samples the shared state,
-        // and the notification channel it subscribes to outlives the call.
+        // cancel-safe: it delegates to `start`, and the wait below only samples the shared state,
+        // whose notification channel outlives the call.
         self.start().await?;
         let mut notifications = self.shared.state_tx.subscribe();
         loop {
@@ -1748,6 +1761,7 @@ fn warn_about_wire_options(option: &ZeroTierOption) {
 mod tests {
     use std::net::Ipv4Addr;
     use std::path::PathBuf;
+    use std::task::Poll;
     use std::time::Instant;
 
     use async_trait::async_trait;
@@ -2090,6 +2104,21 @@ mod tests {
         }
     }
 
+    /// The live runtime threads spawned for `name`. The kernel truncates a thread name to 15
+    /// bytes, so only that prefix is compared.
+    #[cfg(target_os = "linux")]
+    fn runtime_thread_count(name: &str) -> usize {
+        let prefix = format!("zerotier-{name}");
+        let expected = &prefix[..prefix.len().min(15)];
+        let Ok(tasks) = std::fs::read_dir("/proc/self/task") else {
+            return 0;
+        };
+        tasks
+            .flatten()
+            .filter(|task| std::fs::read_to_string(task.path().join("comm")).is_ok_and(|comm| comm.trim() == expected))
+            .count()
+    }
+
     fn ad_hoc_outbound(name: &str, state_dir: &str) -> Arc<ZeroTier> {
         ZeroTier::new(ZeroTierOption {
             name: name.to_owned(),
@@ -2240,6 +2269,69 @@ mod tests {
             "the reader must stop instead of queueing a truncated frame"
         );
         assert_eq!(device.reads(), 1, "the oversized report ended the read loop");
+    }
+
+    /// Abandoning a start must stop the runtime thread it spawned, or the next start runs a second
+    /// runtime beside a thread nothing can reach.
+    #[test]
+    fn abandoning_a_start_stops_the_runtime_thread_it_spawned() {
+        let cancel = CancellationToken::new();
+        let stopped = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let flag = Arc::clone(&stopped);
+        let thread_cancel = cancel.clone();
+        let thread = std::thread::spawn(move || {
+            while !thread_cancel.is_cancelled() {
+                std::thread::yield_now();
+            }
+            flag.store(true, Ordering::SeqCst);
+        });
+
+        drop(RuntimeStart(Some(RuntimeHandle { cancel, thread })));
+
+        assert!(stopped.load(Ordering::SeqCst), "the drop cancelled and joined the runtime thread");
+    }
+
+    /// The success path hands the runtime over instead of stopping it.
+    #[test]
+    fn a_started_runtime_is_handed_over_uncancelled() {
+        let cancel = CancellationToken::new();
+        let handle = RuntimeStart(Some(RuntimeHandle {
+            cancel: cancel.clone(),
+            thread: std::thread::spawn(|| {}),
+        }))
+        .disarm();
+
+        assert!(!handle.cancel.is_cancelled(), "the stored runtime keeps running");
+        handle.close();
+    }
+
+    /// The orphan test drives the real runtime, which needs thread names the kernel reports.
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn an_abandoned_start_leaves_no_orphaned_runtime_thread() {
+        let state_dir = format!("zerotier-test-orphan-{}", std::process::id());
+        let _ = std::fs::remove_dir_all(PATH.resolve(&state_dir));
+        let outbound = ad_hoc_outbound("zt-orphan", &state_dir);
+
+        // Polled by hand so the future is dropped while its thread exists and is still unreachable,
+        // rather than after a timeout that a slower host would miss.
+        let mut start = Box::pin(outbound.start());
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while runtime_thread_count("zt-orphan") == 0 {
+            assert!(Instant::now() < deadline, "the runtime thread was never spawned");
+            if let Poll::Ready(result) = futures::poll!(start.as_mut()) {
+                panic!("the runtime came up before the future was dropped: {result:?}");
+            }
+            tokio::task::yield_now().await;
+        }
+        drop(start);
+
+        assert_eq!(runtime_thread_count("zt-orphan"), 0, "the abandoned start stops its runtime thread");
+        outbound.start().await.expect("a fresh runtime starts");
+        assert_eq!(runtime_thread_count("zt-orphan"), 1, "the second start owns exactly one runtime");
+
+        outbound.close().expect("close");
+        let _ = std::fs::remove_dir_all(PATH.resolve(&state_dir));
     }
 
     /// Only a host that is not already an address is resolved.
