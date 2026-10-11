@@ -1562,6 +1562,14 @@ pub mod h3 {
     const MAX_QUARTER_STREAM_ID: u64 = (1 << 60) - 1;
     const STREAM_DATAGRAM_QUEUE_LEN: usize = 32;
 
+    /// The frames preceding the final response may not exceed the field-section size this client
+    /// advertises, which bounds both the allocation and the loop.
+    const MAX_RESPONSE_PREAMBLE_BYTES: u64 = DEFAULT_MAX_FIELD_SECTION_SIZE;
+
+    /// Informational responses are the only reason to loop here, and RFC 9110 does not require
+    /// handling more than one.
+    const MAX_INTERIM_RESPONSES: u64 = 2;
+
     /// The hop-by-hop request headers dropped when encoding.
     const CONNECTION_SPECIFIC: [&str; 5] =
         ["connection", "proxy-connection", "transfer-encoding", "upgrade", "keep-alive"];
@@ -2371,17 +2379,24 @@ pub mod h3 {
         }
 
         pub async fn read_response(&mut self) -> anyhow::Result<HttpResponse> {
+            let mut preamble_bytes: u64 = 0;
+            let mut interim_responses: u64 = 0;
             loop {
                 let Some((frame_type, length)) = self.recv.next_frame().await? else {
                     self.send.conn.close_with_error(H3_REQUEST_INCOMPLETE, "request stream closed before response");
                     return Err(anyhow!("http3: request stream closed before response"));
                 };
+                if frame_type == FRAME_HEADERS && length > DEFAULT_MAX_FIELD_SECTION_SIZE {
+                    self.send.conn.close_with_error(H3_EXCESSIVE_LOAD, "response headers too large");
+                    return Err(anyhow!("http3: response headers too large"));
+                }
+                preamble_bytes = preamble_bytes.saturating_add(length);
+                if preamble_bytes > MAX_RESPONSE_PREAMBLE_BYTES {
+                    self.send.conn.close_with_error(H3_EXCESSIVE_LOAD, "response preamble too large");
+                    return Err(anyhow!("http3: response frames exceed {MAX_RESPONSE_PREAMBLE_BYTES} bytes"));
+                }
                 match frame_type {
                     FRAME_HEADERS => {
-                        if length > DEFAULT_MAX_FIELD_SECTION_SIZE {
-                            self.send.conn.close_with_error(H3_EXCESSIVE_LOAD, "response headers too large");
-                            return Err(anyhow!("http3: response headers too large"));
-                        }
                         let block = self.recv.read_payload(length).await?;
                         let fields = qpack::decode_headers(&block).inspect_err(|_err| {
                             self.send
@@ -2390,6 +2405,13 @@ pub mod h3 {
                         })?;
                         let status_code = status_from_fields(&fields)?;
                         if (100..200).contains(&status_code) {
+                            interim_responses += 1;
+                            if interim_responses > MAX_INTERIM_RESPONSES {
+                                self.send.conn.close_with_error(H3_EXCESSIVE_LOAD, "too many informational responses");
+                                return Err(anyhow!(
+                                    "http3: more than {MAX_INTERIM_RESPONSES} informational responses before the final response"
+                                ));
+                            }
                             // Informational responses precede the final one.
                             continue;
                         }
@@ -3037,6 +3059,189 @@ pub mod h3 {
                 return Err(anyhow!("qpack: invalid Huffman padding"));
             }
             Ok(out)
+        }
+    }
+
+    #[cfg(test)]
+    mod stream_tests {
+        use std::collections::HashMap;
+        use std::sync::Arc;
+        use std::time::Duration;
+
+        use bytes::Bytes;
+        use quinn::{ConnectionError, Endpoint, SendStream, VarInt};
+        use tokio::sync::mpsc;
+        use tokio::time::timeout;
+
+        use super::qpack;
+        use super::*;
+        use crate::masque::{generate_cert, prepare_tls_config, EcdsaPrivateKey, EcdsaPublicKey, NEXT_PROTO_H3};
+
+        /// A loopback round trip takes milliseconds; this only has to be short enough that a missing
+        /// frame bound fails the test instead of hanging the suite.
+        const FRAME_TIMEOUT: Duration = Duration::from_secs(10);
+
+        struct TestPair {
+            client: Arc<ClientConn>,
+            server: quinn::Connection,
+            _client_endpoint: Endpoint,
+            _server_endpoint: Endpoint,
+        }
+
+        /// A P-256 key in the SEC1 DER the crate's certificate helpers take.
+        fn private_key() -> EcdsaPrivateKey {
+            loop {
+                let mut seed = [0u8; 32];
+                rand::RngCore::fill_bytes(&mut rand::rng(), &mut seed);
+                if let Ok(secret) = p256::SecretKey::from_bytes(&seed.into()) {
+                    let der = secret.to_sec1_der().expect("encode sec1 der");
+                    return EcdsaPrivateKey::parse_ec_private_key(&der).expect("parse the key just generated");
+                }
+            }
+        }
+
+        fn public_key(private: &EcdsaPrivateKey) -> EcdsaPublicKey {
+            use murmur_component_ca::keypair::OID_PRIME256V1;
+            let secret = p256::SecretKey::from_sec1_der(private.der()).expect("sec1 private key");
+            let signing = p256::ecdsa::SigningKey::from(&secret);
+            EcdsaPublicKey {
+                curve: OID_PRIME256V1.to_vec(),
+                point: signing.verifying_key().to_sec1_point(false).as_ref().to_vec(),
+            }
+        }
+
+        /// The client under test over a real QUIC connection, with the server side held by the test
+        /// so it can write what a masque server would.
+        async fn connect_pair() -> TestPair {
+            murmur_testsupport_probe::ensure_test_crypto_provider();
+
+            let server_key = private_key();
+            let server_certs: Vec<rustls::pki_types::CertificateDer<'static>> = generate_cert(&server_key)
+                .expect("server cert")
+                .into_iter()
+                .map(rustls::pki_types::CertificateDer::from)
+                .collect();
+            let server_private = rustls::pki_types::PrivateKeyDer::Sec1(rustls::pki_types::PrivateSec1KeyDer::from(
+                server_key.der().to_vec(),
+            ));
+            let mut server_tls = rustls::ServerConfig::builder()
+                .with_no_client_auth()
+                .with_single_cert(server_certs, server_private)
+                .expect("build the test server config");
+            server_tls.alpn_protocols = vec![NEXT_PROTO_H3.to_vec()];
+            let server_crypto =
+                quinn::crypto::rustls::QuicServerConfig::try_from(server_tls).expect("quinn accepts the server config");
+            let server_endpoint = Endpoint::server(
+                quinn::ServerConfig::with_crypto(Arc::new(server_crypto)),
+                "127.0.0.1:0".parse().expect("loopback address"),
+            )
+            .expect("bind the server endpoint");
+            let addr = server_endpoint.local_addr().expect("the server endpoint has an address");
+
+            let client_key = private_key();
+            let tls = prepare_tls_config(&client_key, &public_key(&server_key), "example.com", false)
+                .expect("prepare the client tls config");
+            let client_crypto =
+                quinn::crypto::rustls::QuicClientConfig::try_from(tls.config).expect("quinn accepts the client config");
+            let client_endpoint =
+                Endpoint::client("127.0.0.1:0".parse().expect("loopback address")).expect("bind the client endpoint");
+            let server_name = tls.server_name.to_str().into_owned();
+            let connecting = client_endpoint
+                .connect_with(quinn::ClientConfig::new(Arc::new(client_crypto)), addr, &server_name)
+                .expect("dial the server");
+            let accepting = async {
+                server_endpoint
+                    .accept()
+                    .await
+                    .expect("the server endpoint is still accepting")
+                    .await
+                    .expect("the server handshake completes")
+            };
+            let (client_conn, server_conn) = futures::join!(connecting, accepting);
+            let client_conn = client_conn.expect("the client handshake completes");
+
+            let client = Transport::new(true, Vec::new())
+                .new_client_conn(client_conn)
+                .await
+                .expect("the client connection is created");
+            TestPair {
+                client,
+                server: server_conn,
+                _client_endpoint: client_endpoint,
+                _server_endpoint: server_endpoint,
+            }
+        }
+
+        /// Writes one HTTP/3 frame header declaring `length`, with no payload.
+        async fn write_frame_header(send: &mut SendStream, frame_type: u64, length: u64) {
+            let mut header: Vec<u8> = Vec::new();
+            quicvarint::append(&mut header, frame_type);
+            quicvarint::append(&mut header, length);
+            send.write_all(&header).await.expect("write the frame header");
+        }
+
+        async fn write_headers(send: &mut SendStream, status: &str) {
+            let block = qpack::encode_fields(&[(":status".to_owned(), status.to_owned())]);
+            let mut frame: Vec<u8> = Vec::new();
+            quicvarint::append(&mut frame, FRAME_HEADERS);
+            quicvarint::append(&mut frame, block.len() as u64);
+            frame.extend_from_slice(&block);
+            send.write_all(&frame).await.expect("write the HEADERS frame");
+        }
+
+        /// Opens a request stream and takes the server-side half a masque server would answer on.
+        /// The request head has to be written first: a QUIC stream only exists for the peer once
+        /// bytes arrive on it.
+        async fn open_response_stream(pair: &TestPair) -> (RequestStream, SendStream) {
+            let mut stream = pair.client.open_request_stream(None).await.expect("open a request stream");
+            let head = RequestHead {
+                method: http::Method::CONNECT,
+                proto: String::new(),
+                host: "example.com".to_owned(),
+                header: http::HeaderMap::new(),
+                url: http::Uri::from_static("https://example.com"),
+            };
+            stream.send_request_header(&head).await.expect("write the request head");
+            let (send, _recv) = pair.server.accept_bi().await.expect("the server accepts the request stream");
+            (stream, send)
+        }
+
+        #[tokio::test]
+        async fn more_informational_responses_than_the_cap_fail_closed() {
+            let pair = connect_pair().await;
+            let (mut stream, mut server_send) = open_response_stream(&pair).await;
+            for _ in 0..=MAX_INTERIM_RESPONSES {
+                write_headers(&mut server_send, "103").await;
+            }
+
+            let result = timeout(FRAME_TIMEOUT, stream.read_response()).await.expect("the response loop is bounded");
+            let err = result.expect_err("an unlimited run of informational responses is rejected");
+            assert!(err.to_string().contains("informational responses"), "unexpected error: {err}");
+        }
+
+        #[tokio::test]
+        async fn a_response_preamble_past_the_cap_fails_closed_without_reading_the_frames() {
+            let pair = connect_pair().await;
+            let (mut stream, mut server_send) = open_response_stream(&pair).await;
+            write_headers(&mut server_send, "103").await;
+            write_frame_header(&mut server_send, 0x21, MAX_RESPONSE_PREAMBLE_BYTES).await;
+
+            let result = timeout(FRAME_TIMEOUT, stream.read_response()).await.expect("the response loop is bounded");
+            let err = result.expect_err("a preamble past the byte cap is rejected");
+            assert!(err.to_string().contains("exceed"), "unexpected error: {err}");
+        }
+
+        #[tokio::test]
+        async fn informational_responses_up_to_the_cap_precede_the_final_response() {
+            let pair = connect_pair().await;
+            let (mut stream, mut server_send) = open_response_stream(&pair).await;
+            for _ in 0..MAX_INTERIM_RESPONSES {
+                write_headers(&mut server_send, "103").await;
+            }
+            write_headers(&mut server_send, "200").await;
+
+            let response = timeout(FRAME_TIMEOUT, stream.read_response()).await.expect("the response arrives");
+            assert_eq!(response.expect("a response within the caps").status_code, 200);
         }
     }
 }
