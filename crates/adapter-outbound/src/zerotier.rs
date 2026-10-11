@@ -1730,10 +1730,7 @@ async fn create_state_dir(state_dir: &str) -> Result<()> {
 
         let mut builder = tokio::fs::DirBuilder::new();
         builder.recursive(true).mode(0o700);
-        builder
-            .create(state_dir)
-            .await
-            .map_err(|err| anyhow!("create ZeroTier state directory {state_dir}: {err}"))?;
+        builder.create(state_dir).await.map_err(|err| anyhow!("create ZeroTier state directory {state_dir}: {err}"))?;
         tokio::fs::set_permissions(state_dir, std::fs::Permissions::from_mode(0o700))
             .await
             .map_err(|err| anyhow!("set ZeroTier state directory {state_dir} to 0700: {err}"))?;
@@ -2265,7 +2262,8 @@ mod tests {
     #[tokio::test]
     async fn a_device_reporting_more_than_the_buffer_holds_stops_the_reader() {
         let device = Arc::new(OversizedDevice::new(1500));
-        let stack = NetworkStack::spawn(Arc::clone(&device));
+        let reader: Arc<dyn IpStack> = Arc::clone(&device);
+        let stack = NetworkStack::spawn(reader);
 
         assert!(
             matches!(
@@ -2301,11 +2299,8 @@ mod tests {
     #[test]
     fn a_started_runtime_is_handed_over_uncancelled() {
         let cancel = CancellationToken::new();
-        let handle = RuntimeStart(Some(RuntimeHandle {
-            cancel: cancel.clone(),
-            thread: std::thread::spawn(|| {}),
-        }))
-        .disarm();
+        let handle =
+            RuntimeStart(Some(RuntimeHandle { cancel: cancel.clone(), thread: std::thread::spawn(|| {}) })).disarm();
 
         assert!(!handle.cancel.is_cancelled(), "the stored runtime keeps running");
         handle.close();
