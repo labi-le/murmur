@@ -4,6 +4,10 @@ use tokio::io::{AsyncWrite, AsyncWriteExt};
 
 use murmur_common_net::io::Stream;
 
+/// Caps an HTTP header read: a peer that never ends a line, or never sends the blank line that
+/// ends the header, must not make the reader buffer more than this.
+pub(crate) const MAX_HTTP_HEADER_BYTES: usize = 32 * 1024;
+
 /// A full write. `AsyncWriteExt::write_all` already loops until `p` is exhausted and reports
 /// `WriteZero` on a zero-length successful write, matching the hand-rolled loop and its
 /// a short-write error fallback.

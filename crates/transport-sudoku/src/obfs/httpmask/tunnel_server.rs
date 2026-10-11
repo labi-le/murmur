@@ -22,7 +22,7 @@ use url::Url;
 
 use murmur_common_net::io::{close_stream, Stream};
 
-use super::conn_helpers::{try_close_read, try_close_write, write_full};
+use super::conn_helpers::{try_close_read, try_close_write, write_full, MAX_HTTP_HEADER_BYTES};
 use super::early_handshake::TunnelServerEarlyHandshake;
 use super::halfpipe::new_half_pipe;
 use super::masker::looks_like_http_request_start;
@@ -332,8 +332,6 @@ struct ReadHeaderError {
     buffered: Vec<u8>,
 }
 
-const MAX_HEADER_BYTES: usize = 32 * 1024;
-
 async fn read_line(
     r: &mut BufReader<PreBufferedConn>,
     consumed: &mut Vec<u8>,
@@ -341,7 +339,7 @@ async fn read_line(
 ) -> std::result::Result<Vec<u8>, anyhow::Error> {
     use tokio::io::{AsyncBufReadExt, AsyncReadExt};
     let mut line = Vec::new();
-    let remaining = MAX_HEADER_BYTES.saturating_sub(consumed.len());
+    let remaining = MAX_HTTP_HEADER_BYTES.saturating_sub(consumed.len());
     let limit = remaining as u64 + 1;
     // Bound the individual `read_until`, not the whole header read, so a timeout cancels only
     // this future: `line` (owned by this call, not the cancelled future) keeps whatever partial
@@ -351,7 +349,7 @@ async fn read_line(
     if !line.is_empty() {
         consumed.extend_from_slice(&line);
     }
-    if consumed.len() > MAX_HEADER_BYTES {
+    if consumed.len() > MAX_HTTP_HEADER_BYTES {
         return Err(anyhow!("http header too large"));
     }
     match result {
@@ -2262,7 +2260,7 @@ mod tests {
     }
 
     /// Regression test for the P1 finding: `read_line` used to call `read_until` with no cap,
-    /// buffering an entire unterminated line before checking it against `MAX_HEADER_BYTES`. The
+    /// buffering an entire unterminated line before checking it against `MAX_HTTP_HEADER_BYTES`. The
     /// fix bounds the read itself via `Take`, so a peer that never sends `\n` cannot make
     /// `consumed` grow past the configured cap.
     #[tokio::test]
@@ -2272,7 +2270,7 @@ mod tests {
         let mut consumed = Vec::new();
 
         tokio::spawn(async move {
-            let garbage = vec![b'a'; MAX_HEADER_BYTES + 4096];
+            let garbage = vec![b'a'; MAX_HTTP_HEADER_BYTES + 4096];
             let _ = client.write_all(&garbage).await;
             drop(client);
         });
@@ -2285,7 +2283,7 @@ mod tests {
         .expect("read_line must reject an oversized line promptly rather than buffering it all");
         let err = result.expect_err("expected an error for an oversized header line");
         assert_eq!(err.to_string(), "http header too large");
-        assert!(consumed.len() <= MAX_HEADER_BYTES + 1, "read_line must not buffer far beyond the configured cap");
+        assert!(consumed.len() <= MAX_HTTP_HEADER_BYTES + 1, "read_line must not buffer far beyond the configured cap");
     }
 
     #[tokio::test]

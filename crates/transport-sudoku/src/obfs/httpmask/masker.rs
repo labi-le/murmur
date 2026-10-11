@@ -3,6 +3,7 @@ use std::io;
 use rand::Rng;
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 
+use super::conn_helpers::MAX_HTTP_HEADER_BYTES;
 use super::pathroot::join_path_root;
 
 pub(crate) const USER_AGENTS: &[&str] = &[
@@ -175,12 +176,11 @@ where
     let mut consumed = Vec::new();
 
     let mut line = Vec::new();
-    match r.read_until(b'\n', &mut line).await {
+    match read_line_capped(r, &mut consumed, &mut line).await {
         Ok(0) => return (consumed, Err(io::Error::from(io::ErrorKind::UnexpectedEof))),
         Ok(_) => {}
         Err(err) => return (consumed, Err(err)),
     }
-    consumed.extend_from_slice(&line);
 
     let is_supported_method = line.starts_with(b"POST ")
         || line.starts_with(b"GET ")
@@ -198,16 +198,98 @@ where
     }
 
     loop {
-        line.clear();
-        match r.read_until(b'\n', &mut line).await {
+        match read_line_capped(r, &mut consumed, &mut line).await {
             Ok(0) => return (consumed, Err(io::Error::from(io::ErrorKind::UnexpectedEof))),
             Ok(_) => {}
             Err(err) => return (consumed, Err(err)),
         }
-        consumed.extend_from_slice(&line);
 
         if line == b"\r\n" || line == b"\n" {
             return (consumed, Ok(()));
         }
+    }
+}
+
+/// Reads one `\n`-terminated line into `line`, appends it to `consumed`, and stops one byte past
+/// [`MAX_HTTP_HEADER_BYTES`] so neither a line without a newline nor an endless run of header
+/// lines can grow `consumed` past the cap.
+async fn read_line_capped<R>(r: &mut BufReader<R>, consumed: &mut Vec<u8>, line: &mut Vec<u8>) -> io::Result<usize>
+where
+    R: tokio::io::AsyncRead + Unpin,
+{
+    use tokio::io::AsyncReadExt as _;
+
+    line.clear();
+    let remaining = MAX_HTTP_HEADER_BYTES.saturating_sub(consumed.len());
+    let limit = remaining as u64 + 1;
+    let read = (&mut *r).take(limit).read_until(b'\n', line).await;
+    if !line.is_empty() {
+        consumed.extend_from_slice(line);
+    }
+    if consumed.len() > MAX_HTTP_HEADER_BYTES {
+        return Err(io::Error::new(io::ErrorKind::InvalidData, "http header too large"));
+    }
+    read
+}
+
+#[cfg(test)]
+mod tests {
+    use tokio::io::{duplex, DuplexStream};
+
+    use super::*;
+
+    async fn consume(stream: DuplexStream) -> (Vec<u8>, io::Result<()>) {
+        let mut reader = BufReader::new(stream);
+        consume_header(&mut reader).await
+    }
+
+    /// `GET / HTTP/1.1`, one filler header line and the blank line, `total` bytes in all.
+    fn request_header_of_len(total: usize) -> Vec<u8> {
+        let first = b"GET / HTTP/1.1\r\n";
+        let mut request = first.to_vec();
+        request.extend(std::iter::repeat_n(b'A', total - first.len() - 4));
+        request.extend_from_slice(b"\r\n\r\n");
+        assert_eq!(request.len(), total, "built request length");
+        request
+    }
+
+    #[tokio::test]
+    async fn consume_header_accepts_a_header_at_the_cap_and_refuses_the_byte_past_it() {
+        for (total, accepted) in
+            [(MAX_HTTP_HEADER_BYTES - 1, true), (MAX_HTTP_HEADER_BYTES, true), (MAX_HTTP_HEADER_BYTES + 1, false)]
+        {
+            let (mut client, server) = duplex(MAX_HTTP_HEADER_BYTES * 2);
+            client.write_all(&request_header_of_len(total)).await.expect("write request header");
+            drop(client);
+
+            let (consumed, result) = consume(server).await;
+            if accepted {
+                result.unwrap_or_else(|err| panic!("a {total}-byte header must be accepted: {err}"));
+                assert_eq!(consumed.len(), total, "consumed bytes for a {total}-byte header");
+            } else {
+                let err = result.err().unwrap_or_else(|| panic!("a {total}-byte header must be refused"));
+                assert_eq!(err.kind(), io::ErrorKind::InvalidData);
+                assert_eq!(err.to_string(), "http header too large");
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn consume_header_stops_reading_a_line_that_never_ends() {
+        let (mut client, server) = duplex(MAX_HTTP_HEADER_BYTES * 4);
+        let mut request = b"GET / HTTP/1.1\r\n".to_vec();
+        request.extend(std::iter::repeat_n(b'A', MAX_HTTP_HEADER_BYTES * 3));
+        client.write_all(&request).await.expect("write unterminated header");
+        drop(client);
+
+        let (consumed, result) = consume(server).await;
+        let err = result.expect_err("an unterminated header line must be refused");
+        assert_eq!(err.kind(), io::ErrorKind::InvalidData);
+        assert_eq!(err.to_string(), "http header too large");
+        assert!(
+            consumed.len() <= MAX_HTTP_HEADER_BYTES + 1,
+            "buffered {} bytes of a 96 KiB line with a cap of {MAX_HTTP_HEADER_BYTES}",
+            consumed.len()
+        );
     }
 }
