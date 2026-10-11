@@ -437,10 +437,7 @@ pub(crate) fn system_time_fn() -> TimeFn {
 /// `i64` (as here) rejects the epoch, where a wrapping one would accept it. Rejecting is the
 /// safer behaviour and is kept, at the cost of bit-for-bit parity for that narrow band of epochs
 /// near `now ± 2^63`.
-#[expect(
-    clippy::cast_precision_loss,
-    reason = "the i64 -> f64 step reproduces the lossy arithmetic documented above"
-)]
+#[expect(clippy::cast_precision_loss, reason = "the i64 -> f64 step reproduces the lossy arithmetic documented above")]
 #[expect(
     clippy::cast_possible_truncation,
     reason = "the f64 -> i64 step saturates, the deviation documented above from a wrapping conversion"
