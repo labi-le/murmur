@@ -271,8 +271,7 @@ mod tests {
     #[tokio::test]
     async fn open_stream_rejects_a_conn_outside_the_u16_range() {
         for conn in [65_536, 131_072, -1] {
-            let mut config = Config::default();
-            config.conn = conn;
+            let config = Config { conn, ..Config::default() };
             let client = Client::new(config);
             let ctx = CancellationToken::new();
 
@@ -288,8 +287,7 @@ mod tests {
 
     #[tokio::test]
     async fn open_stream_dials_when_conn_is_within_the_u16_range() {
-        let mut config = Config::default();
-        config.conn = 2;
+        let config = Config { conn: 2, ..Config::default() };
         let client = Client::new(config);
         let ctx = CancellationToken::new();
 
