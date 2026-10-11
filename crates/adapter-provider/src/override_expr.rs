@@ -2759,10 +2759,7 @@ fn override_unique_key(value: &Value) -> Result<String> {
     Ok(String::from_utf8(encoded)?)
 }
 
-#[expect(
-    clippy::cast_precision_loss,
-    reason = "override arithmetic runs in the float64 domain"
-)]
+#[expect(clippy::cast_precision_loss, reason = "override arithmetic runs in the float64 domain")]
 fn override_number(value: &Value) -> (f64, bool, bool) {
     match value {
         Value::Number(n) => {
