@@ -10,8 +10,8 @@
 //!   [`ServerConnection::tcp_requests`] while handing HTTP/3 requests to `h3` unchanged.
 //! * Setting congestion control to a Brutal sender — quinn binds a controller when the connection
 //!   is created and offers no way to swap it, and the protocol only learns the rate after the auth
-//!   exchange completes. [`CongestionOption`] therefore carries the choice to endpoint
-//!   construction, and the client applies the rate to quinn's own BBR initial window instead.
+//!   exchange completes. [`CongestionOption`] is therefore applied when the connection is built,
+//!   from the configured controller name and window; the negotiated rate is only reported in the log.
 
 use std::io;
 use std::net::SocketAddr;
@@ -35,9 +35,6 @@ pub const DEFAULT_STREAM_RECEIVE_WINDOW: u64 = 8_388_608;
 pub const DEFAULT_CONN_RECEIVE_WINDOW: u64 = DEFAULT_STREAM_RECEIVE_WINDOW * 5 / 2;
 pub const DEFAULT_MAX_IDLE_TIMEOUT: Duration = Duration::from_secs(30);
 pub const DEFAULT_KEEP_ALIVE_PERIOD: Duration = Duration::from_secs(10);
-
-/// The floor every brutal window is clamped up to.
-const INIT_MAX_DATAGRAM_SIZE: u64 = 1252;
 
 /// The QUIC configuration, restricted to the fields the protocol sets.
 #[derive(Clone, Debug, Default)]
@@ -380,13 +377,6 @@ pub fn decode_frame_type(first: u8, rest: &[u8]) -> u64 {
     value
 }
 
-/// The congestion window at the 100 ms initial smoothed RTT: `bps * 2 * 0.1`, floored at the
-/// initial max datagram size. `bps` is bytes/s.
-#[must_use]
-pub fn brutal_initial_window(bps: u64) -> Option<u64> {
-    (bps > 0).then(|| (bps / 5).max(INIT_MAX_DATAGRAM_SIZE))
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -427,16 +417,6 @@ mod tests {
         assert_eq!(frame_type_len(0xc0), 8);
         assert_eq!(FRAME_TYPE_TCP_REQUEST, 0x401);
         assert_eq!(frame_type_len(0x44), 2);
-    }
-
-    #[test]
-    fn brutal_window_is_derived_from_the_negotiated_rate() {
-        assert_eq!(brutal_initial_window(0), None);
-        // The window floors at the initial max datagram size before any RTT is measured.
-        assert_eq!(brutal_initial_window(1), Some(1252));
-        // bytes/s * 2 (the congestion window multiplier) * 0.1 s (the default initial RTT), i.e. /5.
-        assert_eq!(brutal_initial_window(100_000_000), Some(20_000_000));
-        assert_eq!(brutal_initial_window(1_500_000), Some(300_000));
     }
 
     #[test]
