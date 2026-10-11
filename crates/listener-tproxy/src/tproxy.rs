@@ -13,7 +13,7 @@ use murmur_constant::tunnel::Tunnel;
 use murmur_transport::socks5::socks5;
 
 #[cfg(target_os = "linux")]
-use super::setsockopt_linux::setsockopt;
+use super::setsockopt_linux::tcp_listener;
 
 #[derive(Debug)]
 pub struct Listener {
@@ -56,6 +56,10 @@ impl Listener {
     }
 }
 
+#[cfg_attr(
+    target_os = "linux",
+    expect(clippy::unused_async, reason = "every caller awaits this; only the non-linux arm binds asynchronously")
+)]
 pub async fn new(addr: &str, tunnel: Arc<dyn Tunnel>, additions: Vec<Addition>) -> Result<Arc<Listener>> {
     let mut additions = additions;
     if additions.is_empty() {
@@ -64,12 +68,14 @@ pub async fn new(addr: &str, tunnel: Arc<dyn Tunnel>, additions: Vec<Addition>) 
 
     // MPTCP is forced off for tproxy: it can malfunction on certain Linux kernels, and tokio's
     // `TcpListener` never opts a socket into MPTCP anyway.
-    let listener = TokioTcpListener::bind(addr).await?;
-
     #[cfg(target_os = "linux")]
-    setsockopt(&listener, addr)?;
+    let listener = tcp_listener(addr)?;
     #[cfg(not(target_os = "linux"))]
-    super::setsockopt_other::setsockopt(addr)?;
+    let listener = {
+        let listener = TokioTcpListener::bind(addr).await?;
+        super::setsockopt_other::setsockopt(addr)?;
+        listener
+    };
 
     let rl = Arc::new(Listener { inner: listener, addr: addr.to_owned(), closed: AtomicBool::new(false) });
 
@@ -92,4 +98,52 @@ pub async fn new(addr: &str, tunnel: Arc<dyn Tunnel>, additions: Vec<Addition>) 
     }
 
     Ok(rl)
+}
+
+#[cfg(all(test, target_os = "linux"))]
+mod tests {
+    use murmur_constant::adapters::{NatTable, UDPPacket};
+    use murmur_constant::metadata::Metadata;
+
+    use super::*;
+
+    struct NoTunnel;
+
+    #[async_trait::async_trait]
+    impl Tunnel for NoTunnel {
+        async fn handle_tcp_conn(&self, _conn: Box<dyn murmur_common_net::io::Stream>, _metadata: Metadata) {}
+
+        fn handle_udp_packet(&self, _packet: Arc<dyn UDPPacket>, _metadata: Metadata) {}
+
+        fn nat_table(&self) -> Arc<dyn NatTable> {
+            unimplemented!("not exercised by this test")
+        }
+    }
+
+    /// Whether the kernel denies the transparent pair, which decides what the error below can
+    /// distinguish.
+    fn transparent_is_denied() -> bool {
+        socket2::Socket::new(socket2::Domain::IPV4, socket2::Type::STREAM, Some(socket2::Protocol::TCP))
+            .and_then(|socket| socket.set_ip_transparent_v4(true))
+            .is_err()
+    }
+
+    /// The transparent pair has to be in force before the bind, and the port `probe` holds makes
+    /// the two orders report different errors: a denial of the option can only come from a pass
+    /// that ran before the bind, a bind failure from one that ran after it.
+    #[tokio::test]
+    async fn the_transparent_options_are_applied_before_the_listener_binds() {
+        let probe = std::net::TcpListener::bind("127.0.0.1:0").expect("an ephemeral port is free");
+        let addr = probe.local_addr().expect("the probe is bound").to_string();
+        let err = match new(&addr, Arc::new(NoTunnel), Vec::new()).await {
+            Err(err) => err,
+            Ok(listener) => panic!("the held port cannot be bound: {}", listener.address()),
+        };
+        let os_error = err.downcast_ref::<std::io::Error>().and_then(std::io::Error::raw_os_error);
+        if transparent_is_denied() {
+            assert_eq!(os_error, Some(libc::EPERM), "the option pass must fail before the bind: {err}");
+        } else {
+            assert_eq!(os_error, Some(libc::EADDRINUSE), "the option pass ran, then the held port was bound: {err}");
+        }
+    }
 }

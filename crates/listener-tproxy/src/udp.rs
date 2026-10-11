@@ -12,7 +12,7 @@ use murmur_constant::tunnel::Tunnel;
 use super::packet::handle_packet_conn;
 
 #[cfg(target_os = "linux")]
-use super::setsockopt_linux::setsockopt;
+use super::setsockopt_linux::udp_socket;
 #[cfg(not(target_os = "linux"))]
 use super::setsockopt_other::setsockopt;
 
@@ -43,21 +43,26 @@ impl ConstListener for UdpListener {
     }
 }
 
+#[cfg_attr(
+    target_os = "linux",
+    expect(clippy::unused_async, reason = "every caller awaits this; only the non-linux arm binds asynchronously")
+)]
 pub async fn new_udp(addr: &str, tunnel: Arc<dyn Tunnel>, additions: Vec<Addition>) -> Result<Arc<UdpListener>> {
     let mut additions = additions;
     if additions.is_empty() {
         additions = vec![with_in_name("DEFAULT-TPROXY"), with_special_rules("")];
     }
 
-    let l = Arc::new(UdpSocket::bind(addr).await?);
+    #[cfg(target_os = "linux")]
+    let l = Arc::new(udp_socket(addr)?);
+    #[cfg(not(target_os = "linux"))]
+    let l = {
+        setsockopt(addr)?;
+        Arc::new(UdpSocket::bind(addr).await?)
+    };
 
     let rl =
         Arc::new(UdpListener { packet_conn: Arc::clone(&l), addr: addr.to_owned(), closed: AtomicBool::new(false) });
-
-    #[cfg(target_os = "linux")]
-    setsockopt(&l, addr)?;
-    #[cfg(not(target_os = "linux"))]
-    setsockopt(addr)?;
 
     {
         let rl = Arc::clone(&rl);
