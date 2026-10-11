@@ -27,8 +27,8 @@ impl<T: AsyncRead + AsyncWrite + Send + Sync + Unpin + ?Sized> MuxStream for T {
 
 #[async_trait]
 pub trait Session: Send + Sync {
-    // NOT cancel-safe: the open request is already on the wire, so a dropped `open` leaves the
-    // peer holding a stream this side never registers.
+    // NOT cancel-safe: the open request is on the wire and the stream is already registered, so a
+    // dropped `open` leaves a stream on both sides that no handle ever removes.
     async fn open(&self, tcp_timeout: Duration) -> io::Result<Box<dyn MuxStream>>;
     // cancel-safe: the accept is a `tokio::sync::mpsc::Receiver::recv` under a lock, both of which
     // tokio documents as cancel-safe, so a stream nobody took stays queued.

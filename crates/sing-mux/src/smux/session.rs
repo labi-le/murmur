@@ -142,6 +142,18 @@ impl SessionInner {
         self.streams.lock().remove(&sid);
     }
 
+    /// Undoes an open that never handed its stream out. The table entry goes first, so the reader
+    /// task cannot deliver into `data_rx` any more, and whatever it already delivered goes back to
+    /// the receive window instead of staying charged to a stream nobody holds.
+    pub(super) fn discard_stream(&self, sid: u32, data_rx: &mut mpsc::UnboundedReceiver<Bytes>) {
+        self.remove_stream(sid);
+        let mut unread = 0usize;
+        while let Ok(chunk) = data_rx.try_recv() {
+            unread += chunk.len();
+        }
+        self.return_tokens(unread);
+    }
+
     fn fatal_close(&self) {
         if self.closed.swap(true, Ordering::SeqCst) {
             return;
@@ -308,18 +320,33 @@ impl Session for SmuxSession {
         }
 
         let sid = self.inner.next_stream_id.fetch_add(2, Ordering::SeqCst) + 2;
+        // The entry goes in before the SYN can be on the wire, so a peer that answers the SYN in
+        // the same flight has its payload delivered to `data_rx` instead of dropped.
+        let (data_tx, mut data_rx) = mpsc::unbounded_channel();
+        self.inner.streams.lock().insert(sid, Arc::new(StreamState { data_tx: SyncMutex::new(Some(data_tx)) }));
+
         let (tx, rx) = oneshot::channel();
-        self.inner.write_tx.send(WriteRequest { frame: Frame::syn(sid), resp: Some(tx) }).map_err(|_| broken_pipe())?;
+        if self.inner.write_tx.send(WriteRequest { frame: Frame::syn(sid), resp: Some(tx) }).is_err() {
+            self.inner.discard_stream(sid, &mut data_rx);
+            return Err(broken_pipe());
+        }
 
         match tokio::time::timeout(tcp_timeout, rx).await {
             Ok(Ok(Ok(_))) => {}
-            Ok(Ok(Err(e))) => return Err(e),
-            Ok(Err(_)) => return Err(broken_pipe()),
-            Err(_) => return Err(io::Error::new(io::ErrorKind::TimedOut, "smux open timed out")),
+            Ok(Ok(Err(e))) => {
+                self.inner.discard_stream(sid, &mut data_rx);
+                return Err(e);
+            }
+            Ok(Err(_)) => {
+                self.inner.discard_stream(sid, &mut data_rx);
+                return Err(broken_pipe());
+            }
+            Err(_) => {
+                self.inner.discard_stream(sid, &mut data_rx);
+                return Err(io::Error::new(io::ErrorKind::TimedOut, "smux open timed out"));
+            }
         }
 
-        let (data_tx, data_rx) = mpsc::unbounded_channel();
-        self.inner.streams.lock().insert(sid, Arc::new(StreamState { data_tx: SyncMutex::new(Some(data_tx)) }));
         Ok(Box::new(SmuxStreamHandle::new(sid, Arc::clone(&self.inner), data_rx)))
     }
 
@@ -351,7 +378,151 @@ impl Session for SmuxSession {
 
 #[cfg(test)]
 mod tests {
+    use std::pin::Pin;
+    use std::task::{Context, Poll, Waker};
+
+    use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
+
     use super::*;
+
+    /// A carrier whose writes stay pending until the test releases them, so a peer's reply can be
+    /// delivered while `open` is still waiting for the writer task's acknowledgement.
+    #[derive(Default)]
+    struct GatedCarrier {
+        state: SyncMutex<GatedState>,
+        wrote: Notify,
+        read_idle: Notify,
+    }
+
+    #[derive(Default)]
+    struct GatedState {
+        inbound: Vec<u8>,
+        consumed: usize,
+        empty_polls: u64,
+        read_waker: Option<Waker>,
+        first_write: Vec<u8>,
+        write_released: bool,
+        write_waker: Option<Waker>,
+    }
+
+    impl GatedCarrier {
+        async fn first_write(&self) -> Vec<u8> {
+            loop {
+                self.wrote.notified().await;
+                let mut state = self.state.lock();
+                if !state.first_write.is_empty() {
+                    return std::mem::take(&mut state.first_write);
+                }
+            }
+        }
+
+        /// Hands `bytes` to the session's reader and waits until it has consumed them and come
+        /// back to an idle read, which is past the point where the frame they carry is delivered.
+        async fn deliver(&self, bytes: &[u8]) {
+            let (idle_before, target) = {
+                let mut state = self.state.lock();
+                let idle_before = state.empty_polls;
+                state.inbound.extend_from_slice(bytes);
+                let target = state.consumed + bytes.len();
+                if let Some(waker) = state.read_waker.take() {
+                    waker.wake();
+                }
+                (idle_before, target)
+            };
+            loop {
+                self.read_idle.notified().await;
+                let state = self.state.lock();
+                if state.consumed >= target && state.empty_polls > idle_before {
+                    return;
+                }
+            }
+        }
+
+        fn release_write(&self) {
+            let waker = {
+                let mut state = self.state.lock();
+                state.write_released = true;
+                state.write_waker.take()
+            };
+            if let Some(waker) = waker {
+                waker.wake();
+            }
+        }
+    }
+
+    struct GatedConn(Arc<GatedCarrier>);
+
+    impl AsyncRead for GatedConn {
+        fn poll_read(self: Pin<&mut Self>, cx: &mut Context<'_>, buf: &mut ReadBuf<'_>) -> Poll<io::Result<()>> {
+            let mut state = self.0.state.lock();
+            if state.inbound.is_empty() {
+                state.empty_polls += 1;
+                state.read_waker = Some(cx.waker().clone());
+                self.0.read_idle.notify_one();
+                return Poll::Pending;
+            }
+            let n = buf.remaining().min(state.inbound.len());
+            let taken: Vec<u8> = state.inbound.drain(..n).collect();
+            buf.put_slice(&taken);
+            state.consumed += n;
+            Poll::Ready(Ok(()))
+        }
+    }
+
+    impl AsyncWrite for GatedConn {
+        fn poll_write(self: Pin<&mut Self>, cx: &mut Context<'_>, buf: &[u8]) -> Poll<io::Result<usize>> {
+            let mut state = self.0.state.lock();
+            if !state.write_released {
+                if state.first_write.is_empty() {
+                    state.first_write = buf.to_vec();
+                }
+                state.write_waker = Some(cx.waker().clone());
+                self.0.wrote.notify_one();
+                return Poll::Pending;
+            }
+            Poll::Ready(Ok(buf.len()))
+        }
+
+        fn poll_flush(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+            Poll::Ready(Ok(()))
+        }
+
+        fn poll_shutdown(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+            Poll::Ready(Ok(()))
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_peer_reply_that_arrives_before_registration_is_not_dropped() {
+        let carrier = Arc::new(GatedCarrier::default());
+        let session =
+            Arc::new(client_session(Box::new(GatedConn(Arc::clone(&carrier)))).await.expect("client session"));
+        let window = session.inner.bucket_level();
+
+        let opening = {
+            let session = Arc::clone(&session);
+            tokio::spawn(async move { session.open(Duration::from_secs(5)).await })
+        };
+
+        let syn = carrier.first_write().await;
+        let header: [u8; HEADER_SIZE] = syn[..HEADER_SIZE].try_into().expect("the SYN is one header long");
+        let (cmd, sid, len) = decode_header(header).expect("a valid SYN header");
+        assert_eq!((cmd, sid, len), (Cmd::Syn, 3, 0));
+
+        let mut reply = [0u8; HEADER_SIZE];
+        encode_header(&mut reply, Cmd::Psh, sid, 5);
+        carrier.deliver(&[reply.as_slice(), b"hello"].concat()).await;
+        carrier.release_write();
+
+        let mut stream = opening.await.expect("the open task").expect("open");
+        let mut buf = [0u8; 5];
+        tokio::time::timeout(Duration::from_secs(5), stream.read_exact(&mut buf))
+            .await
+            .expect("the peer's reply must not be dropped")
+            .expect("read the peer's reply");
+        assert_eq!(&buf, b"hello");
+        assert_eq!(session.inner.bucket_level(), window, "the early reply hands its window back on read");
+    }
 
     #[test]
     fn a_frame_for_an_unknown_stream_costs_no_tokens() {
