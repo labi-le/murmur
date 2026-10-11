@@ -54,11 +54,12 @@ bench-smoke:
 bench-metrics:
 	python3 tools/bench_metrics.py $(METRICS_ARGS)
 
-# The one test marked #[ignore]: a real-timer soak too slow for the default gate
-# (see crates/common-net/src/io.rs): not part of `gate`, run explicitly.
+# The two tests marked #[ignore]: real-timer soaks too slow for the default gate
+# (crates/common-net/src/io.rs and crates/common-net/src/deadline/pipe.rs): not part of `gate`,
+# run explicitly.
 test-heavy:
 	$(CARGO) nextest run --workspace --all-features --run-ignored ignored-only --profile ci \
-		-E 'test(deadline_token_clear_always_wins_a_race_with_the_firing_timer)'
+		-E 'test(deadline_token_clear_always_wins_a_race_with_the_firing_timer) | test(pipe_deadline_set_always_wins_a_race_with_the_firing_timer)'
 
 # Cheapest correct pre-commit gate. `cargo clippy` only wraps the workspace crate itself in
 # clippy-driver (`RUSTC_WORKSPACE_WRAPPER`); every dependency is still built by plain rustc under

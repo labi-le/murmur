@@ -86,11 +86,12 @@ timeout 900 tools/cargo-slot bash -c 'cargo nextest run --workspace --all-featur
 Exit code 124 is a timeout, not a failure of the code under test. Read it as "this run found a
 hang" and bisect for the culprit rather than re-running the same command longer.
 
-`make test-heavy` runs the single `#[ignore]`d test — a real-timer soak that is deliberately outside
-the default gate (`crates/common-net/src/io.rs`). Every crate is published as `murmur-<name>` except
-the binary, which is plain `murmur`. Lint levels live in `[workspace.lints]`, thresholds in
-`clippy.toml`; test code is exempt at the source level (`#![cfg_attr(test, allow(...))]` in crate
-roots, `#![allow(...)]` in `crates/*/tests/*.rs`), not through a flag.
+`make test-heavy` runs the two `#[ignore]`d tests — real-timer soaks that are deliberately outside
+the default gate (`crates/common-net/src/io.rs` and `crates/common-net/src/deadline/pipe.rs`). Every
+crate is published as `murmur-<name>` except the binary, which is plain `murmur`. Lint levels live in
+`[workspace.lints]`, thresholds in `clippy.toml`; test code is exempt at the source level
+(`#![cfg_attr(test, allow(...))]` in crate roots, `#![allow(...)]` in `crates/*/tests/*.rs`), not
+through a flag.
 
 ## Unverified behaviour
 
