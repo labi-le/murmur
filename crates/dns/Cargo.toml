@@ -1,0 +1,56 @@
+[package]
+name = "murmur-dns"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[lib]
+doctest = false
+
+[dependencies]
+anyhow.workspace = true
+async-trait.workspace = true
+base64.workspace = true
+bytes.workspace = true
+chrono.workspace = true
+futures.workspace = true
+h3.workspace = true
+h3-quinn.workspace = true
+hickory-proto.workspace = true
+http.workspace = true
+http-body-util.workspace = true
+hyper.workspace = true
+hyper-util.workspace = true
+ipnet.workspace = true
+parking_lot.workspace = true
+quinn.workspace = true
+rustls.workspace = true
+thiserror.workspace = true
+tokio.workspace = true
+tokio-rustls.workspace = true
+tokio-util.workspace = true
+url.workspace = true
+murmur-common = { path = "../common" }
+murmur-common-net = { path = "../common-net" }
+murmur-common-pool = { path = "../common-pool" }
+murmur-component = { path = "../component" }
+murmur-component-ca = { path = "../component-ca" }
+murmur-component-ech = { path = "../component-ech" }
+murmur-component-fakeip = { path = "../component-fakeip" }
+murmur-component-tls = { path = "../component-tls" }
+murmur-component-trie = { path = "../component-trie" }
+murmur-constant = { path = "../constant" }
+murmur-context = { path = "../context" }
+murmur-std-compat = { path = "../std-compat" }
+murmur-log = { path = "../log" }
+murmur-tunnel = { path = "../tunnel" }
+
+[features]
+cmfa = ["murmur-constant/cmfa"]
+[lints]
+workspace = true
+
+[target.'cfg(windows)'.dependencies]
+windows-sys.workspace = true

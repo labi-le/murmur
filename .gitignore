@@ -1,0 +1,12 @@
+/target
+CACHEDIR.TAG
+
+# Agent harness state and audit scratch, kept out of the published tree.
+/.jcode/
+/.omp/
+/artifact.json
+/final_artifact.json
+/union2.txt
+/ipcg-nodeb-probe/
+/$JCODE_SCRATCH_DIR/
+/${JCODE_SCRATCH_DIR:-/

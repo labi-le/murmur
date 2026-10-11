@@ -1,0 +1,46 @@
+[package]
+name = "murmur"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[[bin]]
+name = "murmur"
+path = "src/main.rs"
+
+[dependencies]
+anyhow.workspace = true
+base64.workspace = true
+tokio.workspace = true
+murmur-adapter-outbound = { path = "../adapter-outbound" }
+murmur-common = { path = "../common" }
+murmur-component = { path = "../component" }
+murmur-component-generator = { path = "../component-generator" }
+murmur-component-geodata = { path = "../component-geodata" }
+murmur-component-updater = { path = "../component-updater" }
+murmur-config = { path = "../config" }
+murmur-constant = { path = "../constant" }
+murmur-constant-features = { path = "../constant-features" }
+murmur-dns = { path = "../dns" }
+murmur-hub = { path = "../hub" }
+murmur-log = { path = "../log" }
+murmur-rules = { path = "../rules" }
+murmur-compat = { path = "../compat" }
+murmur-transport-hysteria = { path = "../transport-hysteria" }
+
+[features]
+default = ["with_gvisor"]
+cmfa = ["murmur-dns/cmfa", "murmur-constant/cmfa", "murmur-hub/cmfa", "murmur-constant-features/cmfa"]
+no_easytier = ["murmur-constant-features/no_easytier", "murmur-hub/no_easytier"]
+no_fake_tcp = ["murmur-transport-hysteria/no_fake_tcp", "murmur-constant-features/no_fake_tcp"]
+no_tailscale = ["murmur-constant-features/no_tailscale", "murmur-hub/no_tailscale"]
+no_zerotier = ["murmur-constant-features/no_zerotier"]
+with_gvisor = ["murmur-constant-features/with_gvisor", "murmur-hub/with_gvisor"]
+with_low_memory = ["murmur-compat/with_low_memory", "murmur-constant-features/with_low_memory"]
+[package.metadata.cargo-machete]
+ignored = ["murmur-compat", "murmur-transport-hysteria"]
+
+[lints]
+workspace = true

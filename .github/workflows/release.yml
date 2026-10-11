@@ -1,0 +1,176 @@
+name: Release
+
+# `push: tags: v*` cuts a real release; `workflow_dispatch` runs the same matrix without
+# tagging anything, so the build and the smoke test can be rehearsed before a version bump.
+# The publish job is gated separately on the tag push so a manual run never creates a release.
+on:
+  push:
+    tags:
+      - "v*"
+  workflow_dispatch: {}
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  # A forgotten version bump would otherwise publish binaries that report a version disagreeing
+  # with the tag they are attached to, and nothing downstream would notice. This is the only
+  # job that reads Cargo.toml as the source of truth; everything else trusts its result.
+  guard-tag:
+    name: Guard tag against Cargo.toml version
+    if: startsWith(github.ref, 'refs/tags/')
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Compare tag to package version
+        run: |
+          manifest_version=$(python3 -c "import tomllib; print(tomllib.load(open('Cargo.toml', 'rb'))['package']['version'])")
+          tag_version="${GITHUB_REF_NAME#v}"
+          echo "Cargo.toml version: $manifest_version"
+          echo "Tag version:        $tag_version"
+          if [ "$manifest_version" != "$tag_version" ]; then
+            echo "::error::tag $GITHUB_REF_NAME does not match the version in Cargo.toml ($manifest_version)"
+            exit 1
+          fi
+
+  build:
+    name: Build (${{ matrix.target }})
+    needs: guard-tag
+    # guard-tag is skipped (not failed) on workflow_dispatch, since there is no tag to check;
+    # a rehearsal build must still run. A failed guard-tag must block every build.
+    if: always() && (needs.guard-tag.result == 'success' || needs.guard-tag.result == 'skipped')
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - target: x86_64-unknown-linux-musl
+            os: ubuntu-latest
+            runnable: true
+          # Cross target on an x86_64 host: cannot run on this runner, so it is built and
+          # checksummed but never smoke-tested here.
+          - target: aarch64-unknown-linux-musl
+            os: ubuntu-latest
+            runnable: false
+          - target: x86_64-pc-windows-msvc
+            os: windows-latest
+            runnable: true
+          # macos-15-intel is the last free-tier Intel image GitHub is shipping (retiring
+          # August 2027); this row is native, not Rosetta-emulated.
+          - target: x86_64-apple-darwin
+            os: macos-15-intel
+            runnable: true
+          - target: aarch64-apple-darwin
+            os: macos-15
+            runnable: true
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v7
+
+      # musl's own crt objects are what's missing from ubuntu-latest, not the Rust target;
+      # `rustup target add` alone links against glibc's objects and fails.
+      - name: Install musl toolchain
+        if: matrix.target == 'x86_64-unknown-linux-musl'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y musl-tools
+          rustup target add x86_64-unknown-linux-musl
+
+      # aarch64 musl has no apt package on an x86_64 host; this action provides the prebuilt
+      # cross toolchain and points CC/the Cargo linker at it. It also adds the Rust target.
+      - name: Install aarch64-musl cross toolchain
+        if: matrix.target == 'aarch64-unknown-linux-musl'
+        uses: taiki-e/setup-cross-toolchain-action@12b7ad4acfa95a1476779d6c06699b96ec1691f8 # v1.42.0
+        with:
+          target: aarch64-unknown-linux-musl
+
+      - name: Add target
+        if: matrix.target != 'x86_64-unknown-linux-musl' && matrix.target != 'aarch64-unknown-linux-musl'
+        run: rustup target add ${{ matrix.target }}
+
+      # `--locked` cuts the release from the committed Cargo.lock instead of re-resolving it.
+      - name: Build
+        run: cargo build --release --locked --target ${{ matrix.target }} --bin murmur
+
+      # `-t` runs the binary's config-test mode (parse and validate, then exit) instead of starting
+      # the proxy; e2e_supported.yaml exercises every supported protocol family, so a binary
+      # that links but is broken at startup fails here instead of shipping. `-d` points the
+      # scratch home directory at a temp dir so the test never touches a real config directory.
+      - name: Smoke test
+        if: matrix.runnable
+        shell: bash
+        run: |
+          bin="target/${{ matrix.target }}/release/murmur"
+          if [ "${{ runner.os }}" = "Windows" ]; then
+            bin="${bin}.exe"
+          fi
+          smoke_home="${RUNNER_TEMP}/murmur-smoke"
+          mkdir -p "$smoke_home"
+          "$bin" -t -f src/config/config/testdata/e2e_supported.yaml -d "$smoke_home"
+
+      - name: Package artifact
+        shell: bash
+        run: |
+          mkdir -p dist
+          src="target/${{ matrix.target }}/release/murmur"
+          dest="dist/murmur-${{ matrix.target }}"
+          if [ "${{ runner.os }}" = "Windows" ]; then
+            src="${src}.exe"
+            dest="${dest}.exe"
+          fi
+          cp "$src" "$dest"
+
+      - uses: actions/upload-artifact@v7
+        with:
+          name: murmur-${{ matrix.target }}
+          path: dist/*
+          if-no-files-found: error
+
+  # Draft first, upload everything, publish last: a run that dies partway through leaves a
+  # draft, never a published release carrying only some of the platforms.
+  release:
+    name: Publish release
+    needs: build
+    if: startsWith(github.ref, 'refs/tags/')
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    env:
+      GH_TOKEN: ${{ github.token }}
+    steps:
+      - uses: actions/checkout@v7
+
+      - uses: actions/download-artifact@v8
+        with:
+          path: dist
+
+      # Each matrix row uploads its own named artifact; a directory missing here means that
+      # row's upload silently failed, which would otherwise be invisible on the release page.
+      - name: Verify every matrix row produced an artifact
+        run: |
+          expected=5
+          found=$(find dist -mindepth 1 -maxdepth 1 -type d | wc -l)
+          echo "expected $expected build artifacts, found $found"
+          if [ "$found" -ne "$expected" ]; then
+            echo "::error::only $found of $expected build artifacts were collected"
+            exit 1
+          fi
+
+      - name: Flatten artifacts and checksum
+        run: |
+          mkdir -p release
+          find dist -type f -exec cp {} release/ \;
+          (cd release && sha256sum -- * > checksums.txt)
+
+      - name: Create draft release
+        run: |
+          gh release create "$GITHUB_REF_NAME" \
+            --draft \
+            --title "$GITHUB_REF_NAME" \
+            --generate-notes
+
+      - name: Upload release assets
+        run: gh release upload "$GITHUB_REF_NAME" release/* --clobber
+
+      - name: Publish release
+        run: gh release edit "$GITHUB_REF_NAME" --draft=false

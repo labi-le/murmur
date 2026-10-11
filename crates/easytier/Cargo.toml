@@ -1,0 +1,42 @@
+[package]
+name = "murmur-easytier"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[lib]
+doctest = false
+
+[dependencies]
+aes-gcm.workspace = true
+anyhow.workspace = true
+async-trait.workspace = true
+base64.workspace = true
+hex.workspace = true
+ipnet.workspace = true
+parking_lot.workspace = true
+prost.workspace = true
+rand.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+sha2.workspace = true
+thiserror.workspace = true
+tokio.workspace = true
+tokio-util.workspace = true
+uuid.workspace = true
+x25519-dalek.workspace = true
+wasmtime = "49"
+wasmtime-wasi = "49"
+murmur-common-net = { path = "../common-net" }
+murmur-component-easytier = { path = "../component-easytier" }
+murmur-std-compat = { path = "../std-compat" }
+
+[dev-dependencies]
+hickory-proto.workspace = true
+murmur-component = { path = "../component" }
+murmur-constant = { path = "../constant" }
+
+[lints]
+workspace = true

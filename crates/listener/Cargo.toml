@@ -1,0 +1,98 @@
+[package]
+name = "murmur-listener"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[lib]
+doctest = false
+
+[dependencies]
+murmur-compat = { path = "../compat" }
+murmur-quic = { path = "../quic" }
+murmur-reality = { path = "../reality" }
+murmur-mieru = { path = "../mieru" }
+anyhow.workspace = true
+arc-swap.workspace = true
+async-trait.workspace = true
+base64.workspace = true
+bytes.workspace = true
+dashmap.workspace = true
+futures.workspace = true
+http.workspace = true
+http-body-util.workspace = true
+hex.workspace = true
+httparse.workspace = true
+hyper.workspace = true
+hyper-util.workspace = true
+ipnet.workspace = true
+libc.workspace = true
+parking_lot.workspace = true
+prost.workspace = true
+quinn.workspace = true
+rand.workspace = true
+regex.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+serde_yaml.workspace = true
+sha2.workspace = true
+socket2.workspace = true
+tokio.workspace = true
+tokio-util.workspace = true
+url.workspace = true
+uuid.workspace = true
+murmur-adapter-inbound = { path = "../adapter-inbound" }
+murmur-common = { path = "../common" }
+murmur-common-net = { path = "../common-net" }
+murmur-common-pool = { path = "../common-pool" }
+murmur-component = { path = "../component" }
+murmur-component-ca = { path = "../component-ca" }
+murmur-component-ech = { path = "../component-ech" }
+murmur-component-wireguard = { path = "../component-wireguard" }
+murmur-component-tls = { path = "../component-tls" }
+murmur-constant = { path = "../constant" }
+murmur-jls-tls = { path = "../jls-tls" }
+murmur-sing = { path = "../sing" }
+murmur-std-compat = { path = "../std-compat" }
+murmur-listener-config = { path = "../listener-config" }
+murmur-listener-inner = { path = "../listener-inner" }
+murmur-listener-sing = { path = "../listener-sing" }
+murmur-listener-tproxy = { path = "../listener-tproxy" }
+murmur-log = { path = "../log" }
+murmur-ntp = { path = "../ntp" }
+murmur-transport = { path = "../transport" }
+murmur-transport-anytls = { path = "../transport-anytls" }
+murmur-transport-hysteria2 = { path = "../transport-hysteria2" }
+murmur-transport-jls = { path = "../transport-jls" }
+murmur-transport-kcptun = { path = "../transport-kcptun" }
+murmur-transport-mekya = { path = "../transport-mekya" }
+murmur-transport-mkcp = { path = "../transport-mkcp" }
+murmur-transport-shadowquic = { path = "../transport-shadowquic" }
+murmur-transport-shadowsocks = { path = "../transport-shadowsocks" }
+murmur-transport-shadowtls = { path = "../transport-shadowtls" }
+murmur-transport-simple-obfs = { path = "../transport-simple-obfs" }
+murmur-transport-snell = { path = "../transport-snell" }
+murmur-transport-sudoku = { path = "../transport-sudoku" }
+murmur-transport-tlsmirror = { path = "../transport-tlsmirror" }
+murmur-transport-trusttunnel = { path = "../transport-trusttunnel" }
+murmur-transport-tuic = { path = "../transport-tuic" }
+murmur-transport-vless = { path = "../transport-vless" }
+murmur-transport-vmess = { path = "../transport-vmess" }
+murmur-transport-xhttp = { path = "../transport-xhttp" }
+
+
+[dev-dependencies]
+murmur-testsupport-probe = { path = "../testsupport-probe" }
+murmur-adapter-outbound = { path = "../adapter-outbound" }
+murmur-component-nat = { path = "../component-nat" }
+murmur-testsupport = { path = "../testsupport" }
+criterion.workspace = true
+
+[[bench]]
+name = "unsafe_rewrite_cost"
+harness = false
+
+[lints]
+workspace = true

@@ -1,0 +1,43 @@
+[package]
+name = "murmur-transport-mekya"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[lib]
+doctest = false
+
+[dependencies]
+anyhow.workspace = true
+async-trait.workspace = true
+base64.workspace = true
+bytes.workspace = true
+dashmap.workspace = true
+futures.workspace = true
+futures-util.workspace = true
+h2.workspace = true
+http.workspace = true
+http-body-util.workspace = true
+hyper.workspace = true
+hyper-util.workspace = true
+ipnet.workspace = true
+parking_lot.workspace = true
+rand.workspace = true
+thiserror.workspace = true
+tokio.workspace = true
+tokio-util.workspace = true
+url.workspace = true
+murmur-common-httputils = { path = "../common-httputils" }
+murmur-common-net = { path = "../common-net" }
+murmur-component-tls = { path = "../component-tls" }
+murmur-std-compat = { path = "../std-compat" }
+murmur-transport-mkcp = { path = "../transport-mkcp" }
+
+
+[dev-dependencies]
+murmur-component-ca = { path = "../component-ca" }
+
+[lints]
+workspace = true

@@ -1,0 +1,99 @@
+name: CI
+
+# The executable form of the gate this project is developed against: formatting, clippy (the
+# workspace denies the lint tiers listed in clippy.toml and Cargo.toml's [workspace.lints], so any
+# `error:` line here is a real defect), the full test suite, cargo-deny, cargo-audit and
+# cargo-machete.
+#
+# The workspace declares rust-version 1.97 and the build host runs rustc 1.97.1. These jobs track
+# stable, so they prove the project builds on a current toolchain; the declared MSRV is a manifest
+# claim that no job here re-checks.
+on:
+  push:
+    branches:
+      - main
+  pull_request:
+  workflow_dispatch: {}
+
+env:
+  CARGO_TERM_COLOR: always
+  # RUST_GUIDELINES.md section 7/12: deny rustc warnings for local packages in a
+  # cache-friendly way (changing this does not invalidate the build cache, unlike
+  # RUSTFLAGS). `--keep-going` is added per-invocation so one package's failure
+  # does not hide the rest of the workspace's warnings.
+  CARGO_BUILD_WARNINGS: deny
+
+jobs:
+  fmt:
+    name: rustfmt
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt
+      - run: cargo fmt --all -- --check
+
+  clippy:
+    name: clippy
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy
+      - uses: Swatinem/rust-cache@v2
+      # Section 12: the end-state gate, with no `-A` neutralizers. Lint levels live
+      # in [workspace.lints], thresholds in clippy.toml, and test code carries its
+      # own `allow` attributes in-source.
+      - run: cargo clippy --workspace --all-targets --locked --keep-going -- -D warnings
+      - run: cargo check --workspace --all-targets --locked --keep-going
+
+  deny:
+    name: cargo-deny
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+      - uses: EmbarkStudios/cargo-deny-action@v2
+
+  audit:
+    name: cargo-audit
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+      - uses: rustsec/audit-check@v2
+        with:
+          token: ${{ secrets.GITHUB_TOKEN }}
+
+  test:
+    name: test (${{ matrix.os }})
+    strategy:
+      fail-fast: false
+      matrix:
+        os:
+          - ubuntu-latest
+          - macos-latest
+          - windows-latest
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v6
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy
+      - uses: Swatinem/rust-cache@v2
+      # --no-fail-fast so one crate's failure does not hide the rest of the matrix.
+      - run: cargo test --workspace --no-fail-fast --locked
+      # The workspace denies the lint tiers listed in clippy.toml and in the manifest's workspace
+      # lints table, so this lints every target-gated body the runner's own platform compiles. The
+      # ubuntu leg still cannot reach the Windows or BSD bodies; `make clippy-windows` covers those
+      # locally and `gate-full` runs it.
+      - run: cargo clippy --workspace --all-targets --locked --keep-going -- -D warnings
+
+  machete:
+    name: cargo-machete
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: taiki-e/install-action@cargo-machete
+      - run: cargo machete

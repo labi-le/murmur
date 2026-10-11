@@ -1,0 +1,36 @@
+[package]
+name = "murmur-adapter-outboundgroup"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[lib]
+doctest = false
+
+[dependencies]
+anyhow.workspace = true
+async-trait.workspace = true
+chrono.workspace = true
+fancy-regex.workspace = true
+parking_lot.workspace = true
+psl.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+serde_yaml.workspace = true
+tokio.workspace = true
+tokio-util.workspace = true
+murmur-adapter-outbound = { path = "../adapter-outbound" }
+murmur-adapter-provider = { path = "../adapter-provider" }
+murmur-common = { path = "../common" }
+murmur-common-callback = { path = "../common-callback" }
+murmur-constant = { path = "../constant" }
+murmur-log = { path = "../log" }
+
+
+[dev-dependencies]
+murmur-adapter = { path = "../adapter" }
+
+[lints]
+workspace = true
