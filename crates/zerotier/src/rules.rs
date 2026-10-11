@@ -786,8 +786,10 @@ impl NetworkConfigData {
                 if let Some(&tcp_flags) = frame.payload.get(pos + 13) {
                     characteristics |= u64::from(tcp_flags);
                 }
-                if let Some(&version) = frame.payload.get(pos + 12) {
-                    characteristics |= u64::from(version & 0x0f) << 8;
+                // Bits 8..11 carry the data-offset byte's low (reserved) nibble, which is what the
+                // reference computes; the header length in its high nibble is not a characteristic.
+                if let Some(&reserved) = frame.payload.get(pos + 12) {
+                    characteristics |= u64::from(reserved & 0x0f) << 8;
                 }
             }
         }
@@ -1302,6 +1304,26 @@ mod tests {
         let mut outbound = context();
         outbound.local_tags = vec![local];
         assert!(config.allows_frame(&frame(ETHER_TYPE_IPV4, 20), outbound));
+    }
+
+    /// Bits 8..11 carry the low nibble of the TCP data-offset byte, as ZeroTier One's matcher does.
+    #[test]
+    fn characteristics_bits_8_to_11_hold_the_tcp_reserved_nibble() {
+        let mut frame = frame(ETHER_TYPE_IPV4, 40);
+        frame.payload[0] = 0x45;
+        frame.payload[9] = 6;
+        frame.payload[32] = 0x51;
+        let config = NetworkConfigData {
+            rules: vec![
+                NetworkRule { rule_type: RULE_MATCH_CHARACTERISTICS, value: 0x0100u64.to_be_bytes().to_vec() },
+                NetworkRule { rule_type: RULE_ACTION_ACCEPT, value: Vec::new() },
+            ],
+            ..Default::default()
+        };
+        assert!(config.allows_frame(&frame, FrameRuleContext::default()));
+
+        frame.payload[32] = 0x50;
+        assert!(!config.allows_frame(&frame, FrameRuleContext::default()));
     }
 
     #[test]
