@@ -29,7 +29,6 @@ pub(crate) const KIP_FEAT_ALL: u32 = KIP_FEAT_OPEN_TCP | KIP_FEAT_MUX | KIP_FEAT
 pub(crate) const KIP_HELLO_USER_HASH_SIZE: usize = 8;
 pub(crate) const KIP_HELLO_NONCE_SIZE: usize = 16;
 pub(crate) const KIP_HELLO_PUB_SIZE: usize = 32;
-const KIP_MAX_PAYLOAD: usize = 64 * 1024;
 
 const KIP_CLIENT_HELLO_TABLE_HINT_SIZE: usize = 4;
 
@@ -43,15 +42,14 @@ pub(crate) struct KipMessage {
 }
 
 pub async fn write_kip_message<W: AsyncWrite + Unpin + ?Sized>(w: &mut W, typ: u8, payload: &[u8]) -> Result<()> {
-    if payload.len() > KIP_MAX_PAYLOAD {
+    let Ok(payload_len) = u16::try_from(payload.len()) else {
         return Err(err_kip(format!("payload too large: {}", payload.len())));
-    }
+    };
 
     let mut hdr = [0u8; 3 + 1 + 2];
     hdr[..3].copy_from_slice(KIP_MAGIC);
     hdr[3] = typ;
-    #[expect(clippy::cast_possible_truncation, reason = "the KIP frame length field is 16 bits wide")]
-    BigEndian::write_u16(&mut hdr[4..], payload.len() as u16);
+    BigEndian::write_u16(&mut hdr[4..], payload_len);
 
     write_all_chunks(w, &[&hdr[..], payload]).await.map_err(Into::into)
 }
@@ -63,10 +61,7 @@ pub(crate) async fn read_kip_message<R: AsyncRead + Unpin + ?Sized>(r: &mut R) -
         return Err(err_kip("bad magic"));
     }
     let typ = hdr[3];
-    let n = BigEndian::read_u16(&hdr[4..]) as usize;
-    if n > KIP_MAX_PAYLOAD {
-        return Err(err_kip(format!("invalid payload length: {n}")));
-    }
+    let n = usize::from(BigEndian::read_u16(&hdr[4..]));
     let mut payload = vec![0u8; n];
     if n > 0 {
         r.read_exact(&mut payload).await?;
@@ -283,5 +278,40 @@ mod tests {
             resolve_client_hello_table(&a, &[std::sync::Arc::clone(&a), b], &hello).is_err(),
             "expected entropy-table mismatch to fail"
         );
+    }
+
+    #[tokio::test]
+    async fn write_kip_message_encodes_the_length_field_at_its_width_and_refuses_one_past_it() {
+        for len in [usize::from(u16::MAX) - 1, usize::from(u16::MAX)] {
+            let mut sink = Vec::new();
+            let payload = vec![0x5au8; len];
+            write_kip_message(&mut sink, KIP_TYPE_OPEN_TCP, &payload)
+                .await
+                .unwrap_or_else(|err| panic!("a {len}-byte payload must be encodable: {err}"));
+
+            let declared = usize::from(u16::from_be_bytes([sink[4], sink[5]]));
+            assert_eq!(declared, len, "declared length for a {len}-byte payload");
+            assert_eq!(sink.len(), 6 + len, "frame size for a {len}-byte payload");
+        }
+
+        let mut sink = Vec::new();
+        let oversized = vec![0x5au8; usize::from(u16::MAX) + 1];
+        let err = write_kip_message(&mut sink, KIP_TYPE_OPEN_TCP, &oversized)
+            .await
+            .expect_err("a payload one byte past the 16-bit length field must be refused");
+
+        assert_eq!(err.to_string(), "kip protocol error: payload too large: 65536");
+        assert!(sink.is_empty(), "a refused payload must write no bytes");
+    }
+
+    #[tokio::test]
+    async fn read_kip_message_reads_the_widest_frame_the_length_field_can_declare() {
+        let payload: Vec<u8> = (0..usize::from(u16::MAX)).map(|i| (i % 251) as u8).collect();
+        let mut frame = Vec::new();
+        write_kip_message(&mut frame, KIP_TYPE_OPEN_TCP, &payload).await.expect("encode widest frame");
+
+        let decoded = read_kip_message(&mut frame.as_slice()).await.expect("decode widest frame");
+        assert_eq!(decoded.typ, KIP_TYPE_OPEN_TCP);
+        assert_eq!(decoded.payload, payload, "widest frame payload round trip");
     }
 }
