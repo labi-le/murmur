@@ -9,6 +9,8 @@
 //! change the MAC.
 
 use anyhow::{anyhow, bail, Result};
+// `subtle` is not a direct dependency of this crate; `p256` re-exports it.
+use p256::elliptic_curve::subtle::ConstantTimeEq;
 
 use crate::consts::{
     RECORD_HEADER_LEN, RECORD_TYPE_APPLICATION_DATA, RESTLS_APP_DATA_AUTH_HEADER_LEN, RESTLS_APP_DATA_LEN_OFFSET,
@@ -243,7 +245,10 @@ pub fn read_record_with_nonce(
     let Some(payload) = record.get_mut(offset..) else {
         bail!("restls: bad record MAC");
     };
-    if payload.get(..RESTLS_APP_DATA_MAC_LEN) != Some(&expect_auth[..RESTLS_APP_DATA_MAC_LEN]) {
+    let Some(received_mac) = payload.get(..RESTLS_APP_DATA_MAC_LEN) else {
+        bail!("restls: bad record MAC");
+    };
+    if !bool::from(received_mac.ct_eq(&expect_auth[..RESTLS_APP_DATA_MAC_LEN])) {
         bail!("restls: bad record MAC");
     }
 
@@ -287,5 +292,27 @@ mod tests {
         let mut corrupt = write_record_with_nonce(&secret, &random, false, 0, None, b"hello", 18, Command::Noop, true);
         corrupt[12] = 2;
         assert!(read_record_with_nonce(&secret, &random, false, 0, None, &mut corrupt, true).is_err());
+    }
+
+    /// The record MAC is decided byte-for-byte: a sealed record opens, and a MAC that differs in
+    /// its last byte, was sealed under another key, or was cut short is rejected.
+    #[test]
+    fn the_record_mac_rejects_any_byte_difference() {
+        let secret = [7; 32];
+        let random = [9; 32];
+        let mut record = write_record(&secret, &random, false, 0, None, b"hello", 18, Command::Noop);
+        let result = read_record(&secret, &random, false, 0, None, &mut record).expect("a sealed record opens");
+        assert_eq!(&record[result.data_offset..result.data_offset + result.data_len], b"hello");
+
+        let mut one_byte_off = write_record(&secret, &random, false, 0, None, b"hello", 18, Command::Noop);
+        one_byte_off[RECORD_HEADER_LEN + RESTLS_APP_DATA_MAC_LEN - 1] ^= 1;
+        assert!(read_record(&secret, &random, false, 0, None, &mut one_byte_off).is_err(), "a MAC off by one byte");
+
+        let mut other_key = write_record(&[8; 32], &random, false, 0, None, b"hello", 18, Command::Noop);
+        assert!(read_record(&secret, &random, false, 0, None, &mut other_key).is_err(), "another key");
+
+        let mut truncated = write_record(&secret, &random, false, 0, None, b"hello", 18, Command::Noop);
+        truncated.truncate(RECORD_HEADER_LEN + RESTLS_APP_DATA_MAC_LEN);
+        assert!(read_record(&secret, &random, false, 0, None, &mut truncated).is_err(), "a cut-short record");
     }
 }

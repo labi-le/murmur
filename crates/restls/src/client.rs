@@ -14,6 +14,8 @@ use std::task::{Context, Poll};
 
 use anyhow::{anyhow, bail, Result};
 use murmur_common::shared_conn::SharedConn;
+// `subtle` is not a direct dependency of this crate; `p256` re-exports it.
+use p256::elliptic_curve::subtle::ConstantTimeEq;
 use parking_lot::Mutex;
 use rand::Rng;
 use sha2::Digest;
@@ -279,6 +281,16 @@ async fn next_handshake_message(
     }
 }
 
+/// RFC 8446 §4.4.4: the server's `Finished.verify_data` is exactly the value this transcript
+/// derives, and byte equality is decided without early exit.
+fn server_finished_matches(
+    secret: &[u8; crypto::HASH_LEN],
+    transcript_hash: &[u8; crypto::HASH_LEN],
+    received: &[u8; 32],
+) -> bool {
+    bool::from(finished_verify_data(secret, transcript_hash).ct_eq(received.as_slice()))
+}
+
 /// Verifies the peer chain and the Finished from the server's TLS 1.3 flight, which starts with
 /// the payload of the first encrypted record (`first_content`).
 async fn tls13_server_handshake(
@@ -337,8 +349,7 @@ async fn tls13_server_handshake(
             HANDSHAKE_TYPE_FINISHED => {
                 let hash_before_finished = transcript.hash();
                 let verify_data = parse_finished(&msg)?;
-                let expect = finished_verify_data(&keys.server_hs_secret, &hash_before_finished);
-                if verify_data != expect {
+                if !server_finished_matches(&keys.server_hs_secret, &hash_before_finished, &verify_data) {
                     bail!("restls: server Finished verification failed");
                 }
                 server_finished = Some(verify_data);
@@ -701,6 +712,17 @@ fn tls12_conn(
     })
 }
 
+/// RFC 5246 §7.4.9: the server's TLS 1.2 `Finished.verify_data` is exactly the PRF output this
+/// transcript derives, and byte equality is decided without early exit.
+fn tls12_server_finished_matches(
+    master: &[u8; 48],
+    session_hash: &[u8],
+    hash: Tls12PrfHash,
+    received: &[u8; 12],
+) -> bool {
+    bool::from(tls12_finished_verify_data(master, b"server finished", session_hash, hash).ct_eq(received.as_slice()))
+}
+
 async fn handshake_tls12(
     mut stream: Box<dyn NetConn>,
     config: &Config,
@@ -769,8 +791,7 @@ async fn handshake_tls12(
     let (parrot_gcm, finished) =
         open_tls12_server_finished(&mut record, config, &server_random, &mut server_protection)?;
     let received = parse_finished12(&finished)?;
-    let expected = tls12_finished_verify_data(&master, b"server finished", &tls12_hash(&transcript, hash), hash);
-    if received != expected {
+    if !tls12_server_finished_matches(&master, &tls12_hash(&transcript, hash), hash, &received) {
         bail!("restls: TLS 1.2 server Finished verification failed");
     }
     Ok(tls12_conn(stream, config, server_random, parrot_gcm, server_protection))
@@ -2167,5 +2188,46 @@ mod tls12_client_tests {
             let err = new_restls(Box::new(TinySocket(inner)), &config).await.err().expect("must reject");
             assert!(err.to_string().contains("NextProtos"), "unexpected error: {err}");
         }
+    }
+
+    /// The TLS 1.3 `Finished` check accepts exactly the value the transcript derives: a one-byte
+    /// difference and another traffic secret are both rejected.
+    #[test]
+    fn the_tls13_server_finished_check_rejects_any_byte_difference() {
+        let secret = [0x5au8; crypto::HASH_LEN];
+        let transcript_hash = [0x27u8; crypto::HASH_LEN];
+        let finished = finished_verify_data(&secret, &transcript_hash);
+        assert!(server_finished_matches(&secret, &transcript_hash, &finished));
+
+        let mut one_byte_off = finished;
+        one_byte_off[crypto::HASH_LEN - 1] ^= 1;
+        assert!(!server_finished_matches(&secret, &transcript_hash, &one_byte_off));
+
+        let other_secret = [0x5bu8; crypto::HASH_LEN];
+        assert!(!server_finished_matches(&other_secret, &transcript_hash, &finished), "another traffic secret");
+    }
+
+    /// The TLS 1.2 `Finished` check accepts exactly the value the transcript derives: a one-byte
+    /// difference, another master secret and another PRF hash are all rejected.
+    #[test]
+    fn the_tls12_server_finished_check_rejects_any_byte_difference() {
+        let master = [0x11u8; 48];
+        let session_hash = [0x22u8; 32];
+        let verify_data = tls12_finished_verify_data(&master, b"server finished", &session_hash, Tls12PrfHash::Sha256);
+        assert!(tls12_server_finished_matches(&master, &session_hash, Tls12PrfHash::Sha256, &verify_data));
+
+        let mut one_byte_off = verify_data;
+        one_byte_off[11] ^= 0x80;
+        assert!(!tls12_server_finished_matches(&master, &session_hash, Tls12PrfHash::Sha256, &one_byte_off));
+
+        let other_master = [0x12u8; 48];
+        assert!(
+            !tls12_server_finished_matches(&other_master, &session_hash, Tls12PrfHash::Sha256, &verify_data),
+            "another master secret"
+        );
+        assert!(
+            !tls12_server_finished_matches(&master, &session_hash, Tls12PrfHash::Sha384, &verify_data),
+            "another PRF hash"
+        );
     }
 }
