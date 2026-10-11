@@ -2099,7 +2099,8 @@ mod tests {
         let mut cx = Context::from_waker(Waker::noop());
         let count = match client.poll_write(&mut stream, &mut cx, b"hello") {
             Poll::Ready(Ok(count)) => count,
-            other => panic!("poll_write must seal the application record: {other:?}"),
+            Poll::Ready(Err(err)) => panic!("poll_write failed: {err}"),
+            Poll::Pending => panic!("poll_write must seal the application record"),
         };
         assert_eq!(count, 5);
 
