@@ -58,9 +58,10 @@ pub struct TrackerInfo {
     pub rule_payload: String,
 }
 
-/// The caller and the manager's connection list share one handle; a `&mut` conn cannot come out of a
-/// shared `Arc`, so the conn lives behind a lock in [`TcpTrackerInner`] and this handle gives the
-/// caller its `&mut` view.
+/// The caller and the manager's connection list share one handle.
+///
+/// A `&mut` conn cannot come out of a shared `Arc`, so the conn lives behind a lock in
+/// [`TcpTrackerInner`] and this handle gives the caller its `&mut` view.
 pub struct TcpTracker {
     inner: Arc<TcpTrackerInner>,
     close_view: TcpTrackerCloseView,
@@ -143,8 +144,10 @@ impl AsyncWrite for TcpTracker {
 }
 
 /// Close-only view of [`TcpTrackerInner`], the `Stream::old_conn` target below (the same pattern
-/// the H2 transport in `transport-vmess` uses): `TcpTracker` itself never implements the old
-/// [`Conn`], so this is the only place production and test code can still reach it directly.
+/// the H2 transport in `transport-vmess` uses):
+///
+/// `TcpTracker` itself never implements the old [`Conn`], so this is the only place production and
+/// test code can still reach it directly.
 struct TcpTrackerCloseView(Arc<TcpTrackerInner>);
 
 /// Never actually polled: forwards to the same locked conn `TcpTracker`'s own `AsyncRead`/
