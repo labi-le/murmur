@@ -239,19 +239,24 @@ async fn update_geo_databases() -> Result<()> {
 #[error("GEO database is updating, skip")]
 pub struct ErrGetDatabaseUpdateSkip;
 
+/// Claims the single update slot, and reports whether another update already holds it. The `swap`
+/// is what makes the claim a test-and-set: a `load` followed by a `store` lets two callers both
+/// observe `false` and then both write the same database files.
+fn claim_geo_update_slot() -> bool {
+    !UPDATING_GEO.swap(true)
+}
+
 /// The public and private spellings both case-fold to `update_geo_databases`; this keeps the
 /// private name and renames the public wrapper to `update_geo_databases_guarded` to avoid the
 /// collision.
-// NOT cancel-safe: a drop between the two `UPDATING_GEO` stores leaves the flag set, so every
-// later update reports that one is already running until the process restarts.
+// NOT cancel-safe: the flag stays set, so every later update reports that one is already running
+// until the process restarts.
 pub async fn update_geo_databases_guarded() -> Result<()> {
     infoln!("[GEO] Start updating GEO database");
 
-    if UPDATING_GEO.load() {
+    if !claim_geo_update_slot() {
         return Err(ErrGetDatabaseUpdateSkip.into());
     }
-
-    UPDATING_GEO.store(true);
     infoln!("[GEO] Updating GEO database");
 
     let result = update_geo_databases().await;
@@ -319,4 +324,48 @@ pub fn register_geo_updater() {
             }
         }
     });
+}
+
+#[cfg(test)]
+mod tests {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::{Arc, Barrier};
+
+    use super::*;
+
+    /// One test for the whole sequence: `UPDATING_GEO` is process-wide, so two tests driving it
+    /// would race each other.
+    #[tokio::test]
+    async fn the_geo_update_slot_admits_exactly_one_claim() {
+        assert!(claim_geo_update_slot(), "the first caller claims the slot");
+        assert!(!claim_geo_update_slot(), "a second caller is refused while the slot is held");
+
+        let refused = update_geo_databases_guarded().await.expect_err("a held slot refuses the update");
+        assert!(refused.is::<ErrGetDatabaseUpdateSkip>(), "{refused}");
+
+        UPDATING_GEO.store(false);
+        assert!(claim_geo_update_slot(), "a released slot can be claimed again");
+        UPDATING_GEO.store(false);
+
+        const CALLERS: usize = 8;
+        let barrier = Arc::new(Barrier::new(CALLERS));
+        let winners = Arc::new(AtomicUsize::new(0));
+        let callers: Vec<_> = (0..CALLERS)
+            .map(|_| {
+                let barrier = Arc::clone(&barrier);
+                let winners = Arc::clone(&winners);
+                std::thread::spawn(move || {
+                    barrier.wait();
+                    if claim_geo_update_slot() {
+                        winners.fetch_add(1, Ordering::SeqCst);
+                    }
+                })
+            })
+            .collect();
+        for caller in callers {
+            caller.join().expect("join");
+        }
+        assert_eq!(1, winners.load(Ordering::SeqCst), "exactly one concurrent caller may claim the slot");
+        UPDATING_GEO.store(false);
+    }
 }
