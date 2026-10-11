@@ -23,7 +23,7 @@ pub(crate) struct ErrNotHTTP;
 #[error("host is ip")]
 pub(crate) struct ErrHostIsIP;
 
-/// RFC 9110 §9.3; RFC 5789 (PATCH method).
+/// RFC 9110 §9.3; RFC 5789 (PATCH method). §9.1 makes the method token case-sensitive.
 const HTTP_METHODS: [&[u8]; 9] =
     [b"GET", b"POST", b"HEAD", b"PUT", b"DELETE", b"OPTIONS", b"CONNECT", b"PATCH", b"TRACE"];
 
@@ -91,11 +91,11 @@ impl Sniffer for HTTPSniffer {
 }
 
 fn is_http_method(method: &[u8]) -> bool {
-    HTTP_METHODS.iter().any(|m| method.eq_ignore_ascii_case(m))
+    HTTP_METHODS.contains(&method)
 }
 
 fn is_http_method_prefix(prefix: &[u8]) -> bool {
-    HTTP_METHODS.iter().any(|method| method.get(..prefix.len()).is_some_and(|head| head.eq_ignore_ascii_case(prefix)))
+    HTTP_METHODS.iter().any(|method| method.starts_with(prefix))
 }
 
 fn sniff_http1(b: &[u8]) -> anyhow::Result<String> {
@@ -838,6 +838,26 @@ mod tests {
     fn http1_rejects_non_http_prefix() {
         let err = new_sniffer().sniff_data(&[0x16, 0x03, 0x01, 0x00, 0x20]).unwrap_err();
         assert!(err.is::<ErrNotHTTP>());
+    }
+
+    /// RFC 9110 §9.1: the method token is case-sensitive (#48).
+    #[test]
+    fn http1_rejects_a_lowercase_method() {
+        let err = new_sniffer().sniff_data(b"get / HTTP/1.1\r\nHost: example.com\r\n\r\n").unwrap_err();
+        assert!(err.is::<ErrNotHTTP>(), "expected a non-method reply, got {err}");
+    }
+
+    #[test]
+    fn http1_rejects_a_mixed_case_method() {
+        let err =
+            new_sniffer().sniff_data(b"Get http://example.com/ HTTP/1.1\r\nHost: example.com\r\n\r\n").unwrap_err();
+        assert!(err.is::<ErrNotHTTP>(), "expected a non-method reply, got {err}");
+    }
+
+    #[test]
+    fn http1_rejects_a_lowercase_method_prefix_instead_of_waiting() {
+        let err = new_sniffer().sniff_data(b"ge").unwrap_err();
+        assert!(err.is::<ErrNotHTTP>(), "expected a non-method reply, got {err}");
     }
 
     #[test]
