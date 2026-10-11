@@ -11,6 +11,7 @@ use std::time::{Duration, Instant};
 use anyhow::{anyhow, bail, Result};
 use chacha20poly1305::aead::{Aead as _, Payload};
 use chacha20poly1305::{KeyInit as _, XChaCha20Poly1305};
+use subtle::ConstantTimeEq;
 
 use crate::crypto::{mac, mac1_key, mac2_key, HASH_SIZE, MAC_SIZE};
 use crate::handshake::TYPE_COOKIE_REPLY;
@@ -66,6 +67,11 @@ pub fn address_bytes(address: IpAddr) -> Vec<u8> {
     }
 }
 
+/// A MAC mismatch must not be observable byte by byte, and a length mismatch fails closed.
+fn constant_time_eq(a: &[u8], b: &[u8]) -> bool {
+    a.len() == b.len() && bool::from(a.ct_eq(b))
+}
+
 /// The responder's half. Its keys derive from the responder's own
 /// static public key, which is the key the initiator uses to build `mac1` and `mac2`.
 pub struct CookieChecker {
@@ -101,7 +107,7 @@ impl CookieChecker {
         let Ok(expected) = mac(&self.mac1_key, body) else {
             return false;
         };
-        macs.get(..MAC_SIZE).is_some_and(|mac1| mac1 == expected.as_slice())
+        macs.get(..MAC_SIZE).is_some_and(|mac1| constant_time_eq(mac1, &expected))
     }
 
     /// Verifies `mac2`. Without a secret younger than `COOKIE_REFRESH_TIME`
@@ -118,7 +124,7 @@ impl CookieChecker {
         let Ok(expected) = mac(&cookie, body) else {
             return false;
         };
-        mac2 == expected.as_slice()
+        constant_time_eq(mac2, &expected)
     }
 
     /// Builds a cookie reply, including its lazy secret rotation.
@@ -296,6 +302,54 @@ mod tests {
         assert!(checker.check_mac1(&retry));
         assert!(checker.check_mac2(&retry, &SRC), "the retry must carry a cookie-derived mac2");
         assert_ne!(&retry[132..], &[0u8; MAC_SIZE]);
+    }
+
+    #[test]
+    fn mac1_is_rejected_whatever_byte_differs() {
+        let (checker, mut generator) = pair();
+        let mut initiation = handshake_packet(7);
+        generator.add_macs(&mut initiation);
+        assert!(checker.check_mac1(&initiation));
+
+        let first = initiation.len() - 2 * MAC_SIZE;
+        for byte in first..first + MAC_SIZE {
+            let mut tampered = initiation.clone();
+            tampered[byte] ^= 1;
+            assert!(!checker.check_mac1(&tampered), "a mac1 wrong in byte {byte} must not verify");
+        }
+    }
+
+    #[test]
+    fn mac2_is_rejected_whatever_byte_differs() {
+        let (mut checker, mut generator) = pair();
+        let mut initiation = handshake_packet(7);
+        generator.add_macs(&mut initiation);
+        let reply = checker.create_reply(&initiation, 7, &SRC).expect("cookie reply");
+        assert!(generator.consume_reply(&reply));
+
+        let mut retry = handshake_packet(8);
+        generator.add_macs(&mut retry);
+        assert!(checker.check_mac2(&retry, &SRC));
+
+        for byte in retry.len() - MAC_SIZE..retry.len() {
+            let mut tampered = retry.clone();
+            tampered[byte] ^= 1;
+            assert!(!checker.check_mac2(&tampered, &SRC), "a mac2 wrong in byte {byte} must not verify");
+        }
+    }
+
+    #[test]
+    fn a_mac_comparison_fails_closed_on_a_length_mismatch() {
+        assert!(constant_time_eq(&[1, 2, 3], &[1, 2, 3]));
+        assert!(!constant_time_eq(&[1, 2, 3], &[1, 2]));
+        assert!(!constant_time_eq(&[1, 2, 3], &[1, 2, 4]));
+        assert!(!constant_time_eq(&[2, 2, 3], &[1, 2, 3]));
+
+        let (checker, mut generator) = pair();
+        let mut initiation = handshake_packet(7);
+        generator.add_macs(&mut initiation);
+        assert!(!checker.check_mac1(&initiation[..2 * MAC_SIZE - 1]), "a message too short for its macs must fail");
+        assert!(!checker.check_mac2(&initiation[..MAC_SIZE - 1], &SRC), "a message too short for a mac2 must fail");
     }
 
     #[test]

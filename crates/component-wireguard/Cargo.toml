@@ -20,6 +20,7 @@ murmur-common-net = { path = "../common-net" }
 murmur-log = { path = "../log" }
 rand.workspace = true
 smoltcp.workspace = true
+subtle.workspace = true
 tokio.workspace = true
 tokio-util.workspace = true
 x25519-dalek.workspace = true
