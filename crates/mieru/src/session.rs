@@ -760,16 +760,25 @@ impl Session {
                     }
                 };
                 if !payload.is_empty() {
-                    let mut reorder = self.inner.recv_reorder.lock().await;
-                    reorder.insert(seq, payload);
-                    drop(reorder);
-                    self.drain_reorder_buffer().await;
+                    self.buffer_out_of_order(seq, payload).await;
                 } else if self.inner.next_recv.load(Ordering::Acquire) == seq {
                     self.inner.next_recv.fetch_add(1, Ordering::AcqRel);
                 }
             }
         }
         Ok(())
+    }
+
+    /// Buffers a segment ahead of `next_recv`, dropping one the window has already passed or one
+    /// past the window the session advertises, so the buffer holds at most [`SEGMENT_TREE_CAPACITY`].
+    async fn buffer_out_of_order(&self, seq: u32, payload: Bytes) {
+        let next = self.inner.next_recv.load(Ordering::Acquire);
+        let window = u32::from(Inner::receive_window_size());
+        if seq < next || seq - next >= window {
+            return;
+        }
+        self.inner.recv_reorder.lock().await.insert(seq, payload);
+        self.drain_reorder_buffer().await;
     }
 
     async fn drain_reorder_buffer(&self) {
@@ -1223,6 +1232,10 @@ mod tests {
         }
     }
 
+    fn data_ack(seq: u32) -> DataAckStruct {
+        DataAckStruct { seq, session_id: 11, ..DataAckStruct::default() }
+    }
+
     /// A segment that has used up its retransmissions leaves nothing on the wire to arrive
     /// later, so the session is over and its reader has to be told. The reader is answered with
     /// a clean end of stream; stopping at the state flag alone leaves it parked on a queue nobody will fill.
@@ -1282,5 +1295,79 @@ mod tests {
             matches!(written, Err(SessionError::Closed)),
             "a closed session must fail the write it was holding back, not report success"
         );
+    }
+
+    /// The reorder buffer is bounded by the window the session advertises, not by the peer's
+    /// choice of sequence number: a `seq` far past `next_recv` must not be stored.
+    #[tokio::test]
+    async fn a_seq_past_the_advertised_window_does_not_grow_the_reorder_buffer() {
+        let session = silent_packet_session();
+        for i in 0..SEGMENT_TREE_CAPACITY as u32 * 2 {
+            let ack = data_ack(1_000_000 + i);
+            session
+                .handle_incoming(ProtocolType::DataClientToServer, SessionMeta::DataAck(ack), Bytes::from_static(b"x"))
+                .await
+                .expect("handle_incoming");
+        }
+        assert!(
+            session.inner.recv_reorder.lock().await.is_empty(),
+            "nothing outside `next_recv..next_recv + {SEGMENT_TREE_CAPACITY}` may be buffered"
+        );
+    }
+
+    /// A duplicate of a segment the window has already passed is dropped, not stored: the copy
+    /// arriving after `next_recv` moved on must leave nothing behind.
+    #[tokio::test]
+    async fn a_duplicate_of_a_delivered_segment_is_not_stored() {
+        let session = silent_packet_session();
+        session
+            .handle_incoming(
+                ProtocolType::DataClientToServer,
+                SessionMeta::DataAck(data_ack(0)),
+                Bytes::from_static(b"first"),
+            )
+            .await
+            .expect("first delivery");
+        assert_eq!(session.inner.next_recv.load(Ordering::Acquire), 1, "an in-order segment advances `next_recv`");
+        assert!(session.inner.recv_reorder.lock().await.is_empty(), "an in-order segment is not retained");
+
+        session
+            .handle_incoming(
+                ProtocolType::DataClientToServer,
+                SessionMeta::DataAck(data_ack(0)),
+                Bytes::from_static(b"duplicate"),
+            )
+            .await
+            .expect("duplicate delivery");
+        assert!(session.inner.recv_reorder.lock().await.is_empty(), "a duplicate below `next_recv` must not be stored");
+    }
+
+    /// The bound must not disable reordering: a segment inside the window is still buffered, and
+    /// both segments reach the read side in order once the gap fills.
+    #[tokio::test]
+    async fn a_segment_inside_the_window_is_still_buffered_and_delivered_in_order() {
+        let session = silent_packet_session();
+        session
+            .handle_incoming(
+                ProtocolType::DataClientToServer,
+                SessionMeta::DataAck(data_ack(1)),
+                Bytes::from_static(b"second"),
+            )
+            .await
+            .expect("out-of-order segment");
+        assert_eq!(session.inner.recv_reorder.lock().await.len(), 1, "a gap segment inside the window is buffered");
+
+        session
+            .handle_incoming(
+                ProtocolType::DataClientToServer,
+                SessionMeta::DataAck(data_ack(0)),
+                Bytes::from_static(b"first"),
+            )
+            .await
+            .expect("in-order segment");
+        assert_eq!(session.inner.next_recv.load(Ordering::Acquire), 2, "both segments are now in order");
+        assert!(session.inner.recv_reorder.lock().await.is_empty(), "the buffer drains as the gap fills");
+        assert_eq!(lock(&session.inner.read_rx).try_recv().expect("first"), Bytes::from_static(b"first"));
+        assert_eq!(lock(&session.inner.read_rx).try_recv().expect("second"), Bytes::from_static(b"second"));
     }
 }
