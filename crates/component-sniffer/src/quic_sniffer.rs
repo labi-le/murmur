@@ -189,7 +189,7 @@ impl PacketSender for QuicPacketSender {
     async fn send(&self, current: Arc<dyn PacketAdapter>) {
         let closed = self.state.read().closed;
         if !closed && self.read_quic_data(current.data()).is_err() {
-            self.close();
+            self.close_sniffing();
         }
         self.inner.send(current).await;
     }
@@ -823,7 +823,11 @@ mod quicvarint {
 
 #[cfg(test)]
 mod tests {
+    use std::net::SocketAddr;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
     use byteorder::{BigEndian, ByteOrder};
+    use murmur_constant::adapters::{new_packet_adapter, UDPPacket, WriteBack};
 
     use super::quicvarint;
     use super::*;
@@ -1146,5 +1150,90 @@ mod tests {
         let domain = sender.try_assemble().expect("assembles");
         assert_eq!(domain, "example.com");
         sender.close_sniffing();
+    }
+
+    #[derive(Default)]
+    struct RecordingSender {
+        closes: AtomicUsize,
+        sends: AtomicUsize,
+    }
+
+    #[async_trait::async_trait]
+    impl PacketSender for RecordingSender {
+        async fn send(&self, _packet: Arc<dyn PacketAdapter>) {
+            self.sends.fetch_add(1, Ordering::SeqCst);
+        }
+
+        async fn process(
+            &self,
+            _conn: Arc<dyn murmur_constant::adapters::PacketConn>,
+            _proxy: Arc<dyn murmur_constant::adapters::WriteBackProxy>,
+        ) {
+        }
+
+        fn close(&self) {
+            self.closes.fetch_add(1, Ordering::SeqCst);
+        }
+
+        async fn do_sniff(&self, _metadata: &mut Metadata) -> anyhow::Result<()> {
+            Ok(())
+        }
+
+        fn add_mapping(&self, _origin_metadata: &Metadata, _metadata: &Metadata) {}
+
+        fn restore_read_from(&self, addr: std::net::IpAddr) -> std::net::IpAddr {
+            addr
+        }
+    }
+
+    struct TestPacket(Vec<u8>);
+
+    #[async_trait::async_trait]
+    impl WriteBack for TestPacket {
+        async fn write_back(&self, _b: &[u8], _addr: Option<SocketAddr>) -> anyhow::Result<usize> {
+            unreachable!("the sniffer never writes a datagram back")
+        }
+    }
+
+    impl UDPPacket for TestPacket {
+        fn data(&self) -> &[u8] {
+            &self.0
+        }
+
+        fn drop_(&self) {}
+
+        fn local_addr(&self) -> SocketAddr {
+            "192.0.2.1:443".parse().expect("valid address")
+        }
+    }
+
+    fn sender_with_recording_inner() -> (QuicPacketSender, Arc<RecordingSender>) {
+        let recording = Arc::new(RecordingSender::default());
+        let shared = Arc::clone(&recording);
+        let sender = QuicPacketSender {
+            inner: shared,
+            replace_domain: Arc::new(|_, _| {}),
+            state: RwLock::new(QuicPacketSenderState::default()),
+            done: CancellationToken::new(),
+        };
+        (sender, recording)
+    }
+
+    /// An unparseable datagram ends sniffing for the flow, not the flow itself (#37).
+    #[tokio::test]
+    async fn unparseable_datagram_stops_sniffing_without_closing_the_flow() {
+        // A short-header packet outside a coalesced group, then a long header naming no known version.
+        let cases: &[&[u8]] = &[&[0x00], &[0xc0, 0x00, 0x00, 0x00, 0x09, 0x00, 0x00, 0x00, 0x00, 0x00]];
+
+        for data in cases {
+            let (sender, inner) = sender_with_recording_inner();
+            let packet = new_packet_adapter(Arc::new(TestPacket(data.to_vec())), Metadata::default());
+
+            sender.send(Arc::new(packet)).await;
+
+            assert_eq!(inner.closes.load(Ordering::SeqCst), 0, "the flow must survive {data:?}");
+            assert!(sender.state.read().closed, "sniffing must stop after {data:?}");
+            assert_eq!(inner.sends.load(Ordering::SeqCst), 1, "the datagram must still be forwarded");
+        }
     }
 }
