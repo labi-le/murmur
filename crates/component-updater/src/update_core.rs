@@ -388,9 +388,7 @@ fn zip_file_unpack(zipfile: &Path, out_dir: &Path, file_mode: u32) -> Result<Pat
     let base_name = Path::new(&name).file_name().map_or_else(|| name.clone(), |s| s.to_string_lossy().into_owned());
     let output_name = out_dir.join(&base_name);
     let mut data = Vec::new();
-    BoundedReader::new(&mut zf, MAX_UNPACKED_FILE_SIZE)
-        .read_to_end(&mut data)
-        .map_err(|err| anyhow!("copy: {err}"))?;
+    BoundedReader::new(&mut zf, MAX_UNPACKED_FILE_SIZE).read_to_end(&mut data).map_err(|err| anyhow!("copy: {err}"))?;
     write_file_mode(&output_name, &data, file_mode).map_err(|err| anyhow!("os.OpenFile(): {err}"))?;
 
     Ok(output_name)

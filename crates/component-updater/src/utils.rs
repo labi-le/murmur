@@ -18,8 +18,7 @@ pub(crate) const DEFAULT_HTTP_TIMEOUT: Duration = Duration::from_secs(90);
 /// 3:1, so eight times the compressed cap cannot clip a legitimate package.
 pub(crate) const MAX_UNPACKED_FILE_SIZE: usize = 8 * MAX_PACKAGE_FILE_SIZE;
 
-/// Fails closed once the wrapped decoder has produced more than `limit` bytes. The byte read past
-/// the limit separates a stream that ended exactly at it from one that keeps inflating.
+/// Fails closed once the wrapped decoder has produced more than `limit` bytes.
 pub(crate) struct BoundedReader<R> {
     inner: R,
     limit: usize,
@@ -34,25 +33,15 @@ impl<R: Read> BoundedReader<R> {
 
 impl<R: Read> Read for BoundedReader<R> {
     fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
-        if buf.is_empty() {
-            return Ok(0);
-        }
-
         let limit = self.limit;
         let remaining = limit - self.produced;
-        if remaining == 0 {
-            let mut probe = [0u8; 1];
-            return match self.inner.read(&mut probe)? {
-                0 => Ok(0),
-                _ => Err(std::io::Error::new(
-                    std::io::ErrorKind::InvalidData,
-                    format!("decompressed data exceeds MAX_UNPACKED_FILE_SIZE ({limit}) bytes"),
-                )),
-            };
+        let read = self.inner.read(buf)?;
+        if read > remaining {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                format!("decompressed data exceeds MAX_UNPACKED_FILE_SIZE ({limit}) bytes"),
+            ));
         }
-
-        let cap = buf.len().min(remaining);
-        let read = self.inner.read(&mut buf[..cap])?;
         self.produced += read;
         Ok(read)
     }
