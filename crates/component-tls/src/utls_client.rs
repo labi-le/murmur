@@ -194,6 +194,31 @@ impl Tls13Suite {
         }
     }
 
+    /// RFC 8446 §4.4.4: `verify_slice` compares the peer's `Finished.verify_data` in constant time
+    /// and rejects a wrong length, so a byte-by-byte comparison never reaches the wire.
+    pub(crate) fn verify_finished(self, finished_key: &[u8], transcript_hash: &[u8], received: &[u8]) -> bool {
+        match self {
+            Self::Aes128GcmSha256 | Self::Chacha20Poly1305Sha256 => {
+                #[expect(
+                    clippy::expect_used,
+                    reason = "Hmac::new_from_slice accepts a key of any length, so the constructor cannot fail"
+                )]
+                let mut mac = Hmac::<Sha256>::new_from_slice(finished_key).expect("HMAC accepts any key length");
+                mac.update(transcript_hash);
+                mac.verify_slice(received).is_ok()
+            }
+            Self::Aes256GcmSha384 => {
+                #[expect(
+                    clippy::expect_used,
+                    reason = "Hmac::new_from_slice accepts a key of any length, so the constructor cannot fail"
+                )]
+                let mut mac = Hmac::<Sha384>::new_from_slice(finished_key).expect("HMAC accepts any key length");
+                mac.update(transcript_hash);
+                mac.verify_slice(received).is_ok()
+            }
+        }
+    }
+
     fn seal(self, key: &[u8], nonce: &[u8; IV_LEN], plaintext: &[u8], aad: &[u8]) -> Result<Vec<u8>> {
         let sealed = match self {
             Self::Aes128GcmSha256 => Aes128Gcm::new_from_slice(key)
@@ -1136,8 +1161,7 @@ impl UtlsClient {
                 HANDSHAKE_FINISHED => {
                     let finished_key =
                         suite.expand_label(&self.server_handshake_secret, "finished", &[], suite.hash_len())?;
-                    let expected = suite.finished_mac(&finished_key, &suite.transcript_hash(&self.transcript));
-                    if body != expected.as_slice() {
+                    if !suite.verify_finished(&finished_key, &suite.transcript_hash(&self.transcript), body) {
                         return Err(anyhow!("tls: server Finished verify_data mismatch"));
                     }
                     self.transcript.extend_from_slice(&raw);
@@ -1795,6 +1819,29 @@ mod tests {
         assert_eq!(parsed.signature, signature);
     }
 
+    /// The peer's `Finished` is accepted only as the recomputed HMAC: a one-byte-off tag, a
+    /// truncated tag and a different finished key all fail, with `verify_slice` comparing in
+    /// constant time.
+    #[test]
+    fn verify_finished_accepts_only_the_recomputed_verify_data() {
+        for suite in [Tls13Suite::Aes128GcmSha256, Tls13Suite::Aes256GcmSha384, Tls13Suite::Chacha20Poly1305Sha256] {
+            let finished_key = vec![0x2a; suite.hash_len()];
+            let transcript_hash = suite.transcript_hash(b"transcript");
+            let verify_data = suite.finished_mac(&finished_key, &transcript_hash);
+            assert!(suite.verify_finished(&finished_key, &transcript_hash, &verify_data), "{suite:?}");
+
+            let mut one_byte_off = verify_data.clone();
+            one_byte_off[0] ^= 0x01;
+            assert!(!suite.verify_finished(&finished_key, &transcript_hash, &one_byte_off), "{suite:?}");
+
+            let (_, truncated) = verify_data.split_at(verify_data.len() - 1);
+            assert!(!suite.verify_finished(&finished_key, &transcript_hash, truncated), "{suite:?}");
+
+            let wrong_key = vec![0x2b; suite.hash_len()];
+            assert!(!suite.verify_finished(&wrong_key, &transcript_hash, &verify_data), "{suite:?}");
+        }
+    }
+
     #[test]
     fn exporter_matches_rfc8446_section_7_5_for_the_callers_label() {
         // The expected values were computed with an independent HKDF re-derivation; a
@@ -2069,14 +2116,8 @@ mod tests {
             "the response must carry update_not_requested"
         );
 
-        let (content_type, plaintext) = open_record_with(
-            keys.suite,
-            &client.client_key,
-            &client.client_iv,
-            1,
-            &parsed[1].0,
-            &parsed[1].1,
-        );
+        let (content_type, plaintext) =
+            open_record_with(keys.suite, &client.client_key, &client.client_iv, 1, &parsed[1].0, &parsed[1].1);
         assert_eq!(content_type, CONTENT_APPLICATION_DATA);
         assert_eq!(plaintext, b"hello".to_vec(), "application data follows under the next generation");
     }
