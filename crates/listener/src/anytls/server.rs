@@ -1,8 +1,9 @@
-//! `NEEDED SHIM ITEM: murmur_sing::metadata::SocksaddrSerializer::ReadAddrPort`, mirroring
-//! `transport/anytls/client.rs`'s `write_socksaddr` note for the same
-//! unmirrored serializer: `read_socksaddr` below implements the read direction (address then
-//! port, no port-then-address option) as a local helper, together with
-//! local `parse_socksaddr_host_port`/`parse_socksaddr`/`socksaddr_from_net` copies of the
+//! `NEEDED SHIM ITEM: murmur_sing::metadata::SocksaddrSerializer::ReadAddrPort`.
+//!
+//! Mirroring `transport/anytls/client.rs`'s `write_socksaddr` note for the same unmirrored
+//! serializer: `read_socksaddr` below implements the read direction (address then port, no
+//! port-then-address option) as a local helper, together with local
+//! `parse_socksaddr_host_port`/`parse_socksaddr`/`socksaddr_from_net` copies of the
 //! `pub(crate)`-scoped helpers already provided (but not exposed) by `listener::sing::sing`.
 //!
 //! DEVIATION: the user would be carried in a private context field that
