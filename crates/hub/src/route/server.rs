@@ -33,7 +33,7 @@ use std::convert::Infallible;
 use std::io::SeekFrom;
 use std::path::{Path as StdPath, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, LazyLock};
+use std::sync::Arc;
 use std::time::SystemTime;
 
 use chrono::{DateTime, NaiveDateTime, Utc};
@@ -76,7 +76,6 @@ use super::{
     cache, configs, connections, dns, doh, external, groups, provider, proxies, restart, rules, storage, upgrade,
 };
 
-static UI_PATH: LazyLock<Mutex<String>> = LazyLock::new(|| Mutex::new(String::new()));
 static EMBED_MODE: AtomicBool = AtomicBool::new(false);
 
 pub fn set_embed_mode(embed: bool) {
@@ -110,6 +109,8 @@ pub struct Config {
     pub tls_addr: String,
     pub unix_addr: String,
     pub pipe_addr: String,
+    /// The `external-ui` root as configured; an empty value unmounts `/ui`.
+    pub ui_path: String,
     pub routing_mark: i32,
     pub secret: String,
     pub certificate: String,
@@ -187,14 +188,6 @@ pub async fn re_create_server(cfg: Arc<Config>) {
     if SUPPORT_NAMED_PIPE {
         tokio::spawn(start_pipe(cfg));
     }
-}
-
-pub fn set_ui_path(path: &str) {
-    *UI_PATH.lock() = PATH.resolve(path);
-}
-
-fn ui_path() -> String {
-    UI_PATH.lock().clone()
 }
 
 struct RunningServer {
@@ -451,6 +444,7 @@ struct RouterState {
     is_debug: bool,
     secret: String,
     doh_server: String,
+    ui_path: String,
     cors: Cors,
 }
 
@@ -463,6 +457,9 @@ impl RouterState {
             is_debug: cfg.is_debug,
             secret: cfg.secret.clone(),
             doh_server: cfg.doh_server.clone(),
+            // Resolving an empty path would mount the home directory, so the empty value that
+            // disables the mount has to survive.
+            ui_path: if cfg.ui_path.is_empty() { String::new() } else { PATH.resolve(&cfg.ui_path) },
             cors: cfg.cors.clone(),
         }
     }
@@ -477,8 +474,7 @@ async fn dispatch_inner(req: Req, cfg: &RouterState) -> Response<RespBody> {
         }
     }
 
-    let current_ui_path = ui_path();
-    if !current_ui_path.is_empty() {
+    if !cfg.ui_path.is_empty() {
         if path == "/ui" {
             return if matches!(req.method(), &Method::GET | &Method::HEAD) {
                 response_with(StatusCode::TEMPORARY_REDIRECT, &[(header::LOCATION, "/ui/")], empty_body())
@@ -487,7 +483,7 @@ async fn dispatch_inner(req: Req, cfg: &RouterState) -> Response<RespBody> {
             };
         }
         if let Some(rest) = path.strip_prefix("/ui/") {
-            return serve_ui_file(&current_ui_path, &req, rest).await;
+            return serve_ui_file(&cfg.ui_path, &req, rest).await;
         }
     }
 
@@ -1935,6 +1931,29 @@ mod tests {
         assert_eq!(status, 401, "something other than the reloaded server is listening: {body}");
         let (status, body) = controller_response(&addr, "/version", Some("reload-secret")).await;
         assert_eq!(status, 200, "the reloaded server did not answer: {body}");
+    }
+
+    /// The reload rebuilds the router from the new config; a config that no longer names
+    /// `external-ui` must unmount `/ui` instead of keeping the root the previous one named.
+    #[tokio::test]
+    async fn re_create_server_unmounts_the_ui_root_when_the_reloaded_config_clears_it() {
+        let _guard = CONTROLLER_LISTENERS.lock().await;
+        let fixture = build_ui_fixture("reload-unmount");
+        let ui_root = fixture.root.to_str().expect("fixture root is utf-8").to_owned();
+
+        let probe = tokio::net::TcpListener::bind("127.0.0.1:0").await.expect("probe a free loopback port");
+        let addr = probe.local_addr().expect("probe local address").to_string();
+        drop(probe);
+
+        re_create_server(Arc::new(Config { addr: addr.clone(), ui_path: ui_root, ..Config::default() })).await;
+        let (status, body) = controller_response(&addr, "/ui/", None).await;
+        assert_eq!(status, 200, "the configured ui root did not serve: {body}");
+        assert!(body.ends_with("ROOT_INDEX"), "unexpected /ui/ body: {body}");
+
+        re_create_server(Arc::new(Config { addr: addr.clone(), ..Config::default() })).await;
+        let (status, body) = controller_response(&addr, "/ui/", None).await;
+        assert_eq!(status, 404, "the reloaded config still serves the root it dropped: {body}");
+        assert!(body.ends_with("404 page not found\n"), "unexpected /ui/ body: {body}");
     }
 
     /// The Unix socket carries no credential of its own, so the configured secret is the only

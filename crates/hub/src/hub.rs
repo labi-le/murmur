@@ -77,14 +77,12 @@ async fn apply_route(cfg: &Config) {
         ANDROID_EMBED_INIT.call_once(crate::route::patch_android::init);
     }
 
-    if !cfg.controller.external_ui.is_empty() {
-        route_server::set_ui_path(&cfg.controller.external_ui);
-    }
     route_server::re_create_server(Arc::new(route_server::Config {
         addr: cfg.controller.external_controller.clone(),
         tls_addr: cfg.controller.external_controller_tls.clone(),
         unix_addr: cfg.controller.external_controller_unix.clone(),
         pipe_addr: cfg.controller.external_controller_pipe.clone(),
+        ui_path: cfg.controller.external_ui.clone(),
         routing_mark: cfg.controller.external_controller_routing_mark,
         secret: cfg.controller.secret.clone(),
         certificate: cfg.tls.certificate.clone(),
