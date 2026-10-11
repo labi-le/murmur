@@ -280,6 +280,11 @@ impl<T: Clone + Send + Sync + 'static> Group<T> {
     ///
     /// The call is completed by a spawned task, so the group has to be held in an `Arc`. A call
     /// retained by `store_result` answers a later caller with its stored result.
+    // The lint resolves its level from the enclosing item, so the expectation sits here.
+    #[expect(
+        clippy::significant_drop_tightening,
+        reason = "the `chans` guard spans the read of `done`, so `finish` cannot drain between the two"
+    )]
     pub fn do_chan<F, Fut>(self: &Arc<Self>, key: &str, f: F) -> oneshot::Receiver<Result<T>>
     where
         F: FnOnce() -> Fut + Send + 'static,
@@ -290,22 +295,15 @@ impl<T: Clone + Send + Sync + 'static> Group<T> {
             let mut m = self.mu.lock();
             if let Some(call) = m.get(key) {
                 call.dups.fetch_add(1, Ordering::SeqCst);
-                // `chans` is held across the read of `done`, so the drain in `CallGuard::finish`
-                // cannot miss a sender registered here.
                 let mut chans = call.chans.lock();
                 let published = call.done.borrow().clone();
-                match published {
-                    // A call retained by `store_result` was drained once already, so its stored
-                    // result answers this caller instead of a sender nobody will drain.
-                    Some(result) => {
-                        drop(chans);
-                        let _ = tx.send(Result {
-                            val: result.val.clone(),
-                            err: result.err.clone(),
-                            shared: result.shared,
-                        });
-                    }
-                    None => chans.push(tx),
+                // A call retained by `store_result` was drained once already, so its stored result
+                // answers this caller instead of a sender nobody will drain.
+                if let Some(result) = published {
+                    drop(chans);
+                    let _ = tx.send(Result { val: result.val.clone(), err: result.err.clone(), shared: result.shared });
+                } else {
+                    chans.push(tx);
                 }
                 return rx;
             }
