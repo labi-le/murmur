@@ -36,7 +36,7 @@ use murmur_transport_shadowsocks::core::cipher::{pick_cipher, Cipher};
 use murmur_transport_simple_obfs::http_server::new_http_obfs_server;
 use murmur_transport_simple_obfs::tls_server::new_tls_obfs_server;
 
-use super::udp::{new_udp, UdpListener};
+use super::udp::{bind_udp, BoundUdp, UdpListener};
 
 static LISTENER: ArcSwapOption<Listener> = ArcSwapOption::const_empty();
 
@@ -105,11 +105,13 @@ pub async fn new(
     let closed = Arc::new(AtomicBool::new(false));
     let mut listeners: Vec<Arc<dyn Acceptor>> = Vec::new();
     let mut udp_listeners: Vec<Arc<UdpListener>> = Vec::new();
+    let mut udp_servers: Vec<BoundUdp> = Vec::new();
 
     for addr in config.listen.split(',') {
         if config.udp {
-            let ul = new_udp(addr, &lc, cipher.as_ref(), &tunnel, &additions).await?;
-            udp_listeners.push(ul);
+            let bound = bind_udp(addr, &lc, cipher.as_ref(), &tunnel, &additions).await?;
+            udp_listeners.push(bound.listener());
+            udp_servers.push(bound);
         }
 
         let mut l: Box<dyn Acceptor> = lc.listen(&CancellationToken::new(), "tcp", addr).await?;
@@ -118,9 +120,15 @@ pub async fn new(
         } else if let Some(builder) = &jls_builder {
             l = builder.new_listener(l);
         }
-        let l: Arc<dyn Acceptor> = Arc::from(l);
-        listeners.push(Arc::clone(&l));
+        listeners.push(Arc::from(l));
+    }
 
+    for server in udp_servers {
+        server.serve();
+    }
+
+    for l in &listeners {
+        let l = Arc::clone(l);
         let closed_task = Arc::clone(&closed);
         let cipher_task = Arc::clone(&cipher);
         let handler_task = Arc::clone(&handler);
@@ -238,4 +246,38 @@ pub fn handle_shadow_socks(conn: Box<dyn NetStream>, tunnel: Arc<dyn Tunnel>, ad
         return true;
     }
     false
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Every address binds before any accept loop starts, so a later bind failure leaves nothing
+    /// serving on the addresses that did bind.
+    #[tokio::test]
+    async fn a_failed_second_bind_releases_the_address_that_did_bind() {
+        let taken = std::net::TcpListener::bind("127.0.0.1:0").expect("hold a port");
+        let taken_port = taken.local_addr().expect("held address").port();
+        let free = (1..taken_port)
+            .rev()
+            .find_map(|port| std::net::TcpListener::bind(("127.0.0.1", port)).ok())
+            .expect("a free port below the held one");
+        let free_port = free.local_addr().expect("free address").port();
+        drop(free);
+
+        let config = ShadowsocksServer {
+            listen: format!("127.0.0.1:{free_port},127.0.0.1:{taken_port}"),
+            cipher: "aes-128-gcm".to_owned(),
+            password: "password".to_owned(),
+            ..Default::default()
+        };
+        let lc: Arc<dyn InboundListenConfig> = Arc::new(murmur_adapter_inbound::listen::new_listen_config());
+        let tunnel: Arc<dyn Tunnel> = murmur_testsupport::HttpTestTunnel::new();
+
+        let err = new(config, lc, tunnel, Vec::new()).await.expect_err("the held port must fail the listener");
+        assert!(err.to_string().contains("Address already in use"), "the failure names the reason: {err}");
+
+        std::net::TcpListener::bind(("127.0.0.1", free_port))
+            .expect("the address that did bind must be released on the failure path");
+    }
 }

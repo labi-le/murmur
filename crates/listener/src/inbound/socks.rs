@@ -73,6 +73,8 @@ impl InboundListener for Socks {
         let lc = self.base.listen_config();
         let mut stl = Vec::new();
         let mut sul = Vec::new();
+        let mut bound_tcp = Vec::new();
+        let mut bound_udp = Vec::new();
         for addr in self.base.raw_address().split(',') {
             let config = AuthServer {
                 enable: true,
@@ -85,16 +87,33 @@ impl InboundListener for Socks {
                 ech_key: self.config.ech_key.clone(),
                 reality_config: self.config.reality_config.clone(),
             };
-            let l =
-                socks_tcp::new_with_config(config.clone(), Arc::clone(&lc), Arc::clone(&tunnel), self.base.additions())
-                    .await?;
-            stl.push(l);
+            let tcp = socks_tcp::bind_with_config(
+                config.clone(),
+                Arc::clone(&lc),
+                Arc::clone(&tunnel),
+                self.base.additions(),
+            )
+            .await?;
+            stl.push(tcp.listener());
+            bound_tcp.push(tcp);
             if self.udp {
-                let l_udp =
-                    socks_udp::new_udp_with_config(config, Arc::clone(&lc), Arc::clone(&tunnel), self.base.additions())
-                        .await?;
-                sul.push(l_udp);
+                let udp = socks_udp::bind_udp_with_config(
+                    config,
+                    Arc::clone(&lc),
+                    Arc::clone(&tunnel),
+                    self.base.additions(),
+                )
+                .await?;
+                sul.push(udp.listener());
+                bound_udp.push(udp);
             }
+        }
+
+        for listener in bound_tcp {
+            listener.serve();
+        }
+        for listener in bound_udp {
+            listener.serve();
         }
         *self.stl.lock() = stl;
         *self.sul.lock() = sul;
@@ -207,5 +226,37 @@ mod tests {
         let _ = out.close();
         inbound.close().expect("socks inbound close");
         tunnel.close();
+    }
+
+    /// The addresses that did bind are only reachable through the value the caller drops when
+    /// `listen` fails, so a later bind failure has to release them here.
+    #[tokio::test]
+    async fn a_failed_second_bind_releases_the_address_that_did_bind() {
+        let taken = std::net::TcpListener::bind("127.0.0.1:0").expect("hold a port");
+        let taken_port = taken.local_addr().expect("held address").port();
+        let free = (1..taken_port)
+            .rev()
+            .find_map(|port| std::net::TcpListener::bind(("127.0.0.1", port)).ok())
+            .expect("a free port below the held one");
+        let free_port = free.local_addr().expect("free address").port();
+        drop(free);
+
+        let inbound = Socks::new(Arc::new(SocksOption {
+            base: BaseOption {
+                name_str: "socks_inbound".to_owned(),
+                listen: "127.0.0.1".to_owned(),
+                port: format!("{free_port},{taken_port}"),
+                ..Default::default()
+            },
+            udp: true,
+            ..Default::default()
+        }))
+        .expect("socks inbound construction");
+
+        let err = inbound.listen(HttpTestTunnel::new()).await.expect_err("the held port must fail the listener");
+        assert!(err.to_string().contains("Address already in use"), "the failure names the reason: {err}");
+
+        std::net::TcpListener::bind(("127.0.0.1", free_port))
+            .expect("the address that did bind must be released on the failure path");
     }
 }

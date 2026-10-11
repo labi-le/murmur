@@ -73,6 +73,8 @@ impl InboundListener for Mixed {
         let lc = self.base.listen_config();
         let mut listeners = Vec::new();
         let mut udp_listeners = Vec::new();
+        let mut bound_tcp = Vec::new();
+        let mut bound_udp = Vec::new();
         for addr in self.base.raw_address().split(',') {
             let config = AuthServer {
                 enable: true,
@@ -85,20 +87,33 @@ impl InboundListener for Mixed {
                 ech_key: self.config.ech_key.clone(),
                 reality_config: self.config.reality_config.clone(),
             };
-            let l = mixed_server::new_with_config(
+            let tcp = mixed_server::bind_with_config(
                 config.clone(),
                 Arc::clone(&lc),
                 Arc::clone(&tunnel),
                 self.base.additions(),
             )
             .await?;
-            listeners.push(l);
+            listeners.push(tcp.listener());
+            bound_tcp.push(tcp);
             if self.udp {
-                let l_udp =
-                    socks_udp::new_udp_with_config(config, Arc::clone(&lc), Arc::clone(&tunnel), self.base.additions())
-                        .await?;
-                udp_listeners.push(l_udp);
+                let udp = socks_udp::bind_udp_with_config(
+                    config,
+                    Arc::clone(&lc),
+                    Arc::clone(&tunnel),
+                    self.base.additions(),
+                )
+                .await?;
+                udp_listeners.push(udp.listener());
+                bound_udp.push(udp);
             }
+        }
+
+        for listener in bound_tcp {
+            listener.serve();
+        }
+        for listener in bound_udp {
+            listener.serve();
         }
         *self.l.lock() = listeners;
         *self.l_udp.lock() = udp_listeners;
@@ -196,5 +211,36 @@ mod tests {
         let _ = out.close();
         inbound.close().expect("mixed inbound close");
         tunnel.close();
+    }
+
+    /// The addresses that did bind are only reachable through the value the caller drops when
+    /// `listen` fails, so a later bind failure has to release them here.
+    #[tokio::test]
+    async fn a_failed_second_bind_releases_the_address_that_did_bind() {
+        let taken = std::net::TcpListener::bind("127.0.0.1:0").expect("hold a port");
+        let taken_port = taken.local_addr().expect("held address").port();
+        let free = (1..taken_port)
+            .rev()
+            .find_map(|port| std::net::TcpListener::bind(("127.0.0.1", port)).ok())
+            .expect("a free port below the held one");
+        let free_port = free.local_addr().expect("free address").port();
+        drop(free);
+
+        let inbound = Mixed::new(Arc::new(MixedOption {
+            base: BaseOption {
+                name_str: "mixed_inbound".to_owned(),
+                listen: "127.0.0.1".to_owned(),
+                port: format!("{free_port},{taken_port}"),
+                ..Default::default()
+            },
+            ..Default::default()
+        }))
+        .expect("mixed inbound construction");
+
+        let err = inbound.listen(HttpTestTunnel::new()).await.expect_err("the held port must fail the listener");
+        assert!(err.to_string().contains("Address already in use"), "the failure names the reason: {err}");
+
+        std::net::TcpListener::bind(("127.0.0.1", free_port))
+            .expect("the address that did bind must be released on the failure path");
     }
 }

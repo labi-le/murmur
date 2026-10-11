@@ -261,9 +261,11 @@ async fn bind_servers(
         // S11: remove with murmur-std-compat, once transport_tuic::server::new_server takes Arc<dyn Datagram>
         let ul: Arc<dyn PacketConn> = Arc::new(DatagramAsOldPacketConn(SharedDatagram(datagram)));
         let server = Arc::new(tuic_server::new_server(Arc::clone(option), ul)?);
-        servers.push(Arc::clone(&server));
+        servers.push(server);
+    }
 
-        let server_task = Arc::clone(&server);
+    for server in &servers {
+        let server_task = Arc::clone(server);
         let closed_task = Arc::clone(closed);
         tokio::spawn(async move { if server_task.serve().await.is_err() && closed_task.load(Ordering::SeqCst) {} });
     }

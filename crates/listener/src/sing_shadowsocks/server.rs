@@ -166,6 +166,13 @@ impl Datagram for ArcDatagram {
     }
 }
 
+/// The datagram half of a bound address, held until every address has bound: the kcptun server
+/// that wraps the socket, or this crate's own cipher read loop over it.
+enum UdpServe {
+    Kcptun { server: Arc<KcptunServer>, pc: Box<dyn NetPacketConn> },
+    Cipher { conn: Arc<dyn EnhancePacketConn> },
+}
+
 #[expect(
     clippy::too_many_lines,
     reason = "one linear constructor: it wires the cipher, the obfuscation and security builders, then spawns a TCP accept loop and a UDP read loop per listen address"
@@ -254,6 +261,7 @@ pub async fn new(
     let closed = Arc::new(AtomicBool::new(false));
     let mut listeners: Vec<Arc<dyn Acceptor>> = Vec::new();
     let mut udp_listeners: Vec<Arc<dyn Datagram>> = Vec::new();
+    let mut udp_serves: Vec<UdpServe> = Vec::new();
 
     for addr in config.listen.split(',') {
         if udp_enabled {
@@ -268,25 +276,9 @@ pub async fn new(
             udp_listeners.push(Arc::clone(&dg));
 
             if let Some(kcptun_server) = &kcptun_server {
-                let kcptun_server = Arc::clone(kcptun_server);
-                let cipher_task = Arc::clone(&cipher);
-                let handler_task = Arc::clone(&handler);
-                let additions_task = additions.clone();
                 // S11: remove with murmur-std-compat, once transport_kcptun::server::Server::serve takes Box<dyn Datagram>
                 let pc: Box<dyn NetPacketConn> = Box::new(DatagramAsOldPacketConn(ArcDatagram(Arc::clone(&dg))));
-                tokio::spawn(async move {
-                    let handler_fn: KcptunHandlerFn = Arc::new(move |c: Box<dyn NetConn>| {
-                        let cipher = Arc::clone(&cipher_task);
-                        let handler = Arc::clone(&handler_task);
-                        let additions = additions_task.clone();
-                        tokio::spawn(async move {
-                            // S11: remove with murmur-std-compat, once transport_kcptun::server::HandlerFn carries Box<dyn Stream>
-                            let c: Box<dyn Stream> = Box::new(OldConnAsStream(c));
-                            handle_conn(&cipher, simple_obfs, &handler, c, &additions).await;
-                        });
-                    });
-                    let _ = kcptun_server.serve(pc, handler_fn).await;
-                });
+                udp_serves.push(UdpServe::Kcptun { server: Arc::clone(kcptun_server), pc });
 
                 continue;
             }
@@ -295,38 +287,7 @@ pub async fn new(
             let conn = cipher.packet_conn(new_enhance_packet_conn(Arc::new(DatagramAsOldPacketConn(ArcDatagram(
                 Arc::clone(&dg),
             )))))?;
-            let closed_task = Arc::clone(&closed);
-            let tunnel_task = Arc::clone(&tunnel);
-            let additions_task = additions.clone();
-            tokio::spawn(async move {
-                loop {
-                    let (data, put, remote_addr, result) = conn.wait_read_from().await;
-                    if result.is_err() {
-                        if let Some(put) = put {
-                            put();
-                        }
-                        if closed_task.load(Ordering::SeqCst) {
-                            break;
-                        }
-                        continue;
-                    }
-                    let Some(remote_addr) = remote_addr else {
-                        if let Some(put) = put {
-                            put();
-                        }
-                        continue;
-                    };
-                    let Ok(remote_addr) = murmur_common_net::io::old_addr_to_socket_addr(remote_addr.as_ref()) else {
-                        if let Some(put) = put {
-                            put();
-                        }
-                        continue;
-                    };
-                    let conn_arc = Arc::clone(&conn);
-                    let conn_dyn: Arc<dyn NetPacketConn> = conn_arc;
-                    handle_socks_udp(conn_dyn, &tunnel_task, &data, put, remote_addr, &additions_task);
-                }
-            });
+            udp_serves.push(UdpServe::Cipher { conn });
         }
 
         let l: Box<dyn Acceptor> = lc.listen(&CancellationToken::new(), "tcp", addr).await?;
@@ -337,9 +298,15 @@ pub async fn new(
         } else {
             l
         };
-        let l: Arc<dyn Acceptor> = Arc::from(l);
-        listeners.push(Arc::clone(&l));
+        listeners.push(Arc::from(l));
+    }
 
+    for serve in udp_serves {
+        serve_udp(serve, &cipher, &handler, &additions, &closed, &tunnel, simple_obfs);
+    }
+
+    for l in &listeners {
+        let l = Arc::clone(l);
         let closed_task = Arc::clone(&closed);
         let cipher_task = Arc::clone(&cipher);
         let handler_task = Arc::clone(&handler);
@@ -376,6 +343,88 @@ pub async fn new(
     }
 
     Ok(listener)
+}
+
+/// Starts one bound datagram socket's serving half.
+fn serve_udp(
+    serve: UdpServe,
+    cipher: &Arc<ServerCipher>,
+    handler: &Arc<ListenerHandler>,
+    additions: &[Addition],
+    closed: &Arc<AtomicBool>,
+    tunnel: &Arc<dyn Tunnel>,
+    simple_obfs: Option<fn(Box<dyn NetConn>) -> Box<dyn NetConn>>,
+) {
+    match serve {
+        UdpServe::Kcptun { server, pc } => {
+            serve_kcptun(server, pc, Arc::clone(cipher), Arc::clone(handler), additions.to_vec(), simple_obfs);
+        }
+        UdpServe::Cipher { conn } => {
+            serve_cipher_udp(conn, Arc::clone(closed), Arc::clone(tunnel), additions.to_vec());
+        }
+    }
+}
+
+/// Runs the kcptun server over one bound datagram socket.
+fn serve_kcptun(
+    server: Arc<KcptunServer>,
+    pc: Box<dyn NetPacketConn>,
+    cipher: Arc<ServerCipher>,
+    handler: Arc<ListenerHandler>,
+    additions: Vec<Addition>,
+    simple_obfs: Option<fn(Box<dyn NetConn>) -> Box<dyn NetConn>>,
+) {
+    tokio::spawn(async move {
+        let handler_fn: KcptunHandlerFn = Arc::new(move |c: Box<dyn NetConn>| {
+            let cipher = Arc::clone(&cipher);
+            let handler = Arc::clone(&handler);
+            let additions = additions.clone();
+            tokio::spawn(async move {
+                // S11: remove with murmur-std-compat, once transport_kcptun::server::HandlerFn carries Box<dyn Stream>
+                let c: Box<dyn Stream> = Box::new(OldConnAsStream(c));
+                handle_conn(&cipher, simple_obfs, &handler, c, &additions).await;
+            });
+        });
+        let _ = server.serve(pc, handler_fn).await;
+    });
+}
+
+/// Reads datagrams through this crate's own cipher on one bound socket.
+fn serve_cipher_udp(
+    conn: Arc<dyn EnhancePacketConn>,
+    closed: Arc<AtomicBool>,
+    tunnel: Arc<dyn Tunnel>,
+    additions: Vec<Addition>,
+) {
+    tokio::spawn(async move {
+        loop {
+            let (data, put, remote_addr, result) = conn.wait_read_from().await;
+            if result.is_err() {
+                if let Some(put) = put {
+                    put();
+                }
+                if closed.load(Ordering::SeqCst) {
+                    break;
+                }
+                continue;
+            }
+            let Some(remote_addr) = remote_addr else {
+                if let Some(put) = put {
+                    put();
+                }
+                continue;
+            };
+            let Ok(remote_addr) = murmur_common_net::io::old_addr_to_socket_addr(remote_addr.as_ref()) else {
+                if let Some(put) = put {
+                    put();
+                }
+                continue;
+            };
+            let conn_arc = Arc::clone(&conn);
+            let conn_dyn: Arc<dyn NetPacketConn> = conn_arc;
+            handle_socks_udp(conn_dyn, &tunnel, &data, put, remote_addr, &additions);
+        }
+    });
 }
 
 impl MultiAddrListener for Listener {

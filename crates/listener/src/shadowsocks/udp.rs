@@ -7,6 +7,7 @@ use tokio_util::sync::CancellationToken;
 use murmur_adapter_inbound::addition::Addition;
 use murmur_adapter_inbound::packet::new_packet;
 use murmur_common::sockopt::reuse_common::udp_reuseaddr;
+use murmur_common_net::packet::packet::EnhancePacketConn;
 use murmur_common_net::packet_file::new_enhance_packet_conn;
 use murmur_constant::listener::InboundListenConfig;
 use murmur_constant::metadata::Type;
@@ -34,13 +35,60 @@ impl UdpListener {
     }
 }
 
-pub(crate) async fn new_udp(
+/// A datagram socket bound and wrapped, with its read loop not yet running: the caller binds
+/// every address of the listener before it starts serving any of them.
+pub(crate) struct BoundUdp {
+    listener: Arc<UdpListener>,
+    conn: Arc<dyn EnhancePacketConn>,
+    tunnel: Arc<dyn Tunnel>,
+    additions: Vec<Addition>,
+}
+
+impl BoundUdp {
+    #[must_use]
+    pub(crate) fn listener(&self) -> Arc<UdpListener> {
+        Arc::clone(&self.listener)
+    }
+
+    pub(crate) fn serve(self) {
+        let Self { listener, conn, tunnel, additions } = self;
+        tokio::spawn(async move {
+            loop {
+                let (data, put, remote_addr, result) = conn.wait_read_from().await;
+                if result.is_err() {
+                    if let Some(put) = put {
+                        put();
+                    }
+                    if listener.closed.load(Ordering::SeqCst) {
+                        break;
+                    }
+                    continue;
+                }
+                let Some(remote_addr) = remote_addr else {
+                    if let Some(put) = put {
+                        put();
+                    }
+                    continue;
+                };
+                let Ok(remote_addr) = murmur_common_net::io::old_addr_to_socket_addr(remote_addr.as_ref()) else {
+                    if let Some(put) = put {
+                        put();
+                    }
+                    continue;
+                };
+                handle_socks_udp(Arc::clone(&conn).into_packet_conn(), &tunnel, &data, put, remote_addr, &additions);
+            }
+        });
+    }
+}
+
+pub(crate) async fn bind_udp(
     addr: &str,
     lc: &Arc<dyn InboundListenConfig>,
     pick_cipher: &dyn Cipher,
     tunnel: &Arc<dyn Tunnel>,
     additions: &[Addition],
-) -> Result<Arc<UdpListener>> {
+) -> Result<BoundUdp> {
     let l: Box<dyn murmur_std_compat::net::PacketConn> = Box::new(murmur_common_net::io::DatagramAsOldPacketConn(
         lc.listen_packet(&CancellationToken::new(), "udp", addr).await?,
     ));
@@ -50,41 +98,11 @@ pub(crate) async fn new_udp(
     }
 
     let l: Arc<dyn NetPacketConn> = Arc::from(l);
-    let sl = Arc::new(UdpListener { packet_conn: Arc::clone(&l), closed: AtomicBool::new(false) });
+    let listener = Arc::new(UdpListener { packet_conn: Arc::clone(&l), closed: AtomicBool::new(false) });
 
     let conn = pick_cipher.packet_conn(new_enhance_packet_conn(l))?;
-    let tunnel = Arc::clone(tunnel);
-    let additions = additions.to_vec();
-    let sl_task = Arc::clone(&sl);
-    tokio::spawn(async move {
-        loop {
-            let (data, put, remote_addr, result) = conn.wait_read_from().await;
-            if result.is_err() {
-                if let Some(put) = put {
-                    put();
-                }
-                if sl_task.closed.load(Ordering::SeqCst) {
-                    break;
-                }
-                continue;
-            }
-            let Some(remote_addr) = remote_addr else {
-                if let Some(put) = put {
-                    put();
-                }
-                continue;
-            };
-            let Ok(remote_addr) = murmur_common_net::io::old_addr_to_socket_addr(remote_addr.as_ref()) else {
-                if let Some(put) = put {
-                    put();
-                }
-                continue;
-            };
-            handle_socks_udp(Arc::clone(&conn).into_packet_conn(), &tunnel, &data, put, remote_addr, &additions);
-        }
-    });
 
-    Ok(sl)
+    Ok(BoundUdp { listener, conn, tunnel: Arc::clone(tunnel), additions: additions.to_vec() })
 }
 
 fn handle_socks_udp(

@@ -57,7 +57,54 @@ impl murmur_constant::listener::Listener for Listener {
     }
 }
 
-pub async fn new(addr: &str, tunnel: Arc<dyn Tunnel>, additions: &[Addition]) -> Result<Listener> {
+/// A bound socket whose accept loop has not started, so a multi-address listener can bind
+/// every address before any of them serves.
+pub struct BoundListener {
+    listener: Listener,
+    tunnel: Arc<dyn Tunnel>,
+    additions: Vec<Addition>,
+}
+
+impl core::fmt::Debug for BoundListener {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        f.debug_struct("BoundListener").field("listener", &self.listener).finish_non_exhaustive()
+    }
+}
+
+impl BoundListener {
+    #[must_use]
+    pub fn serve(self) -> Listener {
+        let Self { listener: rl, tunnel, additions } = self;
+        let socket = Arc::clone(&rl.socket);
+        let closed = Arc::clone(&rl.closed);
+        let close_signal = Arc::clone(&rl.close_signal);
+
+        // cancel-safe: the task owns only the listener handle it was given, so a drop stops accepting and loses nothing.
+        tokio::spawn(async move {
+            loop {
+                tokio::select! {
+                    () = close_signal.wait() => break,
+                    result = socket.accept() => {
+                        match result {
+                            Ok((conn, _)) => {
+                                tokio::spawn(handle_redir(conn, Arc::clone(&tunnel), additions.clone()));
+                            }
+                            Err(_) => {
+                                if closed.load(Ordering::SeqCst) {
+                                    break;
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        });
+
+        rl
+    }
+}
+
+pub async fn bind(addr: &str, tunnel: Arc<dyn Tunnel>, additions: &[Addition]) -> Result<BoundListener> {
     let additions: Vec<Addition> = if additions.is_empty() {
         vec![inbound::addition::with_in_name("DEFAULT-REDIR"), inbound::addition::with_special_rules("")]
     } else {
@@ -75,28 +122,11 @@ pub async fn new(addr: &str, tunnel: Arc<dyn Tunnel>, additions: &[Addition]) ->
         close_signal: Arc::clone(&close_signal),
     };
 
-    // cancel-safe: the task owns only the listener handle it was given, so a drop stops accepting and loses nothing.
-    tokio::spawn(async move {
-        loop {
-            tokio::select! {
-                () = close_signal.wait() => break,
-                result = socket.accept() => {
-                    match result {
-                        Ok((conn, _)) => {
-                            tokio::spawn(handle_redir(conn, Arc::clone(&tunnel), additions.clone()));
-                        }
-                        Err(_) => {
-                            if closed.load(Ordering::SeqCst) {
-                                break;
-                            }
-                        }
-                    }
-                }
-            }
-        }
-    });
+    Ok(BoundListener { listener: rl, tunnel, additions })
+}
 
-    Ok(rl)
+pub async fn new(addr: &str, tunnel: Arc<dyn Tunnel>, additions: &[Addition]) -> Result<Listener> {
+    Ok(bind(addr, tunnel, additions).await?.serve())
 }
 
 async fn handle_redir(conn: TcpStream, tunnel: Arc<dyn Tunnel>, additions: Vec<Addition>) {

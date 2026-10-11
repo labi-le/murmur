@@ -55,11 +55,12 @@ impl InboundListener for Redir {
     }
 
     async fn listen(&self, tunnel: Arc<dyn Tunnel>) -> Result<()> {
-        let mut listeners = Vec::new();
+        let mut bound = Vec::new();
         for addr in self.base.raw_address().split(',') {
-            let l = redir_tcp::new(addr, Arc::clone(&tunnel), &self.base.additions()).await?;
-            listeners.push(l);
+            bound.push(redir_tcp::bind(addr, Arc::clone(&tunnel), &self.base.additions()).await?);
         }
+
+        let listeners = bound.into_iter().map(redir_tcp::BoundListener::serve).collect();
         *self.l.lock() = listeners;
         infoln!("Redir[{}] proxy listening at: {}", self.name(), self.address());
         Ok(())

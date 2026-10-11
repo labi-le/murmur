@@ -85,6 +85,65 @@ pub async fn new_with_config(
     tunnel: Arc<dyn Tunnel>,
     additions: Vec<Addition>,
 ) -> Result<Arc<Listener>> {
+    let bound = bind_with_config(config, lc, tunnel, additions).await?;
+    let listener = bound.listener();
+    bound.serve();
+    Ok(listener)
+}
+
+/// A bound but not yet serving listener, so the caller can bind every address before any serves.
+pub(crate) struct BoundListener {
+    listener: Arc<Listener>,
+    tunnel: Arc<dyn Tunnel>,
+    auth_store: Arc<dyn AuthStore>,
+    additions: Vec<Addition>,
+    reality_server_config: Option<Arc<murmur_reality::RealityServerConfig>>,
+    is_default: bool,
+}
+
+impl BoundListener {
+    pub(crate) fn listener(&self) -> Arc<Listener> {
+        Arc::clone(&self.listener)
+    }
+
+    pub(crate) fn serve(self) {
+        let Self { listener, tunnel, auth_store, additions, reality_server_config, is_default } = self;
+        tokio::spawn(async move {
+            loop {
+                let Ok(conn) = listener.acceptor.accept().await else {
+                    if listener.closed.load(Ordering::SeqCst) {
+                        break;
+                    }
+                    continue;
+                };
+                let mut store = Arc::<dyn AuthStore>::clone(&auth_store);
+                let is_default = is_default;
+                let tunnel = Arc::clone(&tunnel);
+                let additions = additions.clone();
+                crate::reality::spawn_conn(conn, reality_server_config.clone(), move |conn| async move {
+                    if is_default || Arc::ptr_eq(&store, &DEFAULT) {
+                        let remote_addr = conn.peer_addr().ok().map(boxed_tcp_addr);
+                        if !is_remote_addr_dis_allowed(remote_addr.as_deref()) {
+                            let _ = murmur_common_net::io::close_stream(conn.as_ref());
+                            return;
+                        }
+                        if skip_auth_remote_addr(remote_addr.as_deref()) {
+                            store = crate::auth::auth::NIL.clone();
+                        }
+                    }
+                    handle_socks(conn, &tunnel, store, &additions).await;
+                });
+            }
+        });
+    }
+}
+
+pub(crate) async fn bind_with_config(
+    config: AuthServer,
+    lc: Arc<dyn InboundListenConfig>,
+    tunnel: Arc<dyn Tunnel>,
+    additions: Vec<Addition>,
+) -> Result<BoundListener> {
     let is_default = additions.is_empty();
     let additions = if is_default { vec![with_in_name("DEFAULT-SOCKS"), with_special_rules("")] } else { additions };
 
@@ -127,42 +186,16 @@ pub async fn new_with_config(
         l = tls_new_listener(Arc::from(l), Arc::new(tls_config));
     }
 
-    let sl = Arc::new(Listener { acceptor: l, addr: config.listen.clone(), closed: AtomicBool::new(false) });
+    let listener = Arc::new(Listener { acceptor: l, addr: config.listen.clone(), closed: AtomicBool::new(false) });
 
-    {
-        let sl = Arc::clone(&sl);
-        let tunnel = Arc::clone(&tunnel);
-        let auth_store = Arc::<dyn AuthStore>::clone(&config.auth_store);
-        tokio::spawn(async move {
-            loop {
-                let Ok(conn) = sl.acceptor.accept().await else {
-                    if sl.closed.load(Ordering::SeqCst) {
-                        break;
-                    }
-                    continue;
-                };
-                let mut store = Arc::<dyn AuthStore>::clone(&auth_store);
-                let is_default = is_default;
-                let tunnel = Arc::clone(&tunnel);
-                let additions = additions.clone();
-                crate::reality::spawn_conn(conn, reality_server_config.clone(), move |conn| async move {
-                    if is_default || Arc::ptr_eq(&store, &DEFAULT) {
-                        let remote_addr = conn.peer_addr().ok().map(boxed_tcp_addr);
-                        if !is_remote_addr_dis_allowed(remote_addr.as_deref()) {
-                            let _ = murmur_common_net::io::close_stream(conn.as_ref());
-                            return;
-                        }
-                        if skip_auth_remote_addr(remote_addr.as_deref()) {
-                            store = crate::auth::auth::NIL.clone();
-                        }
-                    }
-                    handle_socks(conn, &tunnel, store, &additions).await;
-                });
-            }
-        });
-    }
-
-    Ok(sl)
+    Ok(BoundListener {
+        listener,
+        tunnel,
+        auth_store: Arc::<dyn AuthStore>::clone(&config.auth_store),
+        additions,
+        reality_server_config,
+        is_default,
+    })
 }
 
 pub(crate) async fn handle_socks(

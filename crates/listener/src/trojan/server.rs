@@ -315,7 +315,10 @@ pub async fn new(
         }
         let l: Arc<dyn Acceptor> = Arc::from(l);
         sl.listeners.lock().push(Arc::clone(&l));
+    }
 
+    let bound: Vec<Arc<dyn Acceptor>> = sl.listeners.lock().iter().map(Arc::clone).collect();
+    for l in bound {
         let sl = Arc::clone(&sl);
         let tunnel = Arc::clone(&tunnel);
         let additions = additions.clone();
