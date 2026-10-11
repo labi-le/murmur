@@ -212,7 +212,8 @@ pub(crate) fn read_client_hello(data: &[u8]) -> Result<String, ClientHelloError>
                 if name_type == 0 {
                     let raw = data.get(offset..host_end).ok_or_else(|| ClientHelloError::NeedMoreData(host_end))?;
                     let server_name = String::from_utf8_lossy(raw).into_owned();
-                    if server_name.ends_with('.') {
+                    // RFC 6066 §3's `HostName` is a host name: a zero-length entry names nothing.
+                    if server_name.is_empty() || server_name.ends_with('.') {
                         return Err(ClientHelloError::NotClientHello);
                     }
                     return Ok(server_name);
@@ -313,26 +314,21 @@ mod tests {
     mod encoding {
         use byteorder::{BigEndian, ByteOrder};
 
-        pub(super) fn make_test_client_hello(host: &str, padding_len: usize) -> Vec<u8> {
-            let mut extensions = Vec::new();
-            if !host.is_empty() {
-                let server_name = host.as_bytes();
-                let server_name_list_len = 1 + 2 + server_name.len();
-                let extension_data_len = 2 + server_name_list_len;
-                extensions = vec![0u8; 4 + extension_data_len];
-                BigEndian::write_u16(&mut extensions[2..4], extension_data_len as u16);
-                BigEndian::write_u16(&mut extensions[4..6], server_name_list_len as u16);
-                BigEndian::write_u16(&mut extensions[7..9], server_name.len() as u16);
-                extensions[9..].copy_from_slice(server_name);
-            }
-            if padding_len > 0 {
-                let mut padding = vec![0u8; 4 + padding_len];
-                BigEndian::write_u16(&mut padding[0..2], 0x15);
-                BigEndian::write_u16(&mut padding[2..4], padding_len as u16);
-                extensions.extend_from_slice(&padding);
-            }
+        /// The SNI extension: one `host_name` entry declaring `declared_len` bytes for `name`.
+        pub(super) fn make_sni_extension(name: &[u8], declared_len: u16) -> Vec<u8> {
+            let server_name_list_len = 1 + 2 + name.len();
+            let extension_data_len = 2 + server_name_list_len;
+            let mut extension = vec![0u8; 4 + extension_data_len];
+            BigEndian::write_u16(&mut extension[2..4], extension_data_len as u16);
+            BigEndian::write_u16(&mut extension[4..6], server_name_list_len as u16);
+            BigEndian::write_u16(&mut extension[7..9], declared_len);
+            extension[9..].copy_from_slice(name);
+            extension
+        }
 
-            let mut body = Vec::with_capacity(64 + host.len());
+        /// Wraps `extensions` in the handshake body and its four-byte handshake header.
+        pub(super) fn wrap_client_hello(extensions: &[u8]) -> Vec<u8> {
+            let mut body = Vec::with_capacity(64 + extensions.len());
             body.extend_from_slice(&[0x03, 0x03]);
             body.extend_from_slice(&[0u8; 32]);
             body.push(0);
@@ -341,7 +337,7 @@ mod tests {
             let mut ext_len = [0u8; 2];
             BigEndian::write_u16(&mut ext_len, extensions.len() as u16);
             body.extend_from_slice(&ext_len);
-            body.extend_from_slice(&extensions);
+            body.extend_from_slice(extensions);
 
             let mut hello = vec![
                 super::TLS_HANDSHAKE_TYPE_CLIENT_HELLO,
@@ -351,6 +347,21 @@ mod tests {
             ];
             hello.extend_from_slice(&body);
             hello
+        }
+
+        pub(super) fn make_test_client_hello(host: &str, padding_len: usize) -> Vec<u8> {
+            let mut extensions = Vec::new();
+            if !host.is_empty() {
+                extensions.extend_from_slice(&make_sni_extension(host.as_bytes(), host.len() as u16));
+            }
+            if padding_len > 0 {
+                let mut padding = vec![0u8; 4 + padding_len];
+                BigEndian::write_u16(&mut padding[0..2], 0x15);
+                BigEndian::write_u16(&mut padding[2..4], padding_len as u16);
+                extensions.extend_from_slice(&padding);
+            }
+
+            wrap_client_hello(&extensions)
         }
 
         pub(super) struct TlsRecordBuilder;
@@ -381,6 +392,10 @@ mod tests {
 
     fn make_test_tls_records(handshake: &[u8], cuts: &[usize]) -> Vec<u8> {
         encoding::TlsRecordBuilder::make_test_tls_records(handshake, cuts)
+    }
+
+    fn make_empty_server_name_client_hello() -> Vec<u8> {
+        encoding::wrap_client_hello(&encoding::make_sni_extension(b"", 0))
     }
 
     #[test]
@@ -641,5 +656,21 @@ mod tests {
         let err = sniff_tls(&input).unwrap_err();
         assert!(err.is::<ErrNotTLS>());
         assert!(err.downcast_ref::<ErrNeedAtLeastData>().is_none());
+    }
+
+    /// RFC 6066 §3's `HostName` is a host name, so a zero-length entry names nothing (#47).
+    #[test]
+    fn rejects_a_zero_length_server_name() {
+        let input = make_test_tls_records(&make_empty_server_name_client_hello(), &[]);
+
+        let err = sniff_tls(&input).unwrap_err();
+        assert!(err.is::<ErrNotClientHello>(), "expected a malformed client hello, got {err}");
+    }
+
+    #[test]
+    fn accepts_a_one_byte_server_name_in_the_same_extension_shape() {
+        let input = make_test_tls_records(&encoding::wrap_client_hello(&encoding::make_sni_extension(b"a", 1)), &[]);
+
+        assert_eq!(sniff_tls(&input).expect("client hello parses"), "a");
     }
 }
