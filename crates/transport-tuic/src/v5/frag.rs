@@ -6,7 +6,7 @@ use parking_lot::Mutex;
 use crate::quic::Conn as QuicConn;
 use murmur_common::lru::{self, LruCache};
 
-use super::protocol::{Packet, ATYP_NONE, PACKET_OVER_HEAD};
+use super::protocol::{Address, Packet, ATYP_NONE, PACKET_OVER_HEAD};
 
 /// A safe UDP relay packet size.
 ///
@@ -35,21 +35,22 @@ pub(crate) async fn frag_write_native(
         if payload_size > frag_size {
             payload_size = frag_size;
         }
-        let mut frag = packet.clone();
-        frag.frag_id = frag_id;
+        packet.frag_id = frag_id;
         #[expect(
             clippy::cast_possible_truncation,
             reason = "the fragment payload is capped at `frag_size`, a datagram payload bound that fits the 16-bit wire field"
         )]
         let frag_len = payload_size as u16;
-        frag.size = frag_len;
-        frag.data = full_payload.slice(off..off + payload_size);
+        packet.size = frag_len;
+        packet.data = full_payload.slice(off..off + payload_size);
         off += payload_size;
         frag_id += 1;
         buf.clear();
-        frag.write_to(buf);
+        packet.write_to(buf);
         quic_conn.send_datagram(&buf[..])?;
-        packet.addr.type_ = ATYP_NONE; // avoid "fragment 2/2: address in non-first fragment"
+        // The address is sent once: `Address::write_to` returns before reading `addr` for
+        // `ATYP_NONE`, so it is dropped here rather than deep-copied for every later fragment.
+        packet.addr = Address { type_: ATYP_NONE, addr: Vec::new(), port: 0 };
     }
     Ok(())
 }
@@ -204,5 +205,112 @@ mod tests {
         assert!(defragger.feed(packet(5, 4, 0, b"ab")).is_none());
         assert_eq!(held_fragments(&defragger, 5), 1);
         assert!(defragger.feed(packet(5, 2, 1, b"cd")).is_none());
+    }
+
+    #[derive(Default)]
+    struct RecordingConn(Mutex<Vec<Vec<u8>>>);
+
+    #[async_trait::async_trait]
+    impl QuicConn for RecordingConn {
+        fn local_addr(&self) -> Box<dyn murmur_std_compat::net::Addr> {
+            unimplemented!("the fragment writer never reads the local address")
+        }
+
+        fn remote_addr(&self) -> Box<dyn murmur_std_compat::net::Addr> {
+            unimplemented!("the fragment writer never reads the remote address")
+        }
+
+        fn close_with_error(&self, _code: u64, _reason: &str) -> anyhow::Result<()> {
+            anyhow::bail!("the fragment writer never closes the connection")
+        }
+
+        fn config(&self) -> murmur_quic::Config {
+            unimplemented!("the fragment writer never reads the config")
+        }
+
+        fn connection_stats(&self) -> murmur_quic::ConnectionStats {
+            unimplemented!("the fragment writer never reads the stats")
+        }
+
+        fn connection_state(&self) -> murmur_quic::ConnectionState {
+            unimplemented!("the fragment writer never reads the connection state")
+        }
+
+        fn context(&self) -> tokio_util::sync::CancellationToken {
+            unimplemented!("the fragment writer never reads the context")
+        }
+
+        async fn handshake_complete(&self) {}
+
+        fn export_keying_material(&self, _label: &[u8], _context: &[u8], _length: usize) -> anyhow::Result<Vec<u8>> {
+            anyhow::bail!("the fragment writer never exports keying material")
+        }
+
+        async fn open_stream(
+            &self,
+            _ctx: &tokio_util::sync::CancellationToken,
+        ) -> anyhow::Result<Box<dyn murmur_quic::Stream>> {
+            anyhow::bail!("the fragment writer never opens a stream")
+        }
+
+        async fn open_uni_stream(
+            &self,
+            _ctx: &tokio_util::sync::CancellationToken,
+        ) -> anyhow::Result<Box<dyn murmur_quic::SendStream>> {
+            anyhow::bail!("the fragment writer never opens a uni stream")
+        }
+
+        async fn accept_stream(
+            &self,
+            _ctx: &tokio_util::sync::CancellationToken,
+        ) -> anyhow::Result<Box<dyn murmur_quic::Stream>> {
+            anyhow::bail!("the fragment writer never accepts a stream")
+        }
+
+        async fn accept_uni_stream(
+            &self,
+            _ctx: &tokio_util::sync::CancellationToken,
+        ) -> anyhow::Result<Box<dyn murmur_quic::ReceiveStream>> {
+            anyhow::bail!("the fragment writer never accepts a uni stream")
+        }
+
+        fn send_datagram(&self, data: &[u8]) -> anyhow::Result<()> {
+            self.0.lock().push(data.to_vec());
+            Ok(())
+        }
+
+        async fn receive_datagram(&self, _ctx: &tokio_util::sync::CancellationToken) -> anyhow::Result<Vec<u8>> {
+            anyhow::bail!("the fragment writer never receives a datagram")
+        }
+    }
+
+    /// Pins the frames a fragmented datagram is sent as: the address is written once, every later
+    /// fragment carries `ATYP_NONE`, and each payload is the slice of the original it claims.
+    #[tokio::test]
+    async fn every_fragment_after_the_first_is_sent_without_an_address() {
+        let conn = RecordingConn::default();
+        let addr = protocol::new_address_addr_port(SocketAddr::from(([192, 0, 2, 1], 9)));
+        let packet = protocol::new_packet(1, 4, 1, 0, 12, addr.clone(), bytes::Bytes::from_static(b"abcdefghijkl"));
+        let mut buf = BytesMut::new();
+
+        frag_write_native(&conn, packet, &mut buf, 5).await.expect("the fragments are sent");
+
+        let sent = conn.0.lock();
+        assert_eq!(sent.len(), 3);
+        let mut payloads = Vec::new();
+        for (index, frame) in sent.iter().enumerate() {
+            let mut cursor = std::io::Cursor::new(&frame[..]);
+            let parsed = protocol::read_packet(&mut cursor).await.expect("the frame parses");
+            assert_eq!(parsed.frag_total, 3);
+            assert_eq!(usize::from(parsed.frag_id), index);
+            assert_eq!(usize::from(parsed.size), parsed.data.len());
+            if index == 0 {
+                assert_eq!(parsed.addr.string(), addr.string());
+            } else {
+                assert_eq!(parsed.addr.type_, ATYP_NONE);
+            }
+            payloads.extend_from_slice(&parsed.data);
+        }
+        assert_eq!(payloads, b"abcdefghijkl");
     }
 }
