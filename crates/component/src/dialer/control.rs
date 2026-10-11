@@ -1323,8 +1323,7 @@ mod listener_tfo_tests {
     /// caps the option at `somaxconn`, which is what the process-wide read reports.
     #[test]
     fn set_tfo_listener_applies_the_backlog_it_is_given() {
-        let somaxconn: i32 =
-            std::fs::read_to_string("/proc/sys/net/core/somaxconn").unwrap().trim().parse().unwrap();
+        let somaxconn: i32 = std::fs::read_to_string("/proc/sys/net/core/somaxconn").unwrap().trim().parse().unwrap();
 
         for backlog in [1, 7] {
             let socket = Socket::new(Domain::IPV4, Type::STREAM, Some(Protocol::TCP)).unwrap();
