@@ -197,29 +197,42 @@ impl GeckoPacketConn {
             *counter = counter.wrapping_add(1);
             *counter
         };
-
-        for index in 0..chunks {
-            let frame = {
-                let mut buf = self.write_buf.lock();
-                let start = usize::from(index) * chunk_size;
-                let end = if index + 1 < chunks { start + chunk_size } else { payload.len() };
-                let (_, tail) = payload.split_at(start);
-                let (chunk, _) = tail.split_at(end - start);
-                let pad_len = self.random_pad_len(chunk.len());
-                let header = chunk_header(msg_id, index, chunks, pad_len)?;
-
-                buf.clear();
-                buf.resize(HEADER_LEN + pad_len + chunk.len(), 0);
-                let (head, body) = buf.split_at_mut(HEADER_LEN);
-                head.copy_from_slice(&header);
-                let (pad, data) = body.split_at_mut(pad_len);
-                rand::rng().fill_bytes(pad);
-                data.copy_from_slice(chunk);
-                buf.clone()
-            };
-            self.inner.write_to(&frame, addr).await?;
-        }
+        // Taken out from under the lock, so the framing guard is not held across the sends and
+        // every chunk is sent from the buffer it was framed into.
+        let mut buf = std::mem::take(&mut *self.write_buf.lock());
+        let result = self.write_chunks(payload, addr, msg_id, chunks, chunk_size, &mut buf).await;
+        *self.write_buf.lock() = buf;
+        result?;
         Ok(payload.len())
+    }
+
+    async fn write_chunks(
+        &self,
+        payload: &[u8],
+        addr: &dyn Addr,
+        msg_id: u8,
+        chunks: u8,
+        chunk_size: usize,
+        buf: &mut Vec<u8>,
+    ) -> io::Result<()> {
+        for index in 0..chunks {
+            let start = usize::from(index) * chunk_size;
+            let end = if index + 1 < chunks { start + chunk_size } else { payload.len() };
+            let (_, tail) = payload.split_at(start);
+            let (chunk, _) = tail.split_at(end - start);
+            let pad_len = self.random_pad_len(chunk.len());
+            let header = chunk_header(msg_id, index, chunks, pad_len)?;
+
+            buf.clear();
+            buf.resize(HEADER_LEN + pad_len + chunk.len(), 0);
+            let (head, body) = buf.split_at_mut(HEADER_LEN);
+            head.copy_from_slice(&header);
+            let (pad, data) = body.split_at_mut(pad_len);
+            rand::rng().fill_bytes(pad);
+            data.copy_from_slice(chunk);
+            self.inner.write_to(buf, addr).await?;
+        }
+        Ok(())
     }
 
     /// Returns the reassembled payload once every chunk has arrived.

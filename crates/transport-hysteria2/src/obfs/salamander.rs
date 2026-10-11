@@ -89,12 +89,13 @@ impl PacketConn for SalamanderPacketConn {
     }
 
     async fn write_to(&self, buf: &[u8], addr: &dyn Addr) -> io::Result<usize> {
-        let encoded = {
-            let mut out = self.write_buf.lock();
-            self.encode_into(&mut out, buf);
-            out.clone()
-        };
-        self.inner.write_to(&encoded, addr).await?;
+        // Taken out from under the lock, so the encoding guard is not held across the send and the
+        // packet goes out in the same buffer it was encoded into.
+        let mut encoded = std::mem::take(&mut *self.write_buf.lock());
+        self.encode_into(&mut encoded, buf);
+        let result = self.inner.write_to(&encoded, addr).await;
+        *self.write_buf.lock() = encoded;
+        result?;
         Ok(buf.len())
     }
 
