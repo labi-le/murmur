@@ -728,6 +728,23 @@ fn wire_u24(length: usize) -> [u8; 3] {
     [first, second, third]
 }
 
+fn drain_bytes(buffer: &mut Vec<u8>, stream: &mut dyn Stream, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+    while !buffer.is_empty() {
+        match Pin::new(&mut *stream).poll_write(cx, buffer) {
+            Poll::Pending => return Poll::Pending,
+            Poll::Ready(Err(err)) => return Poll::Ready(Err(err)),
+            Poll::Ready(Ok(0)) => {
+                return Poll::Ready(Err(io::Error::new(
+                    io::ErrorKind::WriteZero,
+                    "tls: peer stopped accepting TLS records",
+                )))
+            }
+            Poll::Ready(Ok(written)) => drop(buffer.drain(..written)),
+        }
+    }
+    Poll::Ready(Ok(()))
+}
+
 fn write_plaintext_record(out: &mut Vec<u8>, content_type: u8, payload: &[u8]) {
     for fragment in payload.chunks(MAX_FRAGMENT_LEN) {
         out.push(content_type);
@@ -863,6 +880,7 @@ pub(crate) struct UtlsClient {
     body_started: bool,
     pending_record: Option<(u8, Vec<u8>)>,
     pending_out: Vec<u8>,
+    pending_control: Vec<u8>,
     pending_length: usize,
     close_notify_sent: bool,
     write_closed: bool,
@@ -906,6 +924,7 @@ impl UtlsClient {
             body_started: false,
             pending_record: None,
             pending_out: Vec::new(),
+            pending_control: Vec::new(),
             pending_length: 0,
             close_notify_sent: false,
             write_closed: false,
@@ -1406,20 +1425,12 @@ impl UtlsClient {
     }
 
     fn poll_drain(&mut self, stream: &mut dyn Stream, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
-        while !self.pending_out.is_empty() {
-            match Pin::new(&mut *stream).poll_write(cx, &self.pending_out) {
-                Poll::Pending => return Poll::Pending,
-                Poll::Ready(Err(err)) => return Poll::Ready(Err(err)),
-                Poll::Ready(Ok(0)) => {
-                    return Poll::Ready(Err(io::Error::new(
-                        io::ErrorKind::WriteZero,
-                        "tls: peer stopped accepting TLS records",
-                    )))
-                }
-                Poll::Ready(Ok(written)) => drop(self.pending_out.drain(..written)),
-            }
+        match drain_bytes(&mut self.pending_out, stream, cx) {
+            Poll::Pending => return Poll::Pending,
+            Poll::Ready(Err(err)) => return Poll::Ready(Err(err)),
+            Poll::Ready(Ok(())) => {}
         }
-        Poll::Ready(Ok(()))
+        drain_bytes(&mut self.pending_control, stream, cx)
     }
 
     pub(crate) fn poll_read(
@@ -1492,7 +1503,8 @@ impl UtlsClient {
         match payload.first() {
             Some(&HANDSHAKE_NEW_SESSION_TICKET) => Ok(None),
             Some(&HANDSHAKE_KEY_UPDATE) => {
-                self.update_traffic_keys(payload.get(1).copied() == Some(1)).map_err(io::Error::other)?;
+                let body = handshake_body(&payload, HANDSHAKE_KEY_UPDATE).map_err(io::Error::other)?;
+                self.update_traffic_keys(body.first() == Some(&1)).map_err(io::Error::other)?;
                 Ok(None)
             }
             _ => Err(io::Error::other("tls: unexpected post-handshake handshake message")),
@@ -1507,6 +1519,11 @@ impl UtlsClient {
         self.server_application_secret.clone_from(&server_secret);
         (self.server_key, self.server_iv) = traffic_key(suite, &server_secret)?;
         if request_response_update {
+            // §4.6.3: the peer cannot read the next generation until it sees our `KeyUpdate`, so it
+            // is sealed here under the generation still on the wire and queued ahead of new data.
+            let update = handshake_message(HANDSHAKE_KEY_UPDATE, &[0x00]);
+            let record = self.seal_record(CONTENT_HANDSHAKE, &update)?;
+            self.pending_control.extend_from_slice(&record);
             let client_secret = suite.expand_label(&self.client_application_secret, "traffic upd", &[], hash_len)?;
             self.client_application_secret.clone_from(&client_secret);
             (self.client_key, self.client_iv) = traffic_key(suite, &client_secret)?;
@@ -1525,6 +1542,15 @@ impl UtlsClient {
         }
         if buf.is_empty() {
             return Poll::Ready(Ok(0));
+        }
+        // A queued `KeyUpdate` has to reach the peer before anything sealed under the next
+        // client generation, so it is flushed before this call seals application data.
+        if !self.pending_control.is_empty() {
+            match self.poll_drain(stream, cx) {
+                Poll::Pending => return Poll::Pending,
+                Poll::Ready(Err(err)) => return Poll::Ready(Err(err)),
+                Poll::Ready(Ok(())) => {}
+            }
         }
         if self.pending_out.is_empty() {
             let take = buf.len().min(MAX_FRAGMENT_LEN);
@@ -1556,6 +1582,13 @@ impl UtlsClient {
     pub(crate) fn poll_shutdown(&mut self, stream: &mut dyn Stream, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
         if self.write_closed {
             return Poll::Ready(Ok(()));
+        }
+        if !self.pending_control.is_empty() {
+            match self.poll_drain(stream, cx) {
+                Poll::Pending => return Poll::Pending,
+                Poll::Ready(Err(err)) => return Poll::Ready(Err(err)),
+                Poll::Ready(Ok(())) => {}
+            }
         }
         if !self.close_notify_sent {
             self.pending_out = match self.seal_record(CONTENT_HANDSHAKE, &[0x01, 0x00]) {
@@ -1906,6 +1939,162 @@ mod tests {
         let error = client.next_record(&mut stream).await.expect_err("a partial header before EOF must fail");
         assert_eq!(error.kind(), io::ErrorKind::UnexpectedEof);
         assert_eq!(error.to_string(), "tls: transport ended inside a record header");
+    }
+
+    /// The application-phase key material a finished handshake leaves behind.
+    struct ApplicationKeys {
+        suite: Tls13Suite,
+        client_key: Vec<u8>,
+        client_iv: [u8; IV_LEN],
+        server_key: Vec<u8>,
+        server_iv: [u8; IV_LEN],
+    }
+
+    fn client_with_application_keys() -> (UtlsClient, ApplicationKeys) {
+        let suite = Tls13Suite::Aes128GcmSha256;
+        let mut client = UtlsClient::new(
+            Arc::new(Config::default()),
+            Arc::new(rustls::crypto::aws_lc_rs::default_provider()),
+            Vec::new(),
+            KeySharePrivateKeys::default(),
+        );
+        client.suite = Some(suite);
+        client.client_application_secret = vec![0x11; 32];
+        client.server_application_secret = vec![0x22; 32];
+        let (client_key, client_iv) =
+            traffic_key(suite, &client.client_application_secret).expect("client traffic keys");
+        let (server_key, server_iv) =
+            traffic_key(suite, &client.server_application_secret).expect("server traffic keys");
+        client.client_key = client_key.clone();
+        client.client_iv = client_iv;
+        client.server_key = server_key.clone();
+        client.server_iv = server_iv;
+        (client, ApplicationKeys { suite, client_key, client_iv, server_key, server_iv })
+    }
+
+    fn seal_record_with(
+        suite: Tls13Suite,
+        key: &[u8],
+        iv: &[u8; IV_LEN],
+        sequence: u64,
+        inner_content_type: u8,
+        payload: &[u8],
+    ) -> (u8, Vec<u8>) {
+        let mut inner = payload.to_vec();
+        inner.push(inner_content_type);
+        let mut header = [0u8; 5];
+        header[..3].copy_from_slice(&[CONTENT_APPLICATION_DATA, LEGACY_RECORD_VERSION[0], LEGACY_RECORD_VERSION[1]]);
+        header[3..].copy_from_slice(&wire_u16(inner.len() + TAG_LEN));
+        let ciphertext = suite.seal(key, &record_nonce(iv, sequence), &inner, &header).expect("seal the record");
+        (CONTENT_APPLICATION_DATA, ciphertext)
+    }
+
+    fn open_record_with(
+        suite: Tls13Suite,
+        key: &[u8],
+        iv: &[u8; IV_LEN],
+        sequence: u64,
+        header: &[u8; 5],
+        ciphertext: &[u8],
+    ) -> (u8, Vec<u8>) {
+        let inner = suite.open(key, &record_nonce(iv, sequence), ciphertext, header).expect("open the record");
+        let index = inner.iter().rposition(|byte| *byte != 0).expect("the inner plaintext carries a content type");
+        let (plaintext, rest) = inner.split_at(index);
+        (rest[0], plaintext.to_vec())
+    }
+
+    /// Splits a captured write into `(header, ciphertext)` record pairs.
+    fn captured_records(records: &[u8]) -> Vec<([u8; 5], Vec<u8>)> {
+        let mut parsed = Vec::new();
+        let mut offset = 0;
+        while offset + 5 <= records.len() {
+            let header: [u8; 5] = records[offset..offset + 5].try_into().expect("record header");
+            let length = usize::from(u16::from_be_bytes([header[3], header[4]]));
+            parsed.push((header, records[offset + 5..offset + 5 + length].to_vec()));
+            offset += 5 + length;
+        }
+        parsed
+    }
+
+    /// An `update_requested` `KeyUpdate` must be answered with the client's own `KeyUpdate` before
+    /// the client switches to the next sending generation: the peer updates its receiving keys
+    /// only when it observes that message.
+    #[tokio::test]
+    async fn a_key_update_request_is_answered_under_the_old_keys_before_the_switch() {
+        let (mut client, keys) = client_with_application_keys();
+        let request = seal_record_with(
+            keys.suite,
+            &keys.server_key,
+            &keys.server_iv,
+            0,
+            CONTENT_HANDSHAKE,
+            &handshake_message(HANDSHAKE_KEY_UPDATE, &[0x01]),
+        );
+        assert!(
+            client.consume_post_handshake(request).expect("a key update request is accepted").is_none(),
+            "a key update carries no application data"
+        );
+        assert_ne!(client.client_key, keys.client_key, "the request installs the next client generation");
+        let written = Arc::new(Mutex::new(Vec::new()));
+        let mut stream = ScriptedStream {
+            to_client: Mutex::new(VecDeque::new()),
+            written: Arc::clone(&written),
+            one_byte_per_read: false,
+            script: Mutex::new(None),
+        };
+        let mut cx = Context::from_waker(Waker::noop());
+        let count = match client.poll_write(&mut stream, &mut cx, b"hello") {
+            Poll::Ready(Ok(count)) => count,
+            other => panic!("poll_write must seal the application record: {other:?}"),
+        };
+        assert_eq!(count, 5);
+
+        let records = written.lock().expect("scripted write capture").clone();
+        let parsed = captured_records(&records);
+        assert_eq!(parsed.len(), 2, "the KeyUpdate response then the application record");
+
+        let (content_type, plaintext) =
+            open_record_with(keys.suite, &keys.client_key, &keys.client_iv, 0, &parsed[0].0, &parsed[0].1);
+        assert_eq!(content_type, CONTENT_HANDSHAKE, "the response is a handshake message");
+        assert_eq!(
+            plaintext,
+            handshake_message(HANDSHAKE_KEY_UPDATE, &[0x00]),
+            "the response must carry update_not_requested"
+        );
+
+        let (content_type, plaintext) = open_record_with(
+            keys.suite,
+            &client.client_key,
+            &client.client_iv,
+            1,
+            &parsed[1].0,
+            &parsed[1].1,
+        );
+        assert_eq!(content_type, CONTENT_APPLICATION_DATA);
+        assert_eq!(plaintext, b"hello".to_vec(), "application data follows under the next generation");
+    }
+
+    /// A `KeyUpdate` that does not request one is one-directional: the client installs the peer's
+    /// next read generation, keeps its own sending generation and answers nothing.
+    #[tokio::test]
+    async fn a_key_update_without_a_request_rotates_only_the_read_keys() {
+        let (mut client, keys) = client_with_application_keys();
+        let update = seal_record_with(
+            keys.suite,
+            &keys.server_key,
+            &keys.server_iv,
+            0,
+            CONTENT_HANDSHAKE,
+            &handshake_message(HANDSHAKE_KEY_UPDATE, &[0x00]),
+        );
+        assert!(
+            client.consume_post_handshake(update).expect("a key update is accepted").is_none(),
+            "a key update carries no application data"
+        );
+
+        assert_ne!(client.server_key, keys.server_key, "the peer's next generation is installed");
+        assert_eq!(client.client_key, keys.client_key, "an unrequested update must not switch the write keys");
+        assert!(client.pending_control.is_empty(), "nothing may be queued in reply");
     }
 
     /// The buffered half of `poll_read` must hand out the bytes at `plain_offset` on, not the
