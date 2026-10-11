@@ -202,6 +202,9 @@ pub(crate) fn merge_ip_ranges(rr: &mut [IpRange]) -> Option<Vec<IpRange>> {
     let Some(first) = ranges.next() else {
         return Some(Vec::new());
     };
+    if !first.is_valid() {
+        return None;
+    }
     let mut current = *first;
     for r in ranges {
         if !r.is_valid() {
@@ -499,5 +502,44 @@ mod tests {
 
         assert!(set.rr.iter().all(IpRange::is_valid));
         assert!(set.rr.windows(2).all(|w| w[0].to < w[1].from));
+    }
+
+    #[test]
+    fn merge_ip_ranges_rejects_a_lone_invalid_range() {
+        let mut rr = [ip_range_from(IpAddr::V4(Ipv4Addr::new(10, 0, 0, 1)), IpAddr::V4(Ipv4Addr::new(10, 0, 0, 0)))];
+
+        assert!(merge_ip_ranges(&mut rr).is_none());
+    }
+
+    #[test]
+    fn merge_ip_ranges_rejects_an_invalid_range_whichever_slot_it_lands_in() {
+        let before = ip_range_from(IpAddr::V4(Ipv4Addr::new(10, 0, 0, 1)), IpAddr::V4(Ipv4Addr::new(10, 0, 0, 0)));
+        let middle = ip_range_from(IpAddr::V4(Ipv4Addr::new(10, 0, 2, 1)), IpAddr::V4(Ipv4Addr::new(10, 0, 2, 0)));
+        let valid = ip_range_from(IpAddr::V4(Ipv4Addr::new(10, 0, 1, 0)), IpAddr::V4(Ipv4Addr::new(10, 0, 1, 255)));
+
+        // Sorting puts `before` in the first slot and `middle` in the second.
+        for mut rr in [vec![before, valid], vec![valid, before], vec![valid, middle], vec![middle, valid]] {
+            assert!(merge_ip_ranges(&mut rr).is_none(), "{rr:?}");
+        }
+        assert_eq!(merge_ip_ranges(&mut [valid]), Some(vec![valid]));
+    }
+
+    #[test]
+    fn merge_ip_ranges_of_an_empty_slice_is_an_empty_set() {
+        assert_eq!(merge_ip_ranges(&mut []), Some(Vec::new()));
+    }
+
+    #[test]
+    fn merge_ip_ranges_coalesces_overlapping_and_adjacent_ranges() {
+        let first = ip_range_from(IpAddr::V4(Ipv4Addr::new(10, 0, 0, 0)), IpAddr::V4(Ipv4Addr::new(10, 0, 0, 255)));
+        let adjacent = ip_range_from(IpAddr::V4(Ipv4Addr::new(10, 0, 1, 0)), IpAddr::V4(Ipv4Addr::new(10, 0, 1, 255)));
+        let inside = ip_range_from(IpAddr::V4(Ipv4Addr::new(10, 0, 0, 64)), IpAddr::V4(Ipv4Addr::new(10, 0, 0, 128)));
+
+        let mut rr = vec![inside, adjacent, first];
+        let merged = merge_ip_ranges(&mut rr).expect("every range is valid");
+
+        assert_eq!(merged.len(), 1);
+        assert_eq!(merged.first().map(IpRange::from), Some(first.from));
+        assert_eq!(merged.first().map(IpRange::to), Some(adjacent.to));
     }
 }
