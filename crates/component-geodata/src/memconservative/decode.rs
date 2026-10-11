@@ -1,5 +1,5 @@
 use std::fs::File;
-use std::io::{BufReader, Read, Seek};
+use std::io::{BufReader, Read, Seek, SeekFrom};
 
 use thiserror::Error;
 
@@ -81,13 +81,20 @@ fn read_length<R: Read>(reader: &mut R, length_bytes: &mut Vec<u8>) -> Result<u6
     }
 }
 
+fn remaining_bytes<F: Read + Seek>(reader: &mut BufReader<F>, file_len: u64) -> Result<u64, DecodeError> {
+    let position = reader.stream_position().map_err(|_| FailedToReadBytes)?;
+    Ok(file_len.saturating_sub(position))
+}
+
 /// `reader.seek_relative` handles the buffered discard or bare seek this needs.
 #[expect(
     clippy::indexing_slicing,
-    reason = "the record header is written at a running cursor; a declared length below the header \
-              size is malformed and must fail loudly instead of being silently clamped"
+    reason = "`length >= prefix_length` is checked before the header is written, so every write \
+              stays inside the `length`-byte buffer"
 )]
-fn emit_bytes<F: Read + Seek>(f: F, code: &str) -> Result<Vec<u8>, DecodeError> {
+fn emit_bytes<F: Read + Seek>(mut f: F, code: &str) -> Result<Vec<u8>, DecodeError> {
+    let file_len = f.seek(SeekFrom::End(0)).map_err(|_| FailedToReadBytes)?;
+    f.seek(SeekFrom::Start(0)).map_err(|_| FailedToReadBytes)?;
     let mut reader = BufReader::with_capacity(16 * 1024, f);
     let mut length_bytes: Vec<u8> = Vec::new();
 
@@ -104,12 +111,22 @@ fn emit_bytes<F: Read + Seek>(f: F, code: &str) -> Result<Vec<u8>, DecodeError> 
         }
         let code_length = read_length(&mut reader, &mut length_bytes)?;
 
-        let mut name = vec![0u8; usize::try_from(code_length).unwrap_or(usize::MAX)];
+        // A declared length larger than the file cannot be a real record, and must not reach an
+        // allocation that aborts on it.
+        if code_length > remaining_bytes(&mut reader, file_len)? {
+            return Err(FailedToReadExpectedLenBytes);
+        }
+        let name_length = usize::try_from(code_length).map_err(|_| FailedToReadExpectedLenBytes)?;
+        let mut name = vec![0u8; name_length];
         read_full(&mut reader, &mut name)?;
 
         let prefix_length = 1 + length_bytes.len() as u64 + code_length;
         if String::from_utf8_lossy(&name).eq_ignore_ascii_case(code) {
-            let mut result = vec![0u8; usize::try_from(length).unwrap_or(usize::MAX)];
+            if length < prefix_length || length - prefix_length > remaining_bytes(&mut reader, file_len)? {
+                return Err(FailedToReadExpectedLenBytes);
+            }
+            let result_length = usize::try_from(length).map_err(|_| FailedToReadExpectedLenBytes)?;
+            let mut result = vec![0u8; result_length];
             let mut n = 0;
             result[n] = 10;
             n += 1;
@@ -135,4 +152,44 @@ fn emit_bytes<F: Read + Seek>(f: F, code: &str) -> Result<Vec<u8>, DecodeError> 
 pub(crate) fn decode(filename: &str, code: &str) -> Result<Vec<u8>, DecodeError> {
     let f = File::open(filename).map_err(|source| DecodeError::OpenFailed { filename: filename.to_owned(), source })?;
     emit_bytes(f, code)
+}
+
+#[cfg(test)]
+mod tests {
+    use std::io::Cursor;
+
+    use super::*;
+
+    #[test]
+    fn a_code_length_past_the_end_of_the_file_is_rejected_not_allocated() {
+        // Outer `0A`, a zero-length record, inner `0A`, then a code-length varint of `u64::MAX`
+        // over a 13-byte file.
+        let file = vec![0x0A, 0x00, 0x0A, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0x01];
+        let err = emit_bytes(Cursor::new(file), "cn").unwrap_err();
+        assert!(matches!(err, FailedToReadExpectedLenBytes), "got {err}");
+    }
+
+    #[test]
+    fn a_record_length_past_the_end_of_the_file_is_rejected_not_allocated() {
+        let mut file = vec![0x0A];
+        file.extend([0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0x01]);
+        file.extend([0x0A, 0x02, b'c', b'n']);
+        let err = emit_bytes(Cursor::new(file), "cn").unwrap_err();
+        assert!(matches!(err, FailedToReadExpectedLenBytes), "got {err}");
+    }
+
+    #[test]
+    fn a_record_shorter_than_its_reencoded_header_is_rejected_not_indexed() {
+        // Record length 3 with code length 2: the re-encoded header alone is 4 bytes.
+        let file = vec![0x0A, 0x03, 0x0A, 0x02, b'c', b'n'];
+        let err = emit_bytes(Cursor::new(file), "cn").unwrap_err();
+        assert!(matches!(err, FailedToReadExpectedLenBytes), "got {err}");
+    }
+
+    #[test]
+    fn a_well_formed_record_still_decodes_to_its_reencoded_entry() {
+        let file = vec![0x0A, 0x06, 0x0A, 0x02, b'c', b'n', 0x12, 0x00];
+        let decoded = emit_bytes(Cursor::new(file), "cn").unwrap();
+        assert_eq!(decoded, vec![0x0A, 0x02, b'c', b'n', 0x12, 0x00]);
+    }
 }
