@@ -19,7 +19,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 
-use anyhow::Result;
+use anyhow::{anyhow, Result};
 use async_trait::async_trait;
 use tokio_util::sync::CancellationToken;
 
@@ -226,8 +226,11 @@ pub async fn new(
         option.tokens = config.token.iter().map(|token| gen_tkn(token)).collect();
     }
     if !config.users.is_empty() {
-        option.users =
-            config.users.iter().map(|(uuid, password)| (uuid_from_string_or_nil(uuid), password.clone())).collect();
+        option.users = config
+            .users
+            .iter()
+            .map(|(uuid, password)| parse_user_uuid(uuid).map(|uuid| (uuid, password.clone())))
+            .collect::<Result<HashMap<_, _>>>()?;
     }
 
     let option = Arc::new(option);
@@ -273,8 +276,14 @@ async fn bind_servers(
     Ok((udp_listeners, servers))
 }
 
-fn uuid_from_string_or_nil(s: &str) -> [u8; 16] {
-    uuid::Uuid::parse_str(s).unwrap_or_default().into_bytes()
+/// A user's uuid is the identity its credential is looked up by, so an unparseable key, or the nil
+/// uuid every client can present, fails the config instead of being substituted for one.
+fn parse_user_uuid(key: &str) -> Result<[u8; 16]> {
+    let uuid = uuid::Uuid::parse_str(key).map_err(|err| anyhow!("invalid tuic user uuid {key:?}: {err}"))?;
+    if uuid.is_nil() {
+        return Err(anyhow!("invalid tuic user uuid {key:?}: the nil uuid matches every client"));
+    }
+    Ok(uuid.into_bytes())
 }
 
 impl Listener {
@@ -304,5 +313,78 @@ impl Listener {
             Box::new(udp_addr_from_socket_addr(addr))
         }
         self.udp_listeners.iter().filter_map(|conn| conn.local_addr().ok()).map(boxed_addr).collect()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use murmur_adapter_inbound::listen::default_listen_config;
+    use murmur_common_net::io::Stream;
+    use murmur_component_nat::table::Table;
+    use murmur_constant::adapters::{NatTable, UDPPacket};
+    use murmur_constant::metadata::Metadata;
+    use murmur_testsupport::{tls_certificate, tls_private_key, USER_UUID};
+
+    use super::*;
+
+    struct NullTunnel;
+
+    #[async_trait]
+    impl Tunnel for NullTunnel {
+        async fn handle_tcp_conn(&self, _conn: Box<dyn Stream>, _metadata: Metadata) {}
+
+        fn handle_udp_packet(&self, _packet: Arc<dyn UDPPacket>, _metadata: Metadata) {}
+
+        fn nat_table(&self) -> Arc<dyn NatTable> {
+            Arc::new(Table::default())
+        }
+    }
+
+    fn config_with_users(users: &[(&str, &str)]) -> TuicServer {
+        TuicServer {
+            enable: true,
+            listen: "127.0.0.1:0".to_owned(),
+            certificate: tls_certificate().to_owned(),
+            private_key: tls_private_key().to_owned(),
+            users: users.iter().map(|(uuid, password)| ((*uuid).to_owned(), (*password).to_owned())).collect(),
+            ..TuicServer::default()
+        }
+    }
+
+    async fn start(config: TuicServer) -> Result<Listener> {
+        new(config, default_listen_config(), Arc::new(NullTunnel), &[]).await
+    }
+
+    #[tokio::test]
+    async fn a_malformed_users_key_fails_the_config_and_names_the_key() {
+        let err = start(config_with_users(&[("not-a-uuid", "pass")]))
+            .await
+            .expect_err("a key that is not a uuid cannot identify a credential");
+
+        assert!(err.to_string().contains("not-a-uuid"), "{err}");
+    }
+
+    #[tokio::test]
+    async fn the_nil_users_key_fails_the_config() {
+        let err = start(config_with_users(&[("00000000-0000-0000-0000-000000000000", "pass")]))
+            .await
+            .expect_err("the nil uuid is the value a malformed key used to become, so it cannot load");
+
+        assert!(err.to_string().contains("nil"), "{err}");
+    }
+
+    /// The accepted direction, paired with `inbound::tuic`'s round trip, which carries traffic for
+    /// exactly this registration.
+    #[tokio::test]
+    async fn a_uuid_users_key_becomes_that_exact_credential() {
+        assert_eq!(
+            parse_user_uuid(&USER_UUID).expect("a uuid key parses"),
+            uuid::Uuid::parse_str(&USER_UUID).expect("USER_UUID is a uuid").into_bytes()
+        );
+
+        let listener = start(config_with_users(&[(&USER_UUID, "pass")])).await.expect("a uuid key loads");
+
+        assert!(!listener.addr_list().is_empty());
+        listener.close().expect("the listener closes");
     }
 }
