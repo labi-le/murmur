@@ -144,34 +144,23 @@ fn emit(event: Event) {
 struct TextFormatter {
     /// Produces RFC 3339 timestamps with nanosecond precision.
     timestamp: fn() -> String,
-    /// Whether `CLICOLOR`/`CLICOLOR_FORCE` override the terminal colour detection.
-    environment_override_colors: bool,
+    /// Whether output is colourised, decided once for the process.
+    colored: bool,
 }
 
 impl TextFormatter {
-    /// Builds the formatter with nanosecond timestamps and colour overrides enabled.
+    /// Builds the process formatter, taking the colour decision once rather than per record.
     fn new() -> Self {
-        Self {
-            timestamp: || Local::now().to_rfc3339_opts(SecondsFormat::Nanos, true),
-            environment_override_colors: true,
-        }
+        Self::with_color_decision(detect_colored())
     }
 
-    /// Whether output is colourised: a non-Windows terminal, overridable by environment.
+    /// Builds a formatter with the colour decision given.
+    fn with_color_decision(colored: bool) -> Self {
+        Self { timestamp: || Local::now().to_rfc3339_opts(SecondsFormat::Nanos, true), colored }
+    }
+
     fn is_colored(&self) -> bool {
-        let mut is_colored = std::io::stdout().is_terminal() && !cfg!(windows);
-        if self.environment_override_colors {
-            match std::env::var("CLICOLOR_FORCE") {
-                Ok(force) if force != "0" => is_colored = true,
-                Ok(_) => is_colored = false,
-                Err(_) => {
-                    if std::env::var("CLICOLOR").as_deref() == Ok("0") {
-                        is_colored = false;
-                    }
-                }
-            }
-        }
-        is_colored
+        self.colored
     }
 
     /// Writes one colourised line.
@@ -182,11 +171,45 @@ impl TextFormatter {
             "error" | "fatal" | "panic" => 31,
             _ => 36,
         };
-        let mut level_text = level_name.to_ascii_uppercase();
-        level_text.truncate(4);
+        let level_text = level_text(level_name);
         let message = payload.strip_suffix('\n').unwrap_or(payload);
         let timestamp = (self.timestamp)();
         let _ = write!(out, "\x1b[{level_color}m{level_text}\x1b[0m[{timestamp}] {message:<44} ");
+    }
+}
+
+/// Whether output is colourised: a non-Windows terminal, overridable by `CLICOLOR_FORCE`/`CLICOLOR`.
+fn detect_colored() -> bool {
+    #[cfg(test)]
+    COLOR_DETECTIONS.fetch_add(1, Ordering::SeqCst);
+    let mut is_colored = std::io::stdout().is_terminal() && !cfg!(windows);
+    match std::env::var("CLICOLOR_FORCE") {
+        Ok(force) if force != "0" => is_colored = true,
+        Ok(_) => is_colored = false,
+        Err(_) => {
+            if std::env::var("CLICOLOR").as_deref() == Ok("0") {
+                is_colored = false;
+            }
+        }
+    }
+    is_colored
+}
+
+/// Counts the colour detections, so a test can pin that the decision is taken once per process.
+#[cfg(test)]
+static COLOR_DETECTIONS: AtomicUsize = AtomicUsize::new(0);
+
+/// The four-character upper-case label for a level name, so a record is not upper-cased into a
+/// fresh `String` to be rendered.
+fn level_text(level_name: &str) -> &'static str {
+    match level_name {
+        "debug" => "DEBU",
+        "trace" => "TRAC",
+        "warning" => "WARN",
+        "error" => "ERRO",
+        "fatal" => "FATA",
+        "panic" => "PANI",
+        _ => "INFO",
     }
 }
 
@@ -325,5 +348,49 @@ mod tests {
         set_level(LogLevel::INFO);
         let debug_text = String::from_utf8_lossy(&debug_out);
         assert!(debug_text.contains("debug line"), "debug line missing: {debug_text}");
+    }
+
+    /// Forcing the `LazyLock` first makes the count final: `detect_colored` runs from
+    /// `TextFormatter::new` alone, which the lock calls once per process.
+    #[test]
+    fn the_colour_decision_is_taken_once_for_the_process_formatter() {
+        LazyLock::force(&TEXT_FORMATTER);
+        let before = COLOR_DETECTIONS.load(Ordering::SeqCst);
+
+        let mut first = Vec::new();
+        write_line_to(&mut first, "info", "first");
+        let mut second = Vec::new();
+        write_line_to(&mut second, "info", "second");
+
+        assert_eq!(
+            COLOR_DETECTIONS.load(Ordering::SeqCst),
+            before,
+            "a rendered record must not re-detect colour support"
+        );
+        assert!(!first.is_empty() && !second.is_empty(), "both records must be rendered");
+    }
+
+    #[test]
+    fn a_formatter_renders_the_colour_decision_it_was_built_with() {
+        let mut line = String::new();
+        TextFormatter::with_color_decision(true).print_colored(&mut line, "warning", "x");
+        assert!(line.contains("\x1b[33mWARN\x1b[0m"), "the coloured line lost its label: {line:?}");
+
+        assert!(TextFormatter::with_color_decision(true).is_colored());
+        assert!(
+            !TextFormatter::with_color_decision(false).is_colored(),
+            "the stored decision must not be re-derived from the environment"
+        );
+    }
+
+    #[test]
+    fn a_level_name_maps_to_its_four_character_label() {
+        assert_eq!(level_text("info"), "INFO");
+        assert_eq!(level_text("warning"), "WARN");
+        assert_eq!(level_text("error"), "ERRO");
+        assert_eq!(level_text("debug"), "DEBU");
+        assert_eq!(level_text("fatal"), "FATA");
+        assert_eq!(level_text("panic"), "PANI");
+        assert_eq!(level_text("trace"), "TRAC");
     }
 }
