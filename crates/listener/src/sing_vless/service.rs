@@ -267,7 +267,7 @@ async fn read_addr_port(conn: &mut dyn Stream) -> Result<Socksaddr> {
             conn.read_exact(&mut fqdn).await?;
             Ok(Socksaddr::fqdn(String::from_utf8_lossy(&fqdn).into_owned(), port))
         }
-        _ => Ok(Socksaddr::default()),
+        other => Err(anyhow!("unknown address family: {other}")),
     }
 }
 
@@ -579,5 +579,54 @@ impl network::PacketConn for ServerPacketConn {
 impl NeedAdditionalReadDeadline for ServerPacketConn {
     fn need_additional_read_deadline(&self) -> bool {
         true
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
+
+    use tokio::io::AsyncWriteExt;
+
+    use super::*;
+
+    async fn conn_carrying(frame: &[u8]) -> (Box<dyn Stream>, tokio::net::TcpStream) {
+        let listener =
+            tokio::net::TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).await.expect("an ephemeral port is free");
+        let addr = listener.local_addr().expect("the probe is bound");
+        let mut client = tokio::net::TcpStream::connect(addr).await.expect("the client connects");
+        let (server, _) = listener.accept().await.expect("the probe accepts");
+        client.write_all(frame).await.expect("the frame is written");
+        (Box::new(server), client)
+    }
+
+    /// The frame is the wire port, then the family byte; every other reader of this field in the
+    /// tree refuses a family it does not define, so an unknown one must not become a destination.
+    #[tokio::test]
+    async fn an_unknown_address_family_is_refused_instead_of_becoming_an_empty_destination() {
+        let (mut server, _client) = conn_carrying(&[0x00, 0x50, 0x09]).await;
+
+        let err = read_addr_port(&mut *server).await.expect_err("family 0x09 names no address family");
+
+        assert_eq!(err.to_string(), "unknown address family: 9");
+    }
+
+    #[tokio::test]
+    async fn the_defined_address_families_still_parse_with_the_port_the_frame_carries() {
+        let (mut server, _client) = conn_carrying(&[0x01, 0xbb, 0x01, 127, 0, 0, 1]).await;
+        assert_eq!(
+            read_addr_port(&mut *server).await.expect("0x01 is ipv4"),
+            Socksaddr::from_ip(IpAddr::V4(Ipv4Addr::LOCALHOST), 443)
+        );
+
+        let (mut server, _client) = conn_carrying(&[0x00, 0x35, 0x02, 3, b'a', b'.', b'b']).await;
+        assert_eq!(read_addr_port(&mut *server).await.expect("0x02 is fqdn"), Socksaddr::fqdn("a.b", 53));
+
+        let (mut server, _client) =
+            conn_carrying(&[0x00, 0x35, 0x03, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1]).await;
+        assert_eq!(
+            read_addr_port(&mut *server).await.expect("0x03 is ipv6"),
+            Socksaddr::from_ip(IpAddr::V6(Ipv6Addr::LOCALHOST), 53)
+        );
     }
 }
