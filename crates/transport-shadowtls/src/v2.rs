@@ -299,22 +299,17 @@ fn poll_read_capped(
     buf: &mut ReadBuf<'_>,
     cap_len: usize,
 ) -> Poll<io::Result<usize>> {
-    // The underlying read writes directly into the caller's
-    // slice; `ReadBuf` offers no safe way to hand `poll_read` a capped sub-view of `buf` itself
-    // (`ReadBuf::take` requires `unsafe fn assume_init` to report the bytes back to `buf`, and
-    // `unsafe` is denied crate-wide), so the capped read lands in an owned scratch buffer and is
-    // copied into `buf` with the safe `put_slice`.
     let max = cap_len.min(buf.remaining());
-    let mut scratch = vec![0u8; max];
-    let mut scratch_buf = ReadBuf::new(&mut scratch);
-    let result = Pin::new(conn.as_mut()).poll_read(cx, &mut scratch_buf);
-    let n = scratch_buf.filled().len();
-    if let Some(read) = scratch.get(..n) {
-        buf.put_slice(read);
-    }
+    let (result, filled) = {
+        let out = buf.initialize_unfilled_to(max);
+        let mut sub = ReadBuf::new(out);
+        let result = Pin::new(conn.as_mut()).poll_read(cx, &mut sub);
+        (result, sub.filled().len())
+    };
+    buf.advance(filled);
     match result {
         Poll::Pending => Poll::Pending,
-        Poll::Ready(Ok(())) => Poll::Ready(Ok(n)),
+        Poll::Ready(Ok(())) => Poll::Ready(Ok(filled)),
         Poll::Ready(Err(err)) => Poll::Ready(Err(err)),
     }
 }
@@ -701,5 +696,103 @@ mod tests {
             io::ErrorKind::BrokenPipe,
             "the conn must stay torn so no later write ever puts a fresh record after the already-sent partial one"
         );
+    }
+
+    /// Hands out a scripted byte stream and records every read it is offered: the byte count and
+    /// the address of the region those bytes would land in.
+    struct ScriptedConn {
+        data: Vec<u8>,
+        offset: usize,
+        reads: Arc<Mutex<Vec<(usize, usize)>>>,
+    }
+
+    impl AsyncRead for ScriptedConn {
+        fn poll_read(self: Pin<&mut Self>, _cx: &mut Context<'_>, buf: &mut ReadBuf<'_>) -> Poll<io::Result<()>> {
+            let this = self.get_mut();
+            let asked = buf.remaining();
+
+            let take = asked.min(this.data.len().saturating_sub(this.offset));
+            let end = this.offset.saturating_add(take);
+            let chunk =
+                this.data.get(this.offset..end).ok_or_else(|| io::Error::other("scripted read past the end"))?;
+            this.offset = end;
+            buf.put_slice(chunk);
+            this.reads.lock().push((asked, buf.filled().as_ptr().addr()));
+            Poll::Ready(Ok(()))
+        }
+    }
+
+    impl AsyncWrite for ScriptedConn {
+        fn poll_write(self: Pin<&mut Self>, _cx: &mut Context<'_>, buf: &[u8]) -> Poll<io::Result<usize>> {
+            Poll::Ready(Ok(buf.len()))
+        }
+
+        fn poll_flush(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+            Poll::Ready(Ok(()))
+        }
+
+        fn poll_shutdown(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+            Poll::Ready(Ok(()))
+        }
+    }
+
+    impl NetConn for ScriptedConn {
+        fn local_addr(&self) -> io::Result<Box<dyn Addr>> {
+            Ok(Box::new(TcpAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 1)))
+        }
+
+        fn remote_addr(&self) -> io::Result<Box<dyn Addr>> {
+            Ok(Box::new(TcpAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 2)))
+        }
+
+        fn close(&self) -> io::Result<()> {
+            Ok(())
+        }
+    }
+
+    /// A record read is capped by both the record's remaining length and the caller's buffer, and
+    /// the capped read writes into the caller's own buffer rather than into a scratch copy of it.
+    #[tokio::test]
+    async fn a_record_read_is_capped_and_lands_in_the_callers_buffer() {
+        let payload = b"v2 payload";
+        let mut wire = Vec::with_capacity(TLS_HEADER_SIZE + payload.len());
+        wire.push(APPLICATION_DATA);
+        wire.extend_from_slice(&[3, 3]);
+        wire.extend_from_slice(&u16::try_from(payload.len()).expect("the payload fits a record").to_be_bytes());
+        wire.extend_from_slice(payload);
+
+        let reads = Arc::new(Mutex::new(Vec::new()));
+        let mut conn = ShadowConn::new(Box::new(ScriptedConn { data: wire, offset: 0, reads: Arc::clone(&reads) }));
+
+        let mut small = [0u8; 8];
+        let caller = small.as_ptr().addr()..small.as_ptr().addr().saturating_add(small.len());
+        let waker = std::task::Waker::noop();
+        let mut cx = Context::from_waker(waker);
+
+        let mut received = Vec::new();
+        for _ in 0..payload.len().div_ceil(small.len()) {
+            let mut buf = ReadBuf::new(&mut small);
+            match Pin::new(&mut conn).poll_read(&mut cx, &mut buf) {
+                Poll::Ready(Ok(())) => received.extend_from_slice(buf.filled()),
+                other @ (Poll::Ready(_) | Poll::Pending) => {
+                    panic!("every read of a complete record must be ready, got {other:?}")
+                }
+            }
+        }
+
+        assert_eq!(received, payload, "the record payload did not arrive whole");
+        let reads = reads.lock().clone();
+        let asked: Vec<usize> = reads.iter().map(|(asked, _)| *asked).collect();
+        assert_eq!(
+            asked,
+            vec![TLS_HEADER_SIZE, 8, 2],
+            "the reads were not capped by the header, the caller's buffer and the record's remainder"
+        );
+        for (asked, target) in reads.iter().skip(1) {
+            assert!(
+                caller.contains(target),
+                "the read of {asked} bytes was handed a region outside the caller's buffer"
+            );
+        }
     }
 }
