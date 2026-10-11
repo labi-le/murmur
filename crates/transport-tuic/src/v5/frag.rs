@@ -295,7 +295,7 @@ mod tests {
 
         frag_write_native(&conn, packet, &mut buf, 5).await.expect("the fragments are sent");
 
-        let sent = conn.0.lock();
+        let sent = conn.0.lock().clone();
         assert_eq!(sent.len(), 3);
         let mut payloads = Vec::new();
         for (index, frame) in sent.iter().enumerate() {
