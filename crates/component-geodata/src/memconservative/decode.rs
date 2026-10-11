@@ -121,10 +121,10 @@ fn emit_bytes<F: Read + Seek>(mut f: F, code: &str) -> Result<Vec<u8>, DecodeErr
         read_full(&mut reader, &mut name)?;
 
         let prefix_length = 1 + length_bytes.len() as u64 + code_length;
+        if length < prefix_length || length - prefix_length > remaining_bytes(&mut reader, file_len)? {
+            return Err(FailedToReadExpectedLenBytes);
+        }
         if String::from_utf8_lossy(&name).eq_ignore_ascii_case(code) {
-            if length < prefix_length || length - prefix_length > remaining_bytes(&mut reader, file_len)? {
-                return Err(FailedToReadExpectedLenBytes);
-            }
             let result_length = usize::try_from(length).map_err(|_| FailedToReadExpectedLenBytes)?;
             let mut result = vec![0u8; result_length];
             let mut n = 0;
@@ -144,7 +144,7 @@ fn emit_bytes<F: Read + Seek>(mut f: F, code: &str) -> Result<Vec<u8>, DecodeErr
             return Ok(result);
         }
 
-        let offset = length.cast_signed() - prefix_length.cast_signed();
+        let offset = i64::try_from(length - prefix_length).map_err(|_| FailedToReadExpectedLenBytes)?;
         reader.seek_relative(offset).map_err(|_| FailedToReadBytes)?;
     }
 }
@@ -191,5 +191,23 @@ mod tests {
         let file = vec![0x0A, 0x06, 0x0A, 0x02, b'c', b'n', 0x12, 0x00];
         let decoded = emit_bytes(Cursor::new(file), "cn").unwrap();
         assert_eq!(decoded, vec![0x0A, 0x02, b'c', b'n', 0x12, 0x00]);
+    }
+
+    #[test]
+    fn a_non_matching_record_shorter_than_its_header_is_rejected_on_the_skip_path() {
+        // Record length 0 with code name `xy`: a skip must not walk backwards into the record.
+        let file = vec![0x0A, 0x00, 0x0A, 0x02, b'x', b'y'];
+        let err = emit_bytes(Cursor::new(file), "cn").unwrap_err();
+        assert!(matches!(err, FailedToReadExpectedLenBytes), "got {err}");
+    }
+
+    #[test]
+    fn a_non_matching_record_with_an_overflowing_length_is_rejected_on_the_skip_path() {
+        // A `u64::MAX` length whose signed subtraction would go negative.
+        let mut file = vec![0x0A];
+        file.extend([0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0x01]);
+        file.extend([0x0A, 0x02, b'x', b'y']);
+        let err = emit_bytes(Cursor::new(file), "cn").unwrap_err();
+        assert!(matches!(err, FailedToReadExpectedLenBytes), "got {err}");
     }
 }
