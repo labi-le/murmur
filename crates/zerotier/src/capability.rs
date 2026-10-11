@@ -309,7 +309,8 @@ mod tests {
         let network_id = controller_identity.address().uint64() << 24 | 0x1234;
         let mut capability = chain(&controller_identity, &holder, &recipient, network_id);
         capability.raw.clear();
-        let (parsed, _) = Capability::parse(&capability.append_binary(Vec::new()).expect("the capability encodes")).unwrap();
+        let (parsed, _) =
+            Capability::parse(&capability.append_binary(Vec::new()).expect("the capability encodes")).unwrap();
 
         let identity_for =
             |address: Address| (address == controller_identity.address()).then(|| controller_identity.clone());
@@ -329,7 +330,8 @@ mod tests {
         let signed = capability.signed_data().expect("the capability encodes");
         capability.custody[0].signature = impostor.sign(&signed).expect("impostor signs");
 
-        let (parsed, _) = Capability::parse(&capability.append_binary(Vec::new()).expect("the capability encodes")).unwrap();
+        let (parsed, _) =
+            Capability::parse(&capability.append_binary(Vec::new()).expect("the capability encodes")).unwrap();
         let identities = [(impostor.address(), impostor.clone()), (recipient.address(), recipient.clone())];
         let identity_for = |address: Address| {
             identities.iter().find(|(known, _)| *known == address).map(|(_, identity)| identity.clone())
@@ -374,9 +376,11 @@ mod tests {
     /// A rule value the length byte cannot carry must be refused, not truncated.
     #[test]
     fn a_rule_value_longer_than_a_u8_is_refused_by_the_encoder() {
-        let mut capability = Capability::default();
-        capability.max_custody_chain_length = 1;
-        capability.rules = vec![NetworkRule { rule_type: RULE_MATCH_IP_PROTOCOL, value: vec![0u8; 256] }];
+        let capability = Capability {
+            max_custody_chain_length: 1,
+            rules: vec![NetworkRule { rule_type: RULE_MATCH_IP_PROTOCOL, value: vec![0u8; 256] }],
+            ..Default::default()
+        };
 
         assert_eq!(capability.append_binary(Vec::new()), Err(InvalidCapability));
     }
@@ -384,9 +388,11 @@ mod tests {
     /// A rule count beyond the protocol's limit must be refused too.
     #[test]
     fn more_rules_than_the_protocol_allows_are_refused_by_the_encoder() {
-        let mut capability = Capability::default();
-        capability.max_custody_chain_length = 1;
-        capability.rules = vec![NetworkRule { rule_type: RULE_ACTION_ACCEPT, value: Vec::new() }; MAX_CAPABILITY_RULES + 1];
+        let capability = Capability {
+            max_custody_chain_length: 1,
+            rules: vec![NetworkRule { rule_type: RULE_ACTION_ACCEPT, value: Vec::new() }; MAX_CAPABILITY_RULES + 1],
+            ..Default::default()
+        };
 
         assert_eq!(capability.append_binary(Vec::new()), Err(InvalidCapability));
     }

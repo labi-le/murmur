@@ -167,9 +167,7 @@ impl CertificateOfOwnership {
             && !self.issued_to.is_zero()
             && self.signed_by == controller(self.network_id)
             && controller_identity.address() == self.signed_by
-            && self
-                .signed_data()
-                .is_ok_and(|data| controller_identity.verify(&data, &self.signature))
+            && self.signed_data().is_ok_and(|data| controller_identity.verify(&data, &self.signature))
     }
 
     /// Whether this certificate claims `mac`.
@@ -288,7 +286,8 @@ mod tests {
             signature: [0u8; SIGNATURE_SIZE],
             raw: Vec::new(),
         };
-        certificate.signature = controller_identity.sign(&certificate.signed_data().expect("the certificate encodes")).expect("signs");
+        certificate.signature =
+            controller_identity.sign(&certificate.signed_data().expect("the certificate encodes")).expect("signs");
 
         let mut raw = Vec::new();
         raw.extend_from_slice(&network_id.to_be_bytes());
@@ -362,10 +361,7 @@ mod tests {
     fn re_serialization_is_byte_stable() {
         let controller_identity = Identity::generate();
         let certificate = issue(&controller_identity, Identity::generate().address());
-        assert_eq!(
-            certificate.append_binary(Vec::new()).expect("the certificate encodes"),
-            certificate.bytes()
-        );
+        assert_eq!(certificate.append_binary(Vec::new()).expect("the certificate encodes"), certificate.bytes());
     }
 
     #[test]
