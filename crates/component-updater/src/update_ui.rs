@@ -7,7 +7,8 @@
 //! A `tokio::sync::Mutex` (not `parking_lot`) guards the download, which awaits network I/O while
 //! the lock is held.
 
-use std::path::{Path, PathBuf};
+use std::io::Read as _;
+use std::path::Path;
 use std::sync::Arc;
 
 use anyhow::{anyhow, Result};
@@ -16,7 +17,7 @@ use arc_swap::ArcSwapOption;
 use murmur_constant::path::{join_ui_path, PATH};
 use murmur_log::{debugln, errorln, infoln, warnln};
 
-use super::utils::download_for_bytes;
+use super::utils::{download_for_bytes, in_dest, BoundedReader, MAX_UNPACKED_FILE_SIZE};
 
 #[derive(Debug)]
 pub struct UIUpdater {
@@ -211,7 +212,7 @@ fn unzip(data: &[u8], dest: &Path) -> Result<()> {
         }
         let mode = entry.unix_mode().map_or(0o644, |mode| mode & 0o777);
         let mut file_data = Vec::new();
-        std::io::Read::read_to_end(&mut entry, &mut file_data)?;
+        BoundedReader::new(&mut entry, MAX_UNPACKED_FILE_SIZE).read_to_end(&mut file_data)?;
         write_file_mode(&fpath, &file_data, mode)?;
     }
 
@@ -240,7 +241,7 @@ fn untgz(data: &[u8], dest: &Path) -> Result<()> {
                 std::fs::create_dir_all(parent)?;
             }
             let mut file_data = Vec::new();
-            std::io::Read::read_to_end(&mut entry, &mut file_data)?;
+            BoundedReader::new(&mut entry, MAX_UNPACKED_FILE_SIZE).read_to_end(&mut file_data)?;
             write_file_mode(&fpath, &file_data, mode & 0o777)?;
         }
     }
@@ -255,33 +256,6 @@ fn extract(data: &[u8], dest: &Path) -> Result<()> {
         CompressionType::Zip => unzip(data, dest),
         CompressionType::TarGzip => untgz(data, dest),
         CompressionType::Unknown => Err(anyhow!("unknown or unsupported file type")),
-    }
-}
-
-fn lexical_clean(path: &Path) -> PathBuf {
-    let mut out: Vec<std::path::Component<'_>> = Vec::new();
-    for component in path.components() {
-        match component {
-            std::path::Component::ParentDir => match out.last() {
-                Some(std::path::Component::Normal(_)) => {
-                    out.pop();
-                }
-                _ => out.push(component),
-            },
-            std::path::Component::CurDir => {}
-            std::path::Component::Prefix(_) | std::path::Component::RootDir | std::path::Component::Normal(_) => {
-                out.push(component);
-            }
-        }
-    }
-    let mut buf = PathBuf::new();
-    for component in out {
-        buf.push(component.as_os_str());
-    }
-    if buf.as_os_str().is_empty() {
-        PathBuf::from(".")
-    } else {
-        buf
     }
 }
 
@@ -406,15 +380,6 @@ mod walkdir_entry {
     }
 }
 
-fn in_dest(fpath: &Path, dest: &Path) -> bool {
-    let cleaned_fpath = lexical_clean(fpath);
-    let cleaned_dest = lexical_clean(dest);
-    match cleaned_fpath.strip_prefix(&cleaned_dest) {
-        Ok(rel) => rel.components().next() != Some(std::path::Component::ParentDir) && !rel.is_absolute(),
-        Err(_) => false,
-    }
-}
-
 fn write_file_mode(path: &Path, data: &[u8], mode: u32) -> std::io::Result<()> {
     #[cfg(unix)]
     {
@@ -432,7 +397,7 @@ fn write_file_mode(path: &Path, data: &[u8], mode: u32) -> std::io::Result<()> {
 
 #[cfg(test)]
 mod tests {
-    use std::io::Write as _;
+    use std::io::{Read as _, Write as _};
 
     use super::{install_ui_updater, new_ui_updater, ui_updater, untgz, unzip};
     use murmur_constant::path::PATH;
@@ -559,5 +524,66 @@ mod tests {
         let err = updater.download_ui().await.expect_err("a closed port fails");
         let text = err.to_string();
         assert!(text.starts_with(&format!("can't download file: Get \"{url}\": ")), "{text}");
+    }
+
+    fn build_zip_of_zeros(entry: &str, len: usize) -> Vec<u8> {
+        let mut buf = Vec::new();
+        {
+            let mut writer = zip::ZipWriter::new(std::io::Cursor::new(&mut buf));
+            let options = zip::write::SimpleFileOptions::default();
+            writer.start_file(entry, options).expect("start_file");
+            let chunk = vec![0u8; 64 * 1024];
+            let mut written = 0;
+            while written < len {
+                let n = (len - written).min(chunk.len());
+                writer.write_all(&chunk[..n]).expect("write_all");
+                written += n;
+            }
+            writer.finish().expect("finish");
+        }
+        buf
+    }
+
+    fn build_targz_of_zeros(entry: &str, len: usize) -> Vec<u8> {
+        let mut tar_bytes = Vec::new();
+        {
+            let mut builder = tar::Builder::new(&mut tar_bytes);
+            let mut header = tar::Header::new_gnu();
+            header.set_size(len as u64);
+            header.set_mode(0o644);
+            let name_bytes = entry.as_bytes();
+            header.as_mut_bytes()[0..name_bytes.len()].copy_from_slice(name_bytes);
+            header.set_cksum();
+            builder.append(&header, std::io::repeat(0).take(len as u64)).expect("append");
+            builder.finish().expect("finish");
+        }
+        let mut encoder = flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::fast());
+        encoder.write_all(&tar_bytes).expect("gzip write");
+        encoder.finish().expect("gzip finish")
+    }
+
+    /// Both extractors read a member whole: without the cap on the decoder, a few KiB of archive
+    /// inflates past 256 MiB into memory.
+    #[test]
+    fn extract_stops_a_member_that_inflates_past_the_unpack_cap() {
+        use super::MAX_UNPACKED_FILE_SIZE;
+
+        let dest = std::env::temp_dir().join(format!("murmur-extract-bomb-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dest);
+        std::fs::create_dir_all(&dest).expect("create dest");
+
+        let bomb = build_zip_of_zeros("index.html", MAX_UNPACKED_FILE_SIZE + 1024 * 1024);
+        assert!(bomb.len() < MAX_UNPACKED_FILE_SIZE / 100, "the zip bomb is {} bytes", bomb.len());
+        let err = unzip(&bomb, &dest).expect_err("a bomb must fail closed");
+        assert!(err.to_string().contains("MAX_UNPACKED_FILE_SIZE"), "{err}");
+        assert!(!dest.join("index.html").exists(), "a rejected entry must not be written");
+
+        let bomb = build_targz_of_zeros("index.html", MAX_UNPACKED_FILE_SIZE + 1024 * 1024);
+        assert!(bomb.len() < MAX_UNPACKED_FILE_SIZE / 100, "the tar.gz bomb is {} bytes", bomb.len());
+        let err = untgz(&bomb, &dest).expect_err("a bomb must fail closed");
+        assert!(err.to_string().contains("MAX_UNPACKED_FILE_SIZE"), "{err}");
+        assert!(!dest.join("index.html").exists(), "a rejected entry must not be written");
+
+        let _ = std::fs::remove_dir_all(&dest);
     }
 }

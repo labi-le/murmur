@@ -8,6 +8,7 @@
 //! the async HTTP download. Zip unpacking uses the pinned `zip` crate.
 
 use std::collections::HashMap;
+use std::io::Read as _;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
@@ -21,7 +22,7 @@ use murmur_constant::version::VERSION;
 use murmur_constant_features::{AMD64_LEVEL, ARM_VERSION, MIPS_FLOAT};
 use murmur_log::{debugln, errorln, infoln, warnln};
 
-use crate::utils::in_dest;
+use crate::utils::{in_dest, BoundedReader, MAX_UNPACKED_FILE_SIZE};
 
 const BASE_RELEASE_URL: &str = "https://github.com/labi-le/murmur/releases/latest/download/";
 const VERSION_RELEASE_URL: &str = "https://github.com/labi-le/murmur/releases/latest/download/version.txt";
@@ -365,7 +366,8 @@ fn gz_file_unpack(gzfile: &Path, out_dir: &Path, file_mode: u32) -> Result<PathB
 
     let mut wc = open_write_mode(&output_name, file_mode)
         .map_err(|err| anyhow!("os.OpenFile({}): {err}", output_name.display()))?;
-    std::io::copy(&mut gz_reader, &mut wc).map_err(|err| anyhow!("copy: {err}"))?;
+    let mut decoder = BoundedReader::new(&mut gz_reader, MAX_UNPACKED_FILE_SIZE);
+    std::io::copy(&mut decoder, &mut wc).map_err(|err| anyhow!("copy: {err}"))?;
 
     Ok(output_name)
 }
@@ -386,7 +388,9 @@ fn zip_file_unpack(zipfile: &Path, out_dir: &Path, file_mode: u32) -> Result<Pat
     let base_name = Path::new(&name).file_name().map_or_else(|| name.clone(), |s| s.to_string_lossy().into_owned());
     let output_name = out_dir.join(&base_name);
     let mut data = Vec::new();
-    std::io::Read::read_to_end(&mut zf, &mut data).map_err(|err| anyhow!("copy: {err}"))?;
+    BoundedReader::new(&mut zf, MAX_UNPACKED_FILE_SIZE)
+        .read_to_end(&mut data)
+        .map_err(|err| anyhow!("copy: {err}"))?;
     write_file_mode(&output_name, &data, file_mode).map_err(|err| anyhow!("os.OpenFile(): {err}"))?;
 
     Ok(output_name)
@@ -424,7 +428,7 @@ mod tests {
     use std::io::Write as _;
     use std::path::PathBuf;
 
-    use super::unpack;
+    use super::{unpack, MAX_PACKAGE_FILE_SIZE, MAX_UNPACKED_FILE_SIZE};
 
     fn test_dir(name: &str) -> PathBuf {
         let dir = std::env::temp_dir().join(format!("murmur-{name}-{}", std::process::id()));
@@ -445,6 +449,23 @@ mod tests {
             written += n;
         }
         encoder.finish().expect("gzip finish")
+    }
+
+    fn zip_of(entry: &str, len: usize) -> Vec<u8> {
+        let mut buf = Vec::new();
+        {
+            let mut writer = zip::ZipWriter::new(std::io::Cursor::new(&mut buf));
+            writer.start_file(entry, zip::write::SimpleFileOptions::default()).expect("start_file");
+            let chunk = vec![0u8; 64 * 1024];
+            let mut written = 0;
+            while written < len {
+                let n = (len - written).min(chunk.len());
+                writer.write_all(&chunk[..n]).expect("zip write");
+                written += n;
+            }
+            writer.finish().expect("finish");
+        }
+        buf
     }
 
     #[test]
@@ -468,6 +489,43 @@ mod tests {
         std::fs::write(&package, gzip("murmur-linux-amd64", 16)).expect("write package");
         unpack(&out, &package, 0o644).expect("a plain name still unpacks");
         assert_eq!(16, std::fs::metadata(out.join("murmur-linux-amd64")).expect("unpacked file").len());
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn unpack_stops_a_gzip_that_inflates_past_the_unpack_cap() {
+        let root = test_dir("gz-unpack-bomb");
+        let out = root.join("meta-update");
+        std::fs::create_dir_all(&out).expect("create update dir");
+        let package = out.join("murmur-linux-amd64-1.0.gz");
+
+        let bomb = gzip("murmur-linux-amd64", MAX_UNPACKED_FILE_SIZE + 1024 * 1024);
+        assert!(bomb.len() < MAX_PACKAGE_FILE_SIZE, "the bomb is {} compressed bytes", bomb.len());
+        std::fs::write(&package, &bomb).expect("write package");
+
+        let err = unpack(&out, &package, 0o644).expect_err("a bomb must fail closed");
+        assert!(err.to_string().contains("MAX_UNPACKED_FILE_SIZE"), "{err}");
+        let written = std::fs::metadata(out.join("murmur-linux-amd64")).expect("the partial file").len();
+        assert!(written <= MAX_UNPACKED_FILE_SIZE as u64, "{written} bytes were written past the cap");
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn unpack_stops_a_zip_entry_that_inflates_past_the_unpack_cap() {
+        let root = test_dir("zip-unpack-bomb");
+        let out = root.join("meta-update");
+        std::fs::create_dir_all(&out).expect("create update dir");
+        let package = out.join("murmur-linux-amd64-1.0.zip");
+
+        let bomb = zip_of("murmur-linux-amd64", MAX_UNPACKED_FILE_SIZE + 1024 * 1024);
+        assert!(bomb.len() < MAX_PACKAGE_FILE_SIZE, "the bomb is {} compressed bytes", bomb.len());
+        std::fs::write(&package, &bomb).expect("write package");
+
+        let err = unpack(&out, &package, 0o644).expect_err("a bomb must fail closed");
+        assert!(err.to_string().contains("MAX_UNPACKED_FILE_SIZE"), "{err}");
+        assert!(!out.join("murmur-linux-amd64").exists(), "a rejected entry must not be written");
 
         let _ = std::fs::remove_dir_all(&root);
     }
