@@ -70,10 +70,7 @@ impl ReadInner {
             self.id_shared.store(u16::from_be_bytes(self.id), Ordering::SeqCst);
 
             // The status read also ignores the read amount here.
-            #[expect(
-                clippy::unused_io_amount,
-                reason = "the status read deliberately ignores how many bytes arrived"
-            )]
+            #[expect(clippy::unused_io_amount, reason = "the status read deliberately ignores how many bytes arrived")]
             self.conn.read(&mut self.status).await?;
 
             let opcode = self.status[0];
