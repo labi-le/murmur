@@ -70,24 +70,7 @@ impl IpReader {
 
             DatabaseType::MetaV0 => {
                 let record: serde_json::Value = lookup_or_default(&self.reader, ip_address);
-                match record {
-                    serde_json::Value::String(record) => vec![record],
-                    serde_json::Value::Array(record) => {
-                        let mut result = Vec::with_capacity(record.len());
-                        for item in record {
-                            #[expect(
-                                clippy::expect_used,
-                                reason = "a Meta-geoip0 record holds strings, so a non-string item means the database itself is malformed"
-                            )]
-                            result.push(item.as_str().expect("a Meta-geoip0 record item is a string").to_owned());
-                        }
-                        result
-                    }
-                    serde_json::Value::Null
-                    | serde_json::Value::Bool(_)
-                    | serde_json::Value::Number(_)
-                    | serde_json::Value::Object(_) => Vec::new(),
-                }
+                meta_v0_codes(&record)
             }
         }
     }
@@ -122,6 +105,19 @@ impl AsnReader {
     }
 }
 
+fn meta_v0_codes(record: &serde_json::Value) -> Vec<String> {
+    match record {
+        serde_json::Value::String(record) => vec![record.clone()],
+        serde_json::Value::Array(record) => {
+            record.iter().filter_map(serde_json::Value::as_str).map(str::to_owned).collect()
+        }
+        serde_json::Value::Null
+        | serde_json::Value::Bool(_)
+        | serde_json::Value::Number(_)
+        | serde_json::Value::Object(_) => Vec::new(),
+    }
+}
+
 /// A failed or missing lookup leaves the result at its zero value.
 fn lookup_or_default<T: DeserializeOwned + Default>(reader: &Reader<Vec<u8>>, ip: &IpAddr) -> T {
     // The lookup normalizes a 4-in-6 address before walking the tree.
@@ -135,5 +131,29 @@ fn lookup_or_default<T: DeserializeOwned + Default>(reader: &Reader<Vec<u8>>, ip
     match result.decode::<T>() {
         Ok(Some(value)) => value,
         Ok(None) | Err(_) => T::default(),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::meta_v0_codes;
+
+    #[test]
+    fn a_meta_v0_string_record_yields_its_code() {
+        let record = serde_json::json!("cn");
+        assert_eq!(meta_v0_codes(&record), vec!["cn".to_owned()]);
+    }
+
+    #[test]
+    fn a_meta_v0_array_skips_non_string_items_instead_of_panicking() {
+        let record = serde_json::json!(["cn", 7, true, null, ["nested"], { "a": 1 }]);
+        assert_eq!(meta_v0_codes(&record), vec!["cn".to_owned()]);
+    }
+
+    #[test]
+    fn a_meta_v0_scalar_record_yields_no_codes() {
+        assert!(meta_v0_codes(&serde_json::json!(42)).is_empty());
+        assert!(meta_v0_codes(&serde_json::Value::Null).is_empty());
+        assert!(meta_v0_codes(&serde_json::json!({ "a": 1 })).is_empty());
     }
 }
