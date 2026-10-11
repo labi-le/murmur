@@ -56,6 +56,7 @@ impl<T> std::fmt::Debug for PoolInner<T> {
 }
 
 impl<T> PoolInner<T> {
+    // NOT cancel-safe: a pool miss ends in the fallback factory, whose already-started connection a dropped call abandons.
     pub async fn get_context(&self, ctx: CancellationToken) -> anyhow::Result<T> {
         let now = Utc::now();
         loop {
@@ -109,11 +110,12 @@ impl<T> std::fmt::Debug for Pool<T> {
 }
 
 impl<T> Pool<T> {
-    // cancel-safe: pure delegation to `PoolInner::get_context`, which owns the pool state.
+    // NOT cancel-safe: pure delegation to PoolInner::get_context, whose pool miss abandons the connection the factory has started opening.
     pub async fn get_context(&self, ctx: CancellationToken) -> anyhow::Result<T> {
         self.pool.get_context(ctx).await
     }
 
+    // NOT cancel-safe: pure delegation to PoolInner::get, whose pool miss abandons the connection the factory has started opening.
     pub async fn get(&self) -> anyhow::Result<T> {
         self.pool.get().await
     }
