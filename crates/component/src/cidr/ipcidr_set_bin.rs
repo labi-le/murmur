@@ -10,6 +10,10 @@ const MAX_RANGES: usize = 1 << 24;
 impl IpCidrSet {
     /// The wire format is unchanged.
     pub async fn write_bin<W: AsyncWrite + Unpin>(&self, w: &mut W) -> Result<()> {
+        if self.rr.is_empty() {
+            return Err(anyhow!("empty ip cidr set"));
+        }
+
         w.write_all(&[1]).await?;
 
         let length = i64::try_from(self.rr.len()).map_err(|_| anyhow!("length is invalid"))?;
@@ -61,14 +65,12 @@ mod tests {
     use tokio::io::AsyncWriteExt;
 
     use super::read_ip_cidr_set;
-    use crate::cidr::ipcidr_set::addr_as16;
+    use crate::cidr::ipcidr_set::{addr_as16, IpCidrSet};
 
     async fn stream_of(ranges: &[(Ipv4Addr, Ipv4Addr)]) -> Vec<u8> {
         let mut buf = Vec::new();
         buf.write_all(&[1]).await.expect("version byte");
-        buf.write_all(&i64::try_from(ranges.len()).expect("count fits").to_be_bytes())
-            .await
-            .expect("count");
+        buf.write_all(&i64::try_from(ranges.len()).expect("count fits").to_be_bytes()).await.expect("count");
         for (from, to) in ranges {
             buf.write_all(&addr_as16(IpAddr::V4(*from))).await.expect("range start");
             buf.write_all(&addr_as16(IpAddr::V4(*to))).await.expect("range end");
@@ -109,5 +111,30 @@ mod tests {
         let err = read_ip_cidr_set(&mut stream.as_slice()).await.expect_err("implausible count");
 
         assert!(err.to_string().contains("exceeds the maximum"), "{err}");
+    }
+
+    #[tokio::test]
+    async fn an_empty_set_is_refused_instead_of_written_as_a_stream_the_reader_rejects() {
+        let mut stream: Vec<u8> = Vec::new();
+
+        let err = IpCidrSet::new_ip_cidr_set().write_bin(&mut stream).await.err().expect("empty set");
+
+        assert!(stream.is_empty(), "the writer must not emit a partial stream");
+        assert!(err.to_string().contains("empty ip cidr set"), "{err}");
+    }
+
+    #[tokio::test]
+    async fn a_non_empty_set_round_trips_through_the_writer_and_the_reader() {
+        let mut set = IpCidrSet::new_ip_cidr_set();
+        set.add_ip_cidr_for_string("10.0.0.0/8").expect("valid cidr");
+        set.add_ip_cidr_for_string("192.168.0.0/16").expect("valid cidr");
+        let mut stream: Vec<u8> = Vec::new();
+        set.write_bin(&mut stream).await.expect("non-empty set");
+
+        let restored = read_ip_cidr_set(&mut stream.as_slice()).await.expect("valid stream");
+
+        assert_eq!(restored.rr, set.rr);
+        assert!(restored.is_contain_for_string("10.1.2.3"));
+        assert!(restored.is_contain_for_string("192.168.1.1"));
     }
 }
