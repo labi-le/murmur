@@ -208,16 +208,6 @@ pub(crate) enum ComputeOutcome<V> {
     Delete,
 }
 
-/// The read-only load lookups a write path runs first.
-enum LoadLookup<V> {
-    /// The key was found, with its value.
-    Found(V),
-    /// The key is absent, and the caller is `LoadOp::AndDelete`.
-    Missing,
-    /// The write path has to decide the operation.
-    Proceed,
-}
-
 /// What a write path's bucket scan decided.
 enum Scan<K, V> {
     /// The operation finished in place; this is the value `do_compute` returns.
@@ -490,14 +480,6 @@ impl<K: MapKey, V> Map<K, V> {
                 continue 'compute_attempt;
             };
 
-            if load_op != LoadOp::None {
-                match Self::lookup(rootb, &key, tag_word, load_op) {
-                    LoadLookup::Found(value) => return (Some(value), true),
-                    LoadLookup::Missing => return (None, false),
-                    LoadLookup::Proceed => {}
-                }
-            }
-
             let mut chain = rootb.chain.lock();
             // The following two checks must go in reverse to what's
             // in the resize method.
@@ -532,7 +514,14 @@ impl<K: MapKey, V> Map<K, V> {
                     }
                     return (Some(oldv), !compute_only);
                 }
-                Scan::Absent(key, emptyb, emptyidx) => (key, emptyb, emptyidx),
+                Scan::Absent(key, emptyb, emptyidx) => {
+                    if load_op == LoadOp::AndDelete {
+                        // Nothing to delete, and a delete never grows the table.
+                        drop(chain);
+                        return (None, false);
+                    }
+                    (key, emptyb, emptyidx)
+                }
             };
             key = scanned_key;
             if emptyb.is_none() {
@@ -552,37 +541,6 @@ impl<K: MapKey, V> Map<K, V> {
             drop(chain);
             table.add_size(bidx, 1);
             return (Some(new_value), compute_only);
-        }
-    }
-
-    /// The read-only lookup the load operations run before the write path.
-    fn lookup(rootb: &BucketChain<K, V>, key: &K, tag_word: u64, load_op: LoadOp) -> LoadLookup<V>
-    where
-        V: Clone,
-    {
-        let chain = rootb.chain.lock();
-        for b in chain.iter() {
-            let metaw = b.meta;
-            let mut markedw = mark_zero_bytes(metaw ^ tag_word) & META_MASK;
-            while markedw != 0 {
-                let idx = first_marked_byte_index(markedw);
-                markedw &= markedw - 1;
-                let Some(e) = b.entries.get(idx).and_then(Option::as_ref) else {
-                    continue;
-                };
-                if e.key == *key {
-                    if load_op == LoadOp::OrCompute {
-                        return LoadLookup::Found(e.value.clone());
-                    }
-                    return LoadLookup::Proceed;
-                }
-            }
-        }
-        drop(chain);
-        if load_op == LoadOp::AndDelete {
-            LoadLookup::Missing
-        } else {
-            LoadLookup::Proceed
         }
     }
 
@@ -3168,9 +3126,9 @@ mod tests {
     #[test]
     fn test_map_load_or_compute_concurrent_existing_key() {
         // This test attempts to cover the race condition where:
-        // 1. LoadOrCompute's fast path doesn't find the key
+        // 1. LoadOrCompute scans the bucket and finds no entry for the key
         // 2. Another task inserts the key
-        // 3. LoadOrCompute acquires the lock and finds the key
+        // 3. LoadOrCompute's insert lands on top of it
         const NUM_ITERS: i32 = 1000;
         for _ in 0..NUM_ITERS {
             let m = Arc::new(Map::<i32, i32>::new(&[]));

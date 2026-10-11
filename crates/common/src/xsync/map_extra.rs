@@ -16,7 +16,7 @@ impl<K: MapKey, V: Clone> Map<K, V> {
     /// complexity to existing code.
     #[expect(
         clippy::expect_used,
-        reason = "the `OrCompute` path returns a stored value on every branch: the present-key fast path clones the existing one, and a `Cancel` outcome is only reached once a value is already stored"
+        reason = "the `OrCompute` path returns a stored value on every branch: `scan` hands back the value of a present key, and a `Cancel` outcome is only reached once a value is already stored"
     )]
     pub fn load_or_store_fn(&self, key: K, mut value_fn: impl FnMut() -> V) -> (V, bool) {
         let (actual, loaded) = self.do_compute(
