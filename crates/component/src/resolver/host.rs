@@ -3,7 +3,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::LazyLock;
 
 use anyhow::{anyhow, Result};
-use rand::Rng;
+use rand::seq::IndexedRandom;
 
 use crate::resolver::hosts::hosts::lookup_static_host;
 use murmur_component_trie::domain::DomainTrie;
@@ -147,7 +147,37 @@ impl HostValue {
         if self.is_domain {
             return Err(anyhow!("value type is error"));
         }
-        let index = rand::rng().random_range(0..self.ips.len());
-        self.ips.get(index).copied().ok_or_else(|| anyhow!("ip list is empty"))
+        self.ips.choose(&mut rand::rng()).copied().ok_or_else(|| anyhow!("ip list is empty"))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn rand_ip_reports_an_empty_list_instead_of_panicking() {
+        let value = HostValue { is_domain: false, ips: Vec::new(), domain: String::new() };
+
+        let err = value.rand_ip().expect_err("an empty ip list is an error");
+
+        assert!(err.to_string().contains("ip list is empty"), "{err}");
+    }
+
+    #[test]
+    fn rand_ip_of_a_single_address_is_that_address() {
+        let ip: IpAddr = "10.0.0.7".parse().expect("valid ip");
+        let value = HostValue::by_ips(vec![ip]).expect("non-empty ip list");
+
+        assert_eq!(value.rand_ip().expect("one address"), ip);
+    }
+
+    #[test]
+    fn rand_ip_of_a_domain_value_reports_the_type_error() {
+        let value = HostValue::by_domain("example.com").expect("valid domain");
+
+        let err = value.rand_ip().expect_err("a domain value has no ip");
+
+        assert!(err.to_string().contains("value type is error"), "{err}");
     }
 }
