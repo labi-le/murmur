@@ -600,6 +600,8 @@ impl ZeroTier {
     /// Starts the runtime, retried per call rather than latched, so a transient bind failure does
     /// not poison the outbound.
     pub(crate) async fn start(&self) -> Result<()> {
+        // NOT cancel-safe: it delegates to `start_runtime`, whose spawned runtime thread outlives a
+        // dropped future.
         if self.ctx.is_cancelled() || self.shared.state.lock().closed {
             return Err(anyhow!("{OUTBOUND_CLOSED}"));
         }
@@ -681,8 +683,9 @@ impl ZeroTier {
     /// Ensures the runtime is started. The explicit network retry is folded into the runtime loop,
     /// which retries the configuration the node keeps re-requesting.
     pub(crate) async fn ensure_started(&self, ctx: &CancellationToken) -> Result<()> {
-        // cancel-safe: it only samples the shared state, and the notification channel it subscribes
-        // to outlives the call.
+        // NOT cancel-safe: it delegates to `start`, which reaches a runtime thread a dropped future
+        // leaves unreachable. The wait below is the safe half: it only samples the shared state,
+        // and the notification channel it subscribes to outlives the call.
         self.start().await?;
         let mut notifications = self.shared.state_tx.subscribe();
         loop {
