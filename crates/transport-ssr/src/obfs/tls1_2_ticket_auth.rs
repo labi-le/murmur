@@ -71,17 +71,18 @@ impl Tls12Ticket {
         buf.put_slice(&low_u32(ntp::time::now().timestamp()).to_be_bytes());
         tools::buf_pool::append_rand_bytes(buf, 18);
         let start = buf.len() - 22;
-        let mac = self.hmac_sha1(buf.get(start..).unwrap_or_default());
+        let mac = self.hmac_sha1(&self.auth_data.client_id, buf.get(start..).unwrap_or_default());
         buf.put_slice(&mac);
     }
 
-    /// HMAC-SHA1 over the key and client id, truncated to its wire length.
-    fn hmac_sha1(&self, data: &[u8]) -> Vec<u8> {
+    /// HMAC-SHA1 over `Key || clientID`, truncated to its wire length. `client_id` is the id the
+    /// MAC belongs to, which is the local one when signing and the peer's when verifying.
+    fn hmac_sha1(&self, client_id: &[u8; 32], data: &[u8]) -> Vec<u8> {
         let key_length = self.base.key.len();
         let mut key = pool::get(key_length + 32);
-        let (base_key, client_id) = key.split_at_mut(key_length);
+        let (base_key, key_id) = key.split_at_mut(key_length);
         base_key.copy_from_slice(&self.base.key);
-        client_id.copy_from_slice(&self.auth_data.client_id);
+        key_id.copy_from_slice(client_id);
         let mut sha1_data = tools::crypto::hmac_sha1(&key, data);
         pool::put(key).ok();
         sha1_data.truncate(tools::crypto::HMAC_SHA1_LEN);
@@ -189,7 +190,7 @@ impl Tls12TicketConn {
 
             buf.put_slice(&[0x14, 3, 3, 0, 1, 1, 0x16, 3, 3, 0, 0x20]);
             tools::buf_pool::append_rand_bytes(&mut buf, 22);
-            let mac = self.ticket.hmac_sha1(&buf);
+            let mac = self.ticket.hmac_sha1(&self.ticket.auth_data.client_id, &buf);
             buf.put_slice(&mac);
             buf.put_slice(&self.send_buf);
             self.send_buf.clear();
@@ -380,8 +381,14 @@ impl AsyncRead for Tls12TicketConn {
             let head_data = scratch.get(11..33).unwrap_or_default();
             let tail_mac = scratch.get(n - 10..n).unwrap_or_default();
             let body = scratch.get(..n - 10).unwrap_or_default();
-            let hmac_ok = constant_time_eq(head_mac, &this.ticket.hmac_sha1(head_data))
-                && constant_time_eq(tail_mac, &this.ticket.hmac_sha1(body));
+            // The peer signed with the id it put on the wire, so verification must use that id and
+            // never the local one, which no peer can know.
+            let Ok(peer_id) = <[u8; 32]>::try_from(scratch.get(44..76).unwrap_or_default()) else {
+                pool::put(scratch).ok();
+                return Poll::Ready(Err(io::Error::other(ErrTLS12TicketAuthTooShortData)));
+            };
+            let hmac_ok = constant_time_eq(head_mac, &this.ticket.hmac_sha1(&peer_id, head_data))
+                && constant_time_eq(tail_mac, &this.ticket.hmac_sha1(&peer_id, body));
             if !hmac_ok {
                 pool::put(scratch).ok();
                 return Poll::Ready(Err(io::Error::other(ErrTLS12TicketAuthHMACError)));
@@ -459,6 +466,10 @@ fn pack_sni_data(buf: &mut BytesMut, u: &str) {
 
 #[cfg(test)]
 mod tests {
+    use std::future::{Future as _, poll_fn};
+    use std::net::{IpAddr, Ipv4Addr, SocketAddr};
+    use std::task::Waker;
+
     use super::*;
 
     /// A TLS handshake record head (`0x17 0x03 0x03`) and the big-endian payload length.
@@ -484,6 +495,150 @@ mod tests {
             base: Base { key: b"0123456789abcdef".to_vec(), ..Default::default() },
             auth_data: AuthData { client_id: [0x42u8; 32] },
         };
-        assert_eq!(hex::encode(ticket.hmac_sha1(b"hello world")), "d609b10a5348cf2ab529");
+        assert_eq!(hex::encode(ticket.hmac_sha1(&ticket.auth_data.client_id, b"hello world")), "d609b10a5348cf2ab529");
+    }
+
+    const PEER_ID: [u8; 32] = [0x11; 32];
+    const LOCAL_ID: [u8; 32] = [0x22; 32];
+
+    struct DuplexConn(tokio::io::DuplexStream);
+
+    impl AsyncRead for DuplexConn {
+        fn poll_read(self: Pin<&mut Self>, cx: &mut Context<'_>, buf: &mut ReadBuf<'_>) -> Poll<io::Result<()>> {
+            Pin::new(&mut self.get_mut().0).poll_read(cx, buf)
+        }
+    }
+
+    impl AsyncWrite for DuplexConn {
+        fn poll_write(self: Pin<&mut Self>, cx: &mut Context<'_>, buf: &[u8]) -> Poll<io::Result<usize>> {
+            Pin::new(&mut self.get_mut().0).poll_write(cx, buf)
+        }
+
+        fn poll_flush(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+            Pin::new(&mut self.get_mut().0).poll_flush(cx)
+        }
+
+        fn poll_shutdown(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+            Pin::new(&mut self.get_mut().0).poll_shutdown(cx)
+        }
+    }
+
+    impl Stream for DuplexConn {
+        fn local_addr(&self) -> io::Result<SocketAddr> {
+            Ok(SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 0))
+        }
+
+        fn peer_addr(&self) -> io::Result<SocketAddr> {
+            Ok(SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 0))
+        }
+    }
+
+    fn ticket_conn(raw: tokio::io::DuplexStream, base: &Base, client_id: [u8; 32]) -> Tls12TicketConn {
+        Tls12TicketConn {
+            conn: Box::new(DuplexConn(raw)),
+            ticket: Tls12Ticket { base: base.clone(), auth_data: AuthData { client_id } },
+            handshake_status: 0,
+            decoded: BytesMut::new(),
+            under_decoded: BytesMut::new(),
+            send_buf: BytesMut::new(),
+            queue: VecDeque::new(),
+            queue_written: 0,
+            queue_error: None,
+            caller_pending: false,
+            caller_result: 0,
+        }
+    }
+
+    /// `HMAC-SHA1(key || clientID)` over `data`, truncated to its wire length.
+    fn mac(key: &[u8], client_id: &[u8; 32], data: &[u8]) -> Vec<u8> {
+        let mut full_key = key.to_vec();
+        full_key.extend_from_slice(client_id);
+        let mut mac = tools::crypto::hmac_sha1(&full_key, data);
+        mac.truncate(tools::crypto::HMAC_SHA1_LEN);
+        mac
+    }
+
+    /// A handshake record in the shape the reader checks: a 9-byte TLS head, `[3, 3]`, the 22-byte
+    /// auth body and its 10-byte MAC, `0x20`, the sender's 32-byte id, a payload, and a 10-byte
+    /// trailing MAC over everything before it. `mac_id` keys both MACs, `wire_id` is transmitted.
+    fn peer_hello(key: &[u8], mac_id: &[u8; 32], wire_id: &[u8; 32]) -> Vec<u8> {
+        let mut auth = vec![0x5a; 22];
+        let head_mac = mac(key, mac_id, &auth);
+        auth.extend_from_slice(&head_mac);
+        let mut record = vec![0x16, 3, 1, 0, 0, 1, 0, 0, 0, 3, 3];
+        record.extend_from_slice(&auth);
+        record.push(0x20);
+        record.extend_from_slice(wire_id);
+        record.extend_from_slice(&[0xa5; 16]);
+        let tail_mac = mac(key, mac_id, &record);
+        record.extend_from_slice(&tail_mac);
+        record
+    }
+
+    /// The writer puts its own id at bytes 44..76 and MACs the 22 auth bytes at 11..33 with
+    /// `key || own id`, which is exactly the material the peer's reader has to verify with.
+    #[tokio::test]
+    async fn writer_puts_its_own_client_id_where_the_peer_reader_keys_it() {
+        let (raw, mut peer) = tokio::io::duplex(65_536);
+        let base = Base { key: b"0123456789abcdef".to_vec(), ..Default::default() };
+        let mut conn = ticket_conn(raw, &base, LOCAL_ID);
+
+        assert_eq!(poll_fn(|cx| Pin::new(&mut conn).poll_write(cx, b"")).await.unwrap(), 0);
+
+        let mut out = [0u8; 4096];
+        let mut rb = ReadBuf::new(&mut out);
+        poll_fn(|cx| Pin::new(&mut peer).poll_read(cx, &mut rb)).await.unwrap();
+        let hello = rb.filled();
+        assert!(hello.len() > 76, "the hello is {} bytes", hello.len());
+        assert_eq!(hello.get(44..76), Some(&LOCAL_ID[..]));
+        let expected = mac(&base.key, &LOCAL_ID, hello.get(11..33).unwrap_or_default());
+        assert_eq!(hello.get(33..43), Some(&expected[..]));
+    }
+
+    /// A peer whose id differs from this instance's own is accepted, because the MACs it signed
+    /// with the id it transmits are the ones verified. The single `poll_read` ends `Pending` only
+    /// after the handshake verified and this side answered with its own hello.
+    #[tokio::test]
+    async fn handshake_keyed_with_the_transmitted_client_id_is_accepted() {
+        let base = Base { key: b"0123456789abcdef".to_vec(), ..Default::default() };
+        let (mut peer, raw) = tokio::io::duplex(65_536);
+        let mut local = ticket_conn(raw, &base, LOCAL_ID);
+        let hello = peer_hello(&base.key, &PEER_ID, &PEER_ID);
+        assert_eq!(poll_fn(|cx| Pin::new(&mut peer).poll_write(cx, &hello)).await.unwrap(), hello.len());
+
+        let first = read_once(&mut local);
+        assert!(matches!(first, Poll::Pending), "the peer's handshake must verify, got {first:?}");
+
+        let mut answered = [0u8; 4096];
+        let mut arb = ReadBuf::new(&mut answered);
+        poll_fn(|cx| Pin::new(&mut peer).poll_read(cx, &mut arb)).await.unwrap();
+        assert!(!arb.filled().is_empty(), "the verified handshake was not answered");
+    }
+
+    /// MACs keyed with anything else than the id the record carries are rejected, so a record
+    /// signed with an id this side never received fails closed.
+    #[tokio::test]
+    async fn handshake_keyed_with_a_different_id_is_rejected() {
+        let base = Base { key: b"0123456789abcdef".to_vec(), ..Default::default() };
+        let (mut peer, raw) = tokio::io::duplex(65_536);
+        let mut local = ticket_conn(raw, &base, LOCAL_ID);
+        let hello = peer_hello(&base.key, &LOCAL_ID, &PEER_ID);
+        assert_eq!(poll_fn(|cx| Pin::new(&mut peer).poll_write(cx, &hello)).await.unwrap(), hello.len());
+
+        let first = read_once(&mut local);
+        let Poll::Ready(Err(err)) = first else {
+            panic!("a handshake keyed with an id it does not carry must fail closed, got {first:?}");
+        };
+        let cause = err.get_ref().and_then(|cause| cause.downcast_ref::<ErrTLS12TicketAuthHMACError>());
+        assert!(cause.is_some(), "{err}");
+    }
+
+    /// Polls `conn`'s read once, which is enough to tell a verified handshake that now waits for
+    /// the peer from one that the verifier rejected.
+    fn read_once(conn: &mut Tls12TicketConn) -> Poll<io::Result<()>> {
+        let mut out = [0u8; 4096];
+        let mut rb = ReadBuf::new(&mut out);
+        let mut read = std::pin::pin!(poll_fn(|cx| Pin::new(&mut *conn).poll_read(cx, &mut rb)));
+        read.as_mut().poll(&mut Context::from_waker(Waker::noop()))
     }
 }
