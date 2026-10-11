@@ -26,6 +26,12 @@ jobs:
   audit:
     name: cargo-audit
     runs-on: ubuntu-latest
+    # audit-check publishes its findings through the check-run and issue APIs,
+    # which the default token does not reach.
+    permissions:
+      contents: read
+      checks: write
+      issues: write
     steps:
       - uses: actions/checkout@v6
         with:
