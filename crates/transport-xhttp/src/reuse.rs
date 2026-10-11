@@ -208,10 +208,7 @@ impl ReuseManager {
         transport: Arc<dyn RoundTripper>,
         now: Instant,
     ) -> Arc<ReuseEntry> {
-        #[expect(
-            clippy::cast_possible_truncation,
-            reason = "the draw is stored in an i32, truncating a larger value"
-        )]
+        #[expect(clippy::cast_possible_truncation, reason = "the draw is stored in an i32, truncating a larger value")]
         let left_requests =
             if self.h_max_request_times.max > 0 { self.h_max_request_times.rand() as i32 } else { (1i32 << 30) - 1 };
         let unreusable_at = if self.h_max_reusable_secs.max > 0 {
@@ -219,10 +216,7 @@ impl ReuseManager {
         } else {
             None
         };
-        #[expect(
-            clippy::cast_possible_truncation,
-            reason = "the draw is stored in an i32, truncating a larger value"
-        )]
+        #[expect(clippy::cast_possible_truncation, reason = "the draw is stored in an i32, truncating a larger value")]
         let max_reuse_times = if self.c_max_reuse_times.max > 0 { self.c_max_reuse_times.rand() as i32 } else { 0 };
 
         let entry = Arc::new(ReuseEntry {
