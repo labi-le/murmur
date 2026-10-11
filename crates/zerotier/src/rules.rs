@@ -887,7 +887,7 @@ impl NetworkConfigData {
         } else {
             match find_tag(&context.local_tags, id, self, false) {
                 Some(tag) => tag.value == expected,
-                None => false,
+                None => not_applicable,
             }
         }
     }
@@ -1338,6 +1338,73 @@ mod tests {
         let mut outbound = context();
         outbound.local_tags = vec![local];
         assert!(config.allows_frame(&frame(ETHER_TYPE_IPV4, 20), outbound));
+    }
+
+    /// A NOT-flagged tag rule does not apply to a tag the network never issued.
+    #[test]
+    fn a_not_flagged_tag_rule_does_not_apply_to_an_absent_local_tag() {
+        let config = NetworkConfigData {
+            rules: vec![
+                NetworkRule {
+                    rule_type: RULE_MATCH_TAG_SENDER | RULE_FLAG_NOT,
+                    value: vec![0, 0, 0, 9, 0, 0, 0, 42],
+                },
+                NetworkRule { rule_type: RULE_ACTION_ACCEPT, value: Vec::new() },
+                NetworkRule { rule_type: RULE_ACTION_DROP, value: Vec::new() },
+            ],
+            ..Default::default()
+        };
+        let mut context = context();
+        context.local_tags = vec![tag(7, 42, 0)];
+
+        assert!(
+            !config.allows_frame(&frame(ETHER_TYPE_IPV4, 20), context),
+            "an unissued tag leaves the rule inapplicable, so the NOT flag must not make it match"
+        );
+    }
+
+    /// The same rule with the tag present compares the value in both directions.
+    #[test]
+    fn a_not_flagged_tag_rule_compares_a_present_local_tag() {
+        let config = NetworkConfigData {
+            rules: vec![
+                NetworkRule {
+                    rule_type: RULE_MATCH_TAG_SENDER | RULE_FLAG_NOT,
+                    value: vec![0, 0, 0, 7, 0, 0, 0, 42],
+                },
+                NetworkRule { rule_type: RULE_ACTION_ACCEPT, value: Vec::new() },
+                NetworkRule { rule_type: RULE_ACTION_DROP, value: Vec::new() },
+            ],
+            ..Default::default()
+        };
+        let mut equal = context();
+        equal.local_tags = vec![tag(7, 42, 0)];
+        assert!(!config.allows_frame(&frame(ETHER_TYPE_IPV4, 20), equal), "the value matches, so the NOT rule does not");
+
+        let mut different = context();
+        different.local_tags = vec![tag(7, 7, 0)];
+        assert!(
+            config.allows_frame(&frame(ETHER_TYPE_IPV4, 20), different),
+            "the value differs, so the NOT rule matches"
+        );
+    }
+
+    /// A plain tag rule matches a present tag and leaves an absent one inapplicable.
+    #[test]
+    fn a_plain_tag_rule_matches_only_a_present_local_tag() {
+        let config = NetworkConfigData {
+            rules: vec![
+                NetworkRule { rule_type: RULE_MATCH_TAG_SENDER, value: vec![0, 0, 0, 7, 0, 0, 0, 42] },
+                NetworkRule { rule_type: RULE_ACTION_ACCEPT, value: Vec::new() },
+                NetworkRule { rule_type: RULE_ACTION_DROP, value: Vec::new() },
+            ],
+            ..Default::default()
+        };
+        let mut present = context();
+        present.local_tags = vec![tag(7, 42, 0)];
+        assert!(config.allows_frame(&frame(ETHER_TYPE_IPV4, 20), present));
+
+        assert!(!config.allows_frame(&frame(ETHER_TYPE_IPV4, 20), context()));
     }
 
     /// The reference keeps remote credentials in an id -> tag map whose entry is the newest
