@@ -120,8 +120,7 @@ mod tests {
 
         let err = read_domain_map_bin(&mut stream.as_slice(), |_: &[u8]| -> Result<Option<(u64, usize)>> { Ok(None) })
             .await
-            .err()
-            .expect("implausible value count");
+            .expect_err("implausible value count");
 
         assert!(err.to_string().contains("exceeds the maximum"), "{err}");
     }
