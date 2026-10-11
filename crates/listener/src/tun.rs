@@ -205,6 +205,28 @@ fn reject_unsupported(config: &TunConfig) -> Result<()> {
         "generic segmentation offload needs the virtio-net header and a stack that reassembles it",
     )?;
     reject_flag(
+        "gso-max-size",
+        config.gso_max_size != 0,
+        "it sizes the batched writes `gso` would enable, and this build writes one packet per call",
+    )?;
+    reject_flag(
+        "recvmsgx",
+        config.recvmsgx,
+        "it selects the batched recvmsg read path, and this build reads one packet per call",
+    )?;
+    reject_flag(
+        "sendmsgx",
+        config.sendmsgx,
+        "it selects the batched sendmsg write path, and this build writes one packet per call",
+    )?;
+    if !matches!(config.processors_per_channel, 0 | 1) {
+        bail!(
+            "tun `processors-per-channel` is not supported at {}: parallel per-channel workers would need a device reader this \
+             build does not have, and its single reader and writer per device are one processor per channel (see README)",
+            config.processors_per_channel
+        );
+    }
+    reject_flag(
         "strict-route",
         config.strict_route,
         "it adds unreachable rules for the address families the TUN has no address in",
@@ -559,10 +581,29 @@ mod tests {
             ("iproute2-rule-index", TunConfig { iproute2_rule_index: 9000, ..base.clone() }),
             ("udp-timeout", TunConfig { udp_timeout: 60, ..base.clone() }),
             ("icmp-timeout", TunConfig { icmp_timeout: 30, ..base.clone() }),
+            ("recvmsgx", TunConfig { recvmsgx: true, ..base.clone() }),
+            ("sendmsgx", TunConfig { sendmsgx: true, ..base.clone() }),
+            ("gso-max-size", TunConfig { gso_max_size: 65536, ..base.clone() }),
+            ("processors-per-channel", TunConfig { processors_per_channel: 2, ..base.clone() }),
         ] {
             let err = reject_unsupported(&patch).expect_err("option must be refused").to_string();
             assert!(err.contains(name), "the refusal must name `{name}`, got: {err}");
         }
+    }
+
+    /// The unset value of each of those four options asks for exactly what this build does, so
+    /// refusing it would turn every config that leaves it alone into a startup failure.
+    #[test]
+    fn tun_options_that_match_what_the_port_does_are_accepted() {
+        let base = TunConfig {
+            disable_icmp_forwarding: true,
+            inet4_address: vec!["198.18.0.1/30".parse().unwrap()],
+            ..Default::default()
+        };
+        assert!(reject_unsupported(&base).is_ok(), "unset: single reads and writes, no gso size");
+
+        let one_processor = TunConfig { processors_per_channel: 1, ..base };
+        assert!(reject_unsupported(&one_processor).is_ok(), "one processor per channel is what the port runs");
     }
 
     /// The userspace stack is what `gvisor` and `mips` both name here; `system` and `mixed` need
