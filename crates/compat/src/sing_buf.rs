@@ -216,18 +216,12 @@ where
 }
 
 impl Buffer {
-    #[expect(
-        clippy::indexing_slicing,
-        reason = "an out-of-range frame offset aborts rather than reads a default byte"
-    )]
+    #[expect(clippy::indexing_slicing, reason = "an out-of-range frame offset aborts rather than reads a default byte")]
     pub fn byte(&self, index: usize) -> u8 {
         self.data[self.start + index]
     }
 
-    #[expect(
-        clippy::indexing_slicing,
-        reason = "an out-of-range frame offset aborts rather than drops the write"
-    )]
+    #[expect(clippy::indexing_slicing, reason = "an out-of-range frame offset aborts rather than drops the write")]
     pub fn set_byte(&mut self, index: usize, value: u8) {
         self.data[self.start + index] = value;
     }
