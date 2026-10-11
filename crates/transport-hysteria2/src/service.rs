@@ -874,6 +874,95 @@ mod tests {
         assert_eq!(prefix, vec![0x44, 0x01, 0xAA], "the sniffed bytes have to be replayed in wire order");
     }
 
+    /// The client side of a raw quinn connection to a server whose transport carries `config`; the
+    /// endpoints have to outlive the connection.
+    struct RawPeer {
+        _client_endpoint: quinn::Endpoint,
+        _server_endpoint: quinn::Endpoint,
+        connection: quinn::Connection,
+        _server_connection: quinn::Connection,
+    }
+
+    async fn raw_peer(config: &QuicConfig) -> RawPeer {
+        let crypto = quinn::crypto::rustls::QuicServerConfig::try_from((*server_tls()).clone())
+            .expect("quinn accepts the rustls server config");
+        let mut server_config = quinn::ServerConfig::with_crypto(Arc::new(crypto));
+        server_config.transport_config(Arc::new(transport_config(config, &CongestionOption::default())));
+        let server_endpoint = quinn::Endpoint::server(server_config, "127.0.0.1:0".parse().expect("loopback address"))
+            .expect("bind the server endpoint");
+        let addr = server_endpoint.local_addr().expect("the endpoint has a local address");
+
+        let client_endpoint = quinn::Endpoint::client("127.0.0.1:0".parse().expect("loopback address"))
+            .expect("bind the client endpoint");
+        let crypto = quinn::crypto::rustls::QuicClientConfig::try_from((*client_tls()).clone())
+            .expect("quinn accepts the rustls client config");
+        let connecting = client_endpoint
+            .connect_with(quinn::ClientConfig::new(Arc::new(crypto)), addr, SERVER_NAME)
+            .expect("dial the server");
+        // The server answers the handshake only once the application takes the connection.
+        let accepting = async {
+            server_endpoint
+                .accept()
+                .await
+                .expect("the server endpoint is still accepting")
+                .await
+                .expect("the server handshake completes")
+        };
+        let (connection, server_connection) = futures::join!(connecting, accepting);
+        RawPeer {
+            _client_endpoint: client_endpoint,
+            _server_endpoint: server_endpoint,
+            connection: connection.expect("the client handshake completes"),
+            _server_connection: server_connection,
+        }
+    }
+
+    /// The peer may have in flight exactly the window this session advertises as the initial
+    /// transport parameter — the `initial-*` value, not the `max-*` ceiling the reference grows to.
+    #[tokio::test]
+    async fn a_peer_may_send_bytes_up_to_the_configured_initial_stream_window() {
+        murmur_testsupport_probe::ensure_test_crypto_provider();
+        let config = QuicConfig {
+            initial_stream_receive_window: 4096,
+            max_stream_receive_window: 1_048_576,
+            initial_connection_receive_window: 1_048_576,
+            max_connection_receive_window: 1_048_576,
+            ..QuicConfig::default()
+        }
+        .with_defaults();
+        let peer = raw_peer(&config).await;
+
+        let (mut send, _recv) = peer.connection.open_bi().await.expect("open a stream");
+        let payload = vec![0u8; 4096 + 1024];
+        assert_eq!(
+            send.write(&payload).await.expect("the first write is accepted"),
+            4096,
+            "the configured initial stream window is what the peer may have in flight"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_peer_may_send_bytes_up_to_the_configured_initial_connection_window() {
+        murmur_testsupport_probe::ensure_test_crypto_provider();
+        let config = QuicConfig {
+            initial_stream_receive_window: 1_048_576,
+            max_stream_receive_window: 1_048_576,
+            initial_connection_receive_window: 4096,
+            max_connection_receive_window: 1_048_576,
+            ..QuicConfig::default()
+        }
+        .with_defaults();
+        let peer = raw_peer(&config).await;
+
+        let (mut send, _recv) = peer.connection.open_bi().await.expect("open a stream");
+        let payload = vec![0u8; 4096 + 1024];
+        assert_eq!(
+            send.write(&payload).await.expect("the first write is accepted"),
+            4096,
+            "the configured initial connection window is what the peer may have in flight"
+        );
+    }
+
     #[tokio::test]
     async fn a_client_authenticates_and_carries_a_stream_and_a_datagram() {
         murmur_testsupport_probe::ensure_test_crypto_provider();

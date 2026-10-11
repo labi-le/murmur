@@ -200,7 +200,8 @@ each one names the piece that is still missing rather than ignoring it.
 
 `hysteria2` is implemented: `crates/listener/src/inbound/hysteria2.rs` builds the inbound on
 `murmur-transport-hysteria2`'s `Service`. The option block maps every field, including the
-`realm-opts` block, the four QUIC receive windows and `mux-option`; the TLS layer is built from
+`realm-opts` block, `mux-option` and the two `initial-*` QUIC receive windows, which quinn
+advertises in the handshake; the TLS layer is built from
 `certificate`/`private-key`/`client-auth-*`/`ech-key`/`alpn` (ALPN defaulting to `h3`), obfs
 accepts `salamander` and `gecko` and rejects an unknown type or a missing password with the
 reference's messages, `masquerade` accepts `file://` and `http(s)://` and rejects an unknown scheme,
@@ -211,8 +212,11 @@ payload, a datagram (attributed back to the dialled destination) and a wrong-pas
 carries no traffic. The outbound half is real as well: `crates/adapter-outbound/src/hysteria2.rs` is
 registered in `crates/adapter/src/parser.rs`. What is not implemented: `bbr-profile` is accepted
 but not applied, because quinn binds its congestion controller when the connection is created
-(`crates/transport-hysteria2/src/quic.rs`); everything else the option block carries now runs,
-including `realm-opts`, whose dial half is described next.
+(`crates/transport-hysteria2/src/quic.rs`); the two `max-*` receive windows are accepted but not
+applied either, because quinn's flow-control window is fixed at the value it advertises in the
+handshake and only its connection window can be raised later, through
+`quinn::Connection::set_receive_window` (`crates/transport-hysteria2/src/quic.rs`); everything else
+the option block carries now runs, including `realm-opts`, whose dial half is described next.
 
 `hysteria2-realm` is implemented: `crates/listener/src/hysteria2_realm` carries the realm
 rendezvous service, the `hysteria2-realm` inbound type parses with a required `token` (the schema

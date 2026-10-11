@@ -39,12 +39,14 @@ pub const DEFAULT_KEEP_ALIVE_PERIOD: Duration = Duration::from_secs(10);
 /// The QUIC configuration, restricted to the fields the protocol sets.
 #[derive(Clone, Debug, Default)]
 pub struct QuicConfig {
-    /// Dropped by [`transport_config`]: quinn advertises the configured stream receive window as
-    /// the initial stream limit from the first packet, so the initial window has no knob of its own.
+    /// The per-stream flow-control window quinn advertises at handshake.
     pub initial_stream_receive_window: u64,
+    /// The ceiling the reference grows its stream window to; quinn's is fixed at the initial one.
     pub max_stream_receive_window: u64,
-    /// Dropped by [`transport_config`] for the same reason as [`Self::initial_stream_receive_window`].
+    /// The connection flow-control window quinn advertises at handshake.
     pub initial_connection_receive_window: u64,
+    /// The ceiling the reference grows its connection window to, droppable for the same reason as
+    /// [`Self::max_stream_receive_window`]; only `quinn::Connection::set_receive_window` raises it later.
     pub max_connection_receive_window: u64,
     pub max_idle_timeout: Duration,
     pub keep_alive_period: Duration,
@@ -111,19 +113,22 @@ fn congestion_factory(option: &CongestionOption) -> Arc<dyn quinn::congestion::C
 
 /// The config fields this session maps onto quinn's `TransportConfig`.
 ///
-/// `initial_stream_receive_window` and `initial_connection_receive_window` are dropped: quinn sends
-/// the configured maximums as the connection's initial limits (quinn-proto's `TransportParameters`
-/// fills `initial_max_stream_data_*` and `initial_max_data` from `stream_receive_window` and
-/// `receive_window`), so the two initial windows have no separate knob to land on.
+/// The two `initial_*_receive_window` fields are the flow-control windows quinn advertises in the
+/// handshake and then maintains (quinn-proto's `TransportParameters` fills `initial_max_data` from
+/// `receive_window` and `initial_max_stream_data_{bidi_local,bidi_remote,uni}` from
+/// `stream_receive_window`). The two `max_*` fields are the ceiling the reference grows its window
+/// to as it measures the path; quinn has no counterpart, because its window is the advertised value
+/// for the connection's lifetime — only the connection window can be raised later, through
+/// `quinn::Connection::set_receive_window`.
 #[must_use]
 pub fn transport_config(config: &QuicConfig, congestion: &CongestionOption) -> quinn::TransportConfig {
     let mut transport = quinn::TransportConfig::default();
     transport.max_idle_timeout(quinn::IdleTimeout::try_from(config.max_idle_timeout).ok());
     transport.keep_alive_interval(Some(config.keep_alive_period));
-    if let Some(window) = var_int(config.max_stream_receive_window) {
+    if let Some(window) = var_int(config.initial_stream_receive_window) {
         transport.stream_receive_window(window);
     }
-    if let Some(window) = var_int(config.max_connection_receive_window) {
+    if let Some(window) = var_int(config.initial_connection_receive_window) {
         transport.receive_window(window);
     }
     if config.enable_datagrams {
