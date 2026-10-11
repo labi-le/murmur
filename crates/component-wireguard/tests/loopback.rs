@@ -566,3 +566,66 @@ async fn the_initiator_retries_with_the_cookie_it_was_given() {
     );
     initiator.close().expect("close initiator");
 }
+
+/// A bind that reports its own close, so a test can see that the device task reached its end.
+struct ClosingBind {
+    inner: PipeBind,
+    closed: Arc<tokio::sync::Notify>,
+}
+
+#[async_trait::async_trait]
+impl Bind for ClosingBind {
+    async fn send_to(&self, packet: &[u8], endpoint: SocketAddr) -> std::io::Result<()> {
+        self.inner.send_to(packet, endpoint).await
+    }
+
+    async fn recv_from(&self, buffer: &mut [u8]) -> std::io::Result<(usize, SocketAddr)> {
+        self.inner.recv_from(buffer).await
+    }
+
+    fn local_addr(&self) -> std::io::Result<SocketAddr> {
+        self.inner.local_addr()
+    }
+
+    fn close(&self) -> std::io::Result<()> {
+        self.closed.notify_one();
+        self.inner.close()
+    }
+}
+
+/// The `Tun` holds the only sender into the device task, so dropping it has to stop the device
+/// instead of leaving the loop re-entering on a channel that answers `None` forever.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_dropped_tun_stops_the_device() {
+    let closed = Arc::new(tokio::sync::Notify::new());
+    let peer_endpoint: SocketAddr = "192.0.2.1:51820".parse().expect("addr");
+    let bind = Arc::new(ClosingBind {
+        inner: PipeBind {
+            outbound: Arc::new(Wire::new(Events::default())),
+            inbound: Arc::new(Wire::new(Events::default())),
+            endpoint: peer_endpoint,
+        },
+        closed: Arc::clone(&closed),
+    });
+    let (_device, tun) = Device::new(
+        "dropped".to_owned(),
+        Arc::new(murmur_component_wireguard::bind::ReservedBind::new(bind, [0u8; 3])),
+        DeviceConfig {
+            private_key: StaticKey::from_bytes([0x66; 32]),
+            peers: vec![PeerConfig {
+                public_key: StaticKey::from_bytes([0x77; 32]).public_key(),
+                preshared_key: PresharedKey::zeroed(),
+                endpoint: Some(peer_endpoint),
+                allowed_ips: vec![prefix("10.0.0.0/24")],
+                persistent_keepalive: 0,
+            }],
+            mtu: 1408,
+        },
+    )
+    .expect("device");
+
+    drop(tun);
+    tokio::time::timeout(Duration::from_secs(5), closed.notified())
+        .await
+        .expect("the device task must stop when its tun handle is dropped");
+}

@@ -526,11 +526,12 @@ impl DeviceRun {
                         tokio::time::sleep(Duration::from_millis(300)).await;
                     }
                 },
-                packet = self.tun_rx.recv() => {
-                    if let Some(packet) = packet {
-                        self.handle_tunnel_packet(packet).await;
-                    }
-                }
+                packet = self.tun_rx.recv() => match packet {
+                    Some(packet) => self.handle_tunnel_packet(packet).await,
+                    // The tun handle held the only sender: a closed channel means the stack's
+                    // end of the device is gone.
+                    None => break,
+                },
                 () = timer => self.handle_timers().await,
             }
         }
