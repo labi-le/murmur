@@ -219,6 +219,11 @@ pub(crate) struct VerifiedConn {
     hmac_verify: HmacSha1,
     hmac_ignore: Option<HmacSha1>,
     pending: Vec<u8>,
+    /// The record header, assembled in place rather than in a heap buffer of its own.
+    read_header: [u8; TLS_HEADER_SIZE],
+    /// The frame being assembled: the header copied in once its length is known, then the body
+    /// read into the bytes behind it. Empty between records, because the finished frame is handed
+    /// to the caller by value.
     read_buf: Vec<u8>,
     read_offset: usize,
     read_length_known: bool,
@@ -243,11 +248,23 @@ pub(crate) fn new_verified_conn(
         hmac_verify,
         hmac_ignore,
         pending: Vec::new(),
-        read_buf: vec![0u8; TLS_HEADER_SIZE],
+        read_header: [0u8; TLS_HEADER_SIZE],
+        read_buf: Vec::new(),
         read_offset: 0,
         read_length_known: false,
         write_state: None,
         torn: false,
+    }
+}
+
+/// One inner read reporting how many bytes landed in `dst`, so the caller keeps its own
+/// bookkeeping of the header and the body it has accumulated.
+fn poll_read_into(conn: &mut Box<dyn NetConn>, cx: &mut Context<'_>, dst: &mut [u8]) -> Poll<io::Result<usize>> {
+    let mut buf = ReadBuf::new(dst);
+    match Pin::new(conn.as_mut()).poll_read(cx, &mut buf) {
+        Poll::Pending => Poll::Pending,
+        Poll::Ready(Err(err)) => Poll::Ready(Err(err)),
+        Poll::Ready(Ok(())) => Poll::Ready(Ok(buf.filled().len())),
     }
 }
 
@@ -281,36 +298,49 @@ impl VerifiedConn {
     /// deadline only interrupts the current `Read`.
     fn poll_read_record(&mut self, cx: &mut Context<'_>) -> Poll<io::Result<Vec<u8>>> {
         loop {
-            if self.read_offset < self.read_buf.len() {
-                let Some(unread) = self.read_buf.get_mut(self.read_offset..) else {
+            if self.read_offset < TLS_HEADER_SIZE {
+                let Some(unread) = self.read_header.get_mut(self.read_offset..) else {
                     return Poll::Ready(Err(io::Error::from(io::ErrorKind::UnexpectedEof)));
                 };
-                let mut header_buf = ReadBuf::new(unread);
-                match Pin::new(self.conn.as_mut()).poll_read(cx, &mut header_buf) {
+                match poll_read_into(&mut self.conn, cx, unread) {
                     Poll::Pending => return Poll::Pending,
                     Poll::Ready(Err(err)) => return Poll::Ready(Err(err)),
-                    Poll::Ready(Ok(())) => {
-                        let n = header_buf.filled().len();
-                        if n == 0 {
-                            return Poll::Ready(Err(io::Error::from(io::ErrorKind::UnexpectedEof)));
-                        }
-                        self.read_offset += n;
+                    Poll::Ready(Ok(0)) => {
+                        return Poll::Ready(Err(io::Error::from(io::ErrorKind::UnexpectedEof)));
                     }
+                    Poll::Ready(Ok(n)) => self.read_offset += n,
                 }
                 continue;
             }
             if !self.read_length_known {
-                let Some(length_bytes) = self.read_buf.get(3..TLS_HEADER_SIZE) else {
+                let Some(length_bytes) = self.read_header.get(3..TLS_HEADER_SIZE) else {
                     return Poll::Ready(Err(io::Error::from(io::ErrorKind::UnexpectedEof)));
                 };
                 let length = usize::from(BigEndian::read_u16(length_bytes));
+                self.read_buf.clear();
+                self.read_buf.reserve(TLS_HEADER_SIZE + length);
+                self.read_buf.extend_from_slice(&self.read_header);
                 self.read_buf.resize(TLS_HEADER_SIZE + length, 0);
                 self.read_length_known = true;
                 continue;
             }
+            if self.read_offset < self.read_buf.len() {
+                let Some(unread) = self.read_buf.get_mut(self.read_offset..) else {
+                    return Poll::Ready(Err(io::Error::from(io::ErrorKind::UnexpectedEof)));
+                };
+                match poll_read_into(&mut self.conn, cx, unread) {
+                    Poll::Pending => return Poll::Pending,
+                    Poll::Ready(Err(err)) => return Poll::Ready(Err(err)),
+                    Poll::Ready(Ok(0)) => {
+                        return Poll::Ready(Err(io::Error::from(io::ErrorKind::UnexpectedEof)));
+                    }
+                    Poll::Ready(Ok(n)) => self.read_offset += n,
+                }
+                continue;
+            }
             break;
         }
-        let frame = std::mem::replace(&mut self.read_buf, vec![0u8; TLS_HEADER_SIZE]);
+        let frame = std::mem::take(&mut self.read_buf);
         self.read_offset = 0;
         self.read_length_known = false;
         Poll::Ready(Ok(frame))
@@ -404,7 +434,7 @@ impl AsyncRead for VerifiedConn {
             return Poll::Ready(Ok(()));
         }
         loop {
-            let frame = match this.poll_read_record(cx) {
+            let mut frame = match this.poll_read_record(cx) {
                 Poll::Pending => return Poll::Pending,
                 Poll::Ready(Ok(frame)) => frame,
                 Poll::Ready(Err(err)) => {
@@ -414,14 +444,14 @@ impl AsyncRead for VerifiedConn {
                     return Poll::Ready(Err(err));
                 }
             };
-            match frame.first() {
-                Some(&ALERT) => {
+            match frame.first().copied() {
+                Some(ALERT) => {
                     return Poll::Ready(Err(io::Error::new(
                         io::ErrorKind::ConnectionAborted,
                         "shadow-tls: remote alert: use of closed network connection",
                     )));
                 }
-                Some(&APPLICATION_DATA) => {
+                Some(APPLICATION_DATA) => {
                     if let Some(ignore) = this.hmac_ignore.as_mut() {
                         if verify_application_data(&frame, ignore, false) {
                             continue;
@@ -435,18 +465,21 @@ impl AsyncRead for VerifiedConn {
                             "shadow-tls: application data verification failed",
                         )));
                     }
-                    let Some(payload) = frame.get(TLS_HMAC_HEADER_SIZE..) else {
+                    if frame.len() < TLS_HMAC_HEADER_SIZE {
                         this.send_alert(cx);
                         return Poll::Ready(Err(io::Error::from(io::ErrorKind::UnexpectedEof)));
-                    };
-                    this.pending = payload.to_vec();
+                    }
+                    // The verified frame's buffer *becomes* the pending payload, so a record is
+                    // delivered out of the allocation it was read into instead of a copy of it.
+                    frame.drain(..TLS_HMAC_HEADER_SIZE);
+                    this.pending = frame;
                     if this.pending.is_empty() {
                         continue;
                     }
                     this.deliver_pending(buf);
                     return Poll::Ready(Ok(()));
                 }
-                Some(&other) => {
+                Some(other) => {
                     this.send_alert(cx);
                     return Poll::Ready(Err(io::Error::other(format!(
                         "shadow-tls: unexpected TLS record type: {other}"
@@ -738,6 +771,73 @@ pub(crate) mod tests {
 
         let mut out = vec![0u8; payload.len()];
         verified.read_exact(&mut out).await.expect("read must skip the zero-length record and deliver the next one");
+        assert_eq!(&out, payload);
+    }
+
+    /// Feeds a fixed byte sequence one byte per `poll_read`, so a record's header and body are
+    /// assembled from many inner reads.
+    struct DripConn {
+        data: Vec<u8>,
+        pos: usize,
+    }
+
+    impl AsyncRead for DripConn {
+        fn poll_read(self: Pin<&mut Self>, _cx: &mut Context<'_>, buf: &mut ReadBuf<'_>) -> Poll<io::Result<()>> {
+            let this = self.get_mut();
+            let Some(byte) = this.data.get(this.pos) else {
+                return Poll::Ready(Err(io::Error::from(io::ErrorKind::UnexpectedEof)));
+            };
+            this.pos += 1;
+            buf.put_slice(std::slice::from_ref(byte));
+            Poll::Ready(Ok(()))
+        }
+    }
+
+    impl AsyncWrite for DripConn {
+        fn poll_write(self: Pin<&mut Self>, _cx: &mut Context<'_>, buf: &[u8]) -> Poll<io::Result<usize>> {
+            Poll::Ready(Ok(buf.len()))
+        }
+
+        fn poll_flush(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+            Poll::Ready(Ok(()))
+        }
+
+        fn poll_shutdown(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+            Poll::Ready(Ok(()))
+        }
+    }
+
+    impl NetConn for DripConn {
+        fn local_addr(&self) -> io::Result<Box<dyn Addr>> {
+            Err(io::Error::other("drip conn has no address"))
+        }
+
+        fn remote_addr(&self) -> io::Result<Box<dyn Addr>> {
+            Err(io::Error::other("drip conn has no address"))
+        }
+
+        fn close(&self) -> io::Result<()> {
+            Ok(())
+        }
+    }
+
+    /// The header slot and the frame are filled across as many inner reads as the record has
+    /// bytes; a record that arrives one byte at a time must still be delivered whole.
+    #[tokio::test]
+    async fn verified_conn_reads_a_record_delivered_one_byte_at_a_time() {
+        let mut hmac_state = new_hmac_sha1(TEST_PASSWORD);
+        let payload = b"dripped record payload";
+        let wire = build_verified_record(&mut hmac_state, payload);
+
+        let mut verified = new_verified_conn(
+            Box::new(DripConn { data: wire, pos: 0 }),
+            new_hmac_sha1(TEST_PASSWORD),
+            new_hmac_sha1(TEST_PASSWORD),
+            None,
+        );
+
+        let mut out = vec![0u8; payload.len()];
+        verified.read_exact(&mut out).await.expect("a record arriving one byte at a time must decode");
         assert_eq!(&out, payload);
     }
 
