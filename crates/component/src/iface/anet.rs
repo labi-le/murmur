@@ -613,12 +613,38 @@ fn if_addrs_flags(ifa: &if_addrs::Interface) -> Flags {
     flags
 }
 
-/// Stand-in for the interface listing, of which there is no std equivalent. `if-addrs` reports
-/// one entry per address, so interfaces without addresses are not listed; the MTU, flags and
-/// hardware address come from the same `ifreq` ioctls the rest of the package uses.
-pub(crate) fn net_interfaces() -> anyhow::Result<Vec<Interface>> {
-    let addrs = if_addrs::get_if_addrs()?;
+/// The kernel's link table, which lists every interface including the ones with no address. Linux
+/// and Android expose it as `/sys/class/net`; the platforms without a readable equivalent return
+/// nothing, so the union below is left with the address-shaped entries `if-addrs` provides.
+#[cfg(any(target_os = "linux", target_os = "android"))]
+pub(crate) fn net_link_interfaces() -> anyhow::Result<Vec<Interface>> {
     let mut ift: Vec<Interface> = Vec::new();
+    for entry in std::fs::read_dir("/sys/class/net")? {
+        let entry = entry?;
+        let Some(name) = entry.file_name().to_str().map(str::to_owned) else { continue };
+        let index = std::fs::read_to_string(format!("/sys/class/net/{name}/ifindex"))
+            .ok()
+            .and_then(|raw| raw.trim().parse::<i32>().ok())
+            .unwrap_or(0);
+        let mtu = name_to_mtu(&name).unwrap_or(0);
+        let flags = name_to_flags(&name).unwrap_or_else(|_| Flags::empty());
+        let hardware_addr = name_to_hardware_addr(&name).unwrap_or_default();
+        ift.push(Interface { index, mtu, name, hardware_addr, flags });
+    }
+    Ok(ift)
+}
+
+#[cfg(not(any(target_os = "linux", target_os = "android")))]
+pub(crate) fn net_link_interfaces() -> anyhow::Result<Vec<Interface>> {
+    Ok(Vec::new())
+}
+
+/// Stand-in for the interface listing, of which there is no std equivalent. The kernel's link
+/// table comes first so address-less interfaces are listed; `if-addrs`, which enumerates addresses
+/// rather than interfaces, fills in whatever the link table could not report.
+pub(crate) fn net_interfaces() -> anyhow::Result<Vec<Interface>> {
+    let mut ift = net_link_interfaces()?;
+    let addrs = if_addrs::get_if_addrs()?;
     for ifa in addrs {
         if ift.iter().any(|i| i.name == ifa.name) {
             continue;
@@ -716,5 +742,22 @@ mod tests {
             compared += 1;
         }
         assert!(compared > 0, "no interface could be cross-checked against /sys/class/net");
+    }
+
+    /// An interface with no address is still an interface. `if-addrs` enumerates addresses, so an
+    /// address-less link (a powered-down wifi device, a dummy, a bridge) is dropped before any
+    /// lookup can see it; the listing must cover the kernel's link table instead.
+    #[test]
+    fn network_interfaces_include_links_with_no_address() {
+        let listed: std::collections::HashSet<String> =
+            net_interfaces().expect("interfaces").into_iter().map(|i| i.name).collect();
+        let mut missing = Vec::new();
+        for entry in std::fs::read_dir("/sys/class/net").expect("kernel link table") {
+            let name = entry.expect("entry").file_name().to_string_lossy().into_owned();
+            if !listed.contains(&name) {
+                missing.push(name);
+            }
+        }
+        assert!(missing.is_empty(), "interfaces in the kernel's link table are missing: {missing:?}");
     }
 }
