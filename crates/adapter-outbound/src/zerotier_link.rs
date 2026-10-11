@@ -1223,7 +1223,9 @@ impl Link {
         self.multicast_group_active(group) || self.active_multicast_groups().len() < MAX_MULTICAST_GROUPS
     }
 
-    /// Consumes a Query or a legacy Report, and observes a General Query's interval.
+    /// Consumes a legacy Report (`0x12`) or an IGMPv3 report (`0x16`), and observes a General
+    /// Query's (`0x11`) interval; a Query stays visible to raw L3 listeners, like MLDv1 Done on
+    /// the IPv6 path.
     fn inspect_inbound_ipv4_membership(&mut self, packet: &[u8], now: SystemTime) -> bool {
         let Some(header) = packet.first_chunk::<28>() else {
             return false;
