@@ -46,6 +46,10 @@ pub(crate) struct TunnelServerOptions {
 
 pub(crate) const TUNNEL_HEADER_READ_TIMEOUT: Duration = Duration::from_secs(15);
 
+/// Caps the live session table: `/session` needs no credential, and each entry holds a half-pipe
+/// and a reaper task until `session_ttl` of inactivity, so time alone does not bound the table.
+const MAX_SESSIONS: usize = 1024;
+
 struct TunnelSession {
     read_half: tokio::sync::Mutex<Option<ReadHalf<Box<dyn Stream>>>>,
     write_half: tokio::sync::Mutex<Option<WriteHalf<Box<dyn Stream>>>>,
@@ -1053,7 +1057,9 @@ impl TunnelServer {
         }
 
         let sess = TunnelSession::new(c2);
-        self.sessions.lock().insert(token.clone(), Arc::clone(&sess));
+        if !self.insert_session(token.clone(), Arc::clone(&sess)) {
+            return self.reject_or_reply(raw_conn, header_bytes, buffered, 503, "service unavailable").await;
+        }
 
         {
             let server = Arc::clone(self);
@@ -1124,6 +1130,17 @@ impl TunnelServer {
 
     fn session_has(&self, token: &str) -> bool {
         self.sessions.lock().contains_key(token)
+    }
+
+    /// Reserves a slot in the session table: `false` means [`MAX_SESSIONS`] are already live, and
+    /// the caller must refuse the request rather than grow the table.
+    fn insert_session(&self, token: String, sess: Arc<TunnelSession>) -> bool {
+        let mut sessions = self.sessions.lock();
+        if sessions.len() >= MAX_SESSIONS {
+            return false;
+        }
+        sessions.insert(token, sess);
+        true
     }
 
     fn session_get(&self, token: &str) -> Option<Arc<TunnelSession>> {
@@ -1666,6 +1683,7 @@ const fn status_text(code: u16) -> &'static str {
         410 => "Gone",
         413 => "Request Entity Too Large",
         500 => "Internal Server Error",
+        503 => "Service Unavailable",
         _ => "",
     }
 }
@@ -2378,5 +2396,58 @@ mod tests {
             got, b"GET /x HTTP/1.1\r\nHost: a\r\nX-Partial: yTAIL",
             "the replay must carry every byte the client sent, not just the original 4-byte sniff"
         );
+    }
+
+    #[tokio::test]
+    async fn session_table_refuses_sessions_past_the_cap() {
+        let server = new_tunnel_server(TunnelServerOptions {
+            mode: "auto".to_owned(),
+            session_ttl: Duration::from_secs(120),
+            ..no_op_options()
+        });
+
+        let mut accepted = 0usize;
+        let mut refused = 0usize;
+        let mut tunnels = Vec::new();
+        for _ in 0..(MAX_SESSIONS + 8) {
+            let (mut client, server_conn) = tokio::io::duplex(4096);
+            let server = Arc::clone(&server);
+            let handle = tokio::spawn(async move {
+                let conn: Box<dyn Stream> = Box::new(PipeConn(server_conn));
+                server.handle_conn(conn).await
+            });
+
+            client
+                .write_all(b"GET /session HTTP/1.1\r\nHost: example.com\r\nX-Sudoku-Tunnel: stream\r\n\r\n")
+                .await
+                .expect("write session request");
+
+            let (result, tunnel) = tokio::time::timeout(Duration::from_secs(5), handle)
+                .await
+                .expect("session request must not hang")
+                .expect("handle_conn task")
+                .expect("handle_conn result");
+
+            let mut status = [0u8; 12];
+            client.read_exact(&mut status).await.expect("read session status line");
+            let status = std::str::from_utf8(&status).expect("status line is ASCII");
+
+            match result {
+                HandleResult::StartTunnel(_) => {
+                    assert_eq!(status, "HTTP/1.1 200", "admitted session status");
+                    accepted += 1;
+                    tunnels.push(tunnel.expect("an admitted session carries its tunnel conn"));
+                }
+                HandleResult::Done => {
+                    assert_eq!(status, "HTTP/1.1 503", "refused session status");
+                    refused += 1;
+                }
+                HandleResult::PassThrough => panic!("a /session request must not pass through"),
+            }
+        }
+
+        assert_eq!(accepted, MAX_SESSIONS, "sessions admitted before the cap");
+        assert_eq!(refused, 8, "requests refused once the table was full");
+        assert_eq!(server.sessions.lock().len(), MAX_SESSIONS, "live sessions in the table");
     }
 }
