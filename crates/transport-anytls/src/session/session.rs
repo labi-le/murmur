@@ -372,17 +372,7 @@ impl Session {
                     let _ = pool::put(buffer);
                     return Ok(());
                 }
-                CMD_UPDATE_PADDING_SCHEME if len > 0 => {
-                    let mut raw_scheme = vec![0u8; usize::from(len)];
-                    read_full(&self.conn, &mut raw_scheme).await?;
-                    if self.is_client {
-                        if update_padding_scheme(&raw_scheme, &self.padding) {
-                            debugln!("[Update padding succeed] {}\n", hex::encode(Md5::digest(&raw_scheme)));
-                        } else {
-                            warnln!("[Update padding failed] {}\n", hex::encode(Md5::digest(&raw_scheme)));
-                        }
-                    }
-                }
+                CMD_UPDATE_PADDING_SCHEME if len > 0 => self.recv_padding_scheme_update(len).await?,
                 CMD_HEART_REQUEST => {
                     self.write_control_frame(new_frame(CMD_HEART_RESPONSE, sid)).await?;
                 }
@@ -497,6 +487,21 @@ impl Session {
             }
         }
         let _ = pool::put(buffer);
+        Ok(())
+    }
+
+    /// `CMD_UPDATE_PADDING_SCHEME`: a client follows the scheme it can apply and logs the one it
+    /// cannot; a server ignores the frame.
+    async fn recv_padding_scheme_update(&self, len: u16) -> io::Result<()> {
+        let mut raw_scheme = vec![0u8; usize::from(len)];
+        read_full(&self.conn, &mut raw_scheme).await?;
+        if self.is_client {
+            if update_padding_scheme(&raw_scheme, &self.padding) {
+                debugln!("[Update padding succeed] {}\n", hex::encode(Md5::digest(&raw_scheme)));
+            } else {
+                warnln!("[Update padding failed] {}\n", hex::encode(Md5::digest(&raw_scheme)));
+            }
+        }
         Ok(())
     }
 
