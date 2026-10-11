@@ -191,10 +191,10 @@ pub(crate) mod ip_stack {
         fn read(&self, buffers: &mut [Vec<u8>], sizes: &mut [usize], offset: usize) -> Result<usize>;
         /// The packets received on the tunnel, into the stack.
         fn write(&self, buffers: &[Vec<u8>], offset: usize) -> Result<usize>;
-        /// No Rust outbound reads the stack's MTU or name yet.
-        #[allow(dead_code, reason = "no Rust outbound reads the stack's MTU or name yet")]
+        /// `tun.Device.MTU`, which sizes the stack reader's buffers.
         fn mtu(&self) -> Result<u32>;
-        #[allow(dead_code, reason = "no Rust outbound reads the stack's MTU or name yet")]
+        /// `tun.Device.Name`: no Rust outbound reads it yet.
+        #[allow(dead_code, reason = "no Rust outbound reads the stack's name yet")]
         fn name(&self) -> Result<String>;
         fn batch_size(&self) -> usize;
         fn close(&self) -> Result<()>;
