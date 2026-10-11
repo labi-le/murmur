@@ -415,10 +415,7 @@ mod tests {
                 deadline.set(Some(Utc::now() + TimeDelta::seconds(60)));
             }
             tokio::time::sleep(Duration::from_millis(1)).await;
-            assert!(
-                !deadline.wait().is_closed(),
-                "iteration {i}: a set must win a race with an already-firing timer"
-            );
+            assert!(!deadline.wait().is_closed(), "iteration {i}: a set must win a race with an already-firing timer");
         }
     }
 
