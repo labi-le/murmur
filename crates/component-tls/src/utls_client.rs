@@ -1343,10 +1343,14 @@ impl UtlsClient {
                     Poll::Ready(Ok(())) => {}
                 }
                 let filled = buf.filled().len();
-                if filled == 0 && self.header_filled == 0 {
+                if filled == 0 {
                     return Poll::Ready(Err(io::Error::new(
                         io::ErrorKind::UnexpectedEof,
-                        "tls: peer closed the connection",
+                        if self.header_filled == 0 {
+                            "tls: peer closed the connection"
+                        } else {
+                            "tls: transport ended inside a record header"
+                        },
                     )));
                 }
                 self.header_filled += filled;
@@ -1578,6 +1582,7 @@ impl UtlsClient {
 mod tests {
     use std::collections::VecDeque;
     use std::net::SocketAddr;
+    use std::sync::atomic::{AtomicUsize, Ordering};
     use std::sync::Mutex;
     use std::task::Waker;
     use std::time::Duration;
@@ -1829,6 +1834,78 @@ mod tests {
         fn poll_shutdown(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<io::Result<()>> {
             Poll::Ready(Ok(()))
         }
+    }
+
+    /// A peer that delivers `prefix` and then reports EOF forever. `spin_guard` bounds a reader
+    /// that never yields to the runtime: after that many zero-byte reads the stream itself fails,
+    /// so a spinning implementation fails the test instead of wedging it.
+    struct TruncatedStream {
+        prefix: Mutex<VecDeque<u8>>,
+        zero_reads: AtomicUsize,
+        spin_guard: usize,
+    }
+
+    impl Stream for TruncatedStream {
+        fn local_addr(&self) -> io::Result<SocketAddr> {
+            Ok(SocketAddr::from(([127, 0, 0, 1], 0)))
+        }
+
+        fn peer_addr(&self) -> io::Result<SocketAddr> {
+            Ok(SocketAddr::from(([127, 0, 0, 1], 0)))
+        }
+    }
+
+    impl AsyncRead for TruncatedStream {
+        fn poll_read(self: Pin<&mut Self>, _cx: &mut Context<'_>, buf: &mut ReadBuf<'_>) -> Poll<io::Result<()>> {
+            let this = self.get_mut();
+            let mut prefix = this.prefix.lock().expect("truncated prefix");
+            let take = prefix.len().min(buf.remaining());
+            for _ in 0..take {
+                if let Some(byte) = prefix.pop_front() {
+                    buf.put_slice(&[byte]);
+                }
+            }
+            drop(prefix);
+            if take == 0 && this.zero_reads.fetch_add(1, Ordering::Relaxed) >= this.spin_guard {
+                return Poll::Ready(Err(io::Error::other("test stream: the reader polled past EOF")));
+            }
+            Poll::Ready(Ok(()))
+        }
+    }
+
+    impl AsyncWrite for TruncatedStream {
+        fn poll_write(self: Pin<&mut Self>, _cx: &mut Context<'_>, buf: &[u8]) -> Poll<io::Result<usize>> {
+            Poll::Ready(Ok(buf.len()))
+        }
+
+        fn poll_flush(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+            Poll::Ready(Ok(()))
+        }
+
+        fn poll_shutdown(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+            Poll::Ready(Ok(()))
+        }
+    }
+
+    /// A peer that stops after 1-4 bytes of a record header used to re-enter the read arm with
+    /// nothing to read, spinning inside one `poll` instead of failing.
+    #[tokio::test]
+    async fn a_partial_record_header_before_eof_fails_instead_of_spinning() {
+        let mut client = UtlsClient::new(
+            Arc::new(Config::default()),
+            Arc::new(rustls::crypto::aws_lc_rs::default_provider()),
+            Vec::new(),
+            KeySharePrivateKeys::default(),
+        );
+        let mut stream = TruncatedStream {
+            prefix: Mutex::new(VecDeque::from(vec![0x16, 0x03, 0x03])),
+            zero_reads: AtomicUsize::new(0),
+            spin_guard: 4,
+        };
+
+        let error = client.next_record(&mut stream).await.expect_err("a partial header before EOF must fail");
+        assert_eq!(error.kind(), io::ErrorKind::UnexpectedEof);
+        assert_eq!(error.to_string(), "tls: transport ended inside a record header");
     }
 
     /// The buffered half of `poll_read` must hand out the bytes at `plain_offset` on, not the
