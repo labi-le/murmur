@@ -996,6 +996,13 @@ impl<D: phy::Device> Driver<D> {
         let Self { sockets, entries, .. } = &mut *self;
         for entry in entries.values_mut() {
             loop {
+                // Stop before taking anything out of the socket: the `try_send` below would drop
+                // whatever it could not queue, and for TCP that event is the bytes themselves, so
+                // a chunk smoltcp had handed over would vanish from the stream. A full queue is
+                // the backpressure; the reader notifies the driver once it makes room.
+                if entry.events.capacity() == 0 {
+                    break;
+                }
                 if entry.is_tcp {
                     let tcp: &mut tcp::Socket = sockets.get_mut(entry.handle);
                     if !tcp.may_recv() {
