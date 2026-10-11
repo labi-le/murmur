@@ -315,6 +315,13 @@ pub struct TLS {
     pub custom_trust_cert: Vec<String>,
 }
 
+/// `clash-for-android` config: the Android client's settings carried in the same profile.
+#[derive(Clone, Debug, Default)]
+pub struct ClashForAndroid {
+    pub append_system_dns: bool,
+    pub ui_subtitle_pattern: String,
+}
+
 /// `Config` is the murmur config manager.
 pub struct Config {
     pub general: General,
@@ -335,6 +342,7 @@ pub struct Config {
     pub tunnels: Vec<ListenerTunnel>,
     pub sniffer: SnifferDispatcherConfig,
     pub tls: TLS,
+    pub clash_for_android: ClashForAndroid,
 }
 
 impl std::fmt::Debug for General {
@@ -1219,6 +1227,7 @@ pub async fn parse_raw_config(raw_cfg: RawConfig) -> Result<Config> {
         tunnels,
         sniffer,
         tls,
+        clash_for_android: parse_clash_for_android(&raw_cfg.clash_for_android),
     })
 }
 
@@ -1339,6 +1348,13 @@ fn parse_tls(cfg: &RawConfig) -> TLS {
         client_auth_cert: cfg.tls.client_auth_cert.clone(),
         ech_key: cfg.tls.ech_key.clone(),
         custom_trust_cert: cfg.tls.custom_trust_cert.clone(),
+    }
+}
+
+fn parse_clash_for_android(cfg: &RawClashForAndroid) -> ClashForAndroid {
+    ClashForAndroid {
+        append_system_dns: cfg.append_system_dns,
+        ui_subtitle_pattern: cfg.ui_subtitle_pattern.clone(),
     }
 }
 
@@ -1996,6 +2012,14 @@ fn parse_dns(raw_cfg: &RawConfig, rule_providers: &HashMap<String, Arc<dyn RuleP
     }
     dns_cfg.default_nameserver = parse_name_server(&cfg.default_nameserver, false, cfg.prefer_h3)?;
     validate_default_nameserver(&dns_cfg)?;
+
+    // `clash-for-android.append-system-dns` asks for the device resolver alongside the configured
+    // default nameservers; the port honours it rather than dropping the parsed value.
+    if raw_cfg.clash_for_android.append_system_dns
+        && !dns_cfg.default_nameserver.iter().any(|ns| ns.net == NsNetType::System)
+    {
+        dns_cfg.default_nameserver.extend(parse_name_server(&["system".to_owned()], false, cfg.prefer_h3)?);
+    }
 
     if !cfg.fake_ip_range.is_empty() {
         let fake_ip_range: IpNet = cfg.fake_ip_range.parse()?;
@@ -2832,6 +2856,45 @@ mod tests {
         assert_eq!(dns_cfg.name_server.len(), 2);
         assert_eq!(dns_cfg.name_server[0].net, NsNetType::Https);
         assert_eq!(dns_cfg.name_server[1].net, NsNetType::Tls);
+    }
+
+    /// Bug #104: `clash-for-android.append-system-dns` was parsed but never applied.
+    #[test]
+    fn parse_dns_appends_the_system_resolver_when_clash_for_android_asks_for_it() {
+        let mut raw_cfg = default_raw_config().unwrap();
+        raw_cfg.dns.enable = true;
+        raw_cfg.clash_for_android.append_system_dns = true;
+
+        let dns_cfg = parse_dns(&raw_cfg, &HashMap::new()).unwrap();
+
+        assert!(
+            dns_cfg.default_nameserver.iter().any(|ns| ns.net == NsNetType::System),
+            "`clash-for-android.append-system-dns` must append the system resolver: {:?}",
+            dns_cfg.default_nameserver
+        );
+    }
+
+    #[test]
+    fn append_system_dns_does_not_duplicate_a_configured_system_nameserver() {
+        let mut raw_cfg = default_raw_config().unwrap();
+        raw_cfg.dns.enable = true;
+        raw_cfg.dns.default_nameserver = vec!["system".to_owned(), "1.1.1.1".to_owned()];
+        raw_cfg.clash_for_android.append_system_dns = true;
+
+        let dns_cfg = parse_dns(&raw_cfg, &HashMap::new()).unwrap();
+
+        assert_eq!(dns_cfg.default_nameserver.iter().filter(|ns| ns.net == NsNetType::System).count(), 1);
+    }
+
+    #[test]
+    fn parse_clash_for_android_carries_both_fields_onto_the_runtime_config() {
+        let raw =
+            RawClashForAndroid { append_system_dns: true, ui_subtitle_pattern: "subtitle".to_owned() };
+
+        let got = parse_clash_for_android(&raw);
+
+        assert!(got.append_system_dns);
+        assert_eq!(got.ui_subtitle_pattern, "subtitle");
     }
 
     // With no `nameserver` key the DefaultRawConfig lists are kept, so the default resolvers are
