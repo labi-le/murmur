@@ -423,10 +423,7 @@ pub(crate) fn read_openvpn_string(packet: &[u8], offset: usize) -> Result<(Strin
     Ok((String::from_utf8_lossy(raw).into_owned(), offset + 2 + size))
 }
 
-#[expect(
-    clippy::unnecessary_wraps,
-    reason = "every key-derivation caller propagates the `Result` signature with `?`"
-)]
+#[expect(clippy::unnecessary_wraps, reason = "every key-derivation caller propagates the `Result` signature with `?`")]
 pub(crate) fn openvpn_prf(
     secret: &[u8],
     label: &str,

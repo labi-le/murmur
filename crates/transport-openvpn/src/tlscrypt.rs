@@ -151,10 +151,7 @@ pub(crate) fn clone_bytes(input: &[u8]) -> Vec<u8> {
     input.to_vec()
 }
 
-#[expect(
-    clippy::indexing_slicing,
-    reason = "every caller reads a word it has already bounds-checked"
-)]
+#[expect(clippy::indexing_slicing, reason = "every caller reads a word it has already bounds-checked")]
 pub(crate) fn be_u32(buf: &[u8], offset: usize) -> u32 {
     u32::from_be_bytes([buf[offset], buf[offset + 1], buf[offset + 2], buf[offset + 3]])
 }
