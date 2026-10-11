@@ -212,6 +212,50 @@ pub fn new_quic_stream_conn(
     })
 }
 
+/// A uni stream over a byte slice, shared by the server tests: it hands out `data` and then,
+/// depending on `closes`, ends the stream or stays open.
+#[cfg(test)]
+pub(crate) struct StubUniStream {
+    data: Vec<u8>,
+    pos: usize,
+    closes: bool,
+}
+
+#[cfg(test)]
+impl StubUniStream {
+    pub(crate) fn new(data: Vec<u8>, closes: bool) -> Self {
+        Self { data, pos: 0, closes }
+    }
+}
+
+#[cfg(test)]
+impl AsyncRead for StubUniStream {
+    fn poll_read(self: Pin<&mut Self>, _cx: &mut Context<'_>, buf: &mut ReadBuf<'_>) -> Poll<io::Result<()>> {
+        let this = self.get_mut();
+        let rest = this.data.get(this.pos..).unwrap_or_default();
+        if rest.is_empty() {
+            return if this.closes { Poll::Ready(Ok(())) } else { Poll::Pending };
+        }
+        let n = rest.len().min(buf.remaining());
+        buf.put_slice(&rest[..n]);
+        this.pos += n;
+        Poll::Ready(Ok(()))
+    }
+}
+
+#[cfg(test)]
+impl murmur_quic::ReceiveStream for StubUniStream {
+    fn stream_id(&self) -> murmur_quic::StreamId {
+        0
+    }
+
+    fn cancel_read(&self, _error_code: murmur_quic::StreamErrorCode) {}
+
+    fn set_read_deadline(&self, _deadline: Option<tokio::time::Instant>) -> io::Result<()> {
+        Ok(())
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use std::net::{IpAddr, Ipv4Addr};

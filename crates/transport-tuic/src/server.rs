@@ -11,9 +11,10 @@ use crate::types::type_ as types_type;
 use crate::{v4, v5};
 use murmur_adapter_inbound::addition::Addition;
 use murmur_common::utils::uuid::new_uuid_v4;
-use murmur_common_net::bufconn::{new_buffered_conn, BufioReader};
+use murmur_common_net::bufconn::new_buffered_conn;
 use murmur_common_net::new_extended_conn;
 use murmur_constant::adapters::UDPPacket;
+use murmur_log::warnln;
 use murmur_quic::Config as QuicConfig;
 use murmur_std_compat::net::{Conn as NetConn, PacketConn};
 use murmur_transport::socks5::socks5 as socks5_pkg;
@@ -285,10 +286,10 @@ impl ServerHandler {
         }
     }
 
-    /// The reader refills itself from `stream` on
-    /// demand; this crate's `BufioReader` cannot (see `v4`/`v5` `handle_uni_stream` doc comments), so
-    /// this reads the whole uni-stream message up front before dispatching, since this protocol's
-    /// uni streams always carry exactly one bounded command.
+    /// The handler parses the command straight off the stream, so a command is read whole however
+    /// large it is and a client that leaves the stream open behind it still gets served. The
+    /// version byte, read here to pick the handler, is handed over because the rest of the head
+    /// comes off the same stream.
     async fn handle_uni_stream(&self) -> anyhow::Result<()> {
         let ctx = CancellationToken::new();
         loop {
@@ -296,29 +297,20 @@ impl ServerHandler {
             let v4_handler = self.v4_handler.clone();
             let v5_handler = self.v5_handler.clone();
             tokio::spawn(async move {
-                let mut reader = BufioReader::new();
-                loop {
-                    let free = reader.free_space();
-                    if free.is_empty() {
-                        break;
-                    }
-                    match stream.read(free).await {
-                        Ok(0) | Err(_) => break,
-                        Ok(n) => reader.commit(n),
-                    }
-                }
-
-                let ver = reader.buffered_bytes().first().copied();
-                if let Some(ver) = ver {
-                    if ver == v4::protocol::VER {
-                        if let Some(handler) = v4_handler {
-                            let _ = handler.handle_uni_stream(&mut reader).await;
-                        }
-                    } else if ver == v5::protocol::VER {
-                        if let Some(handler) = v5_handler {
-                            let _ = handler.handle_uni_stream(&mut reader).await;
-                        }
-                    }
+                let result = match stream.read_u8().await {
+                    Ok(ver) if ver == v4::protocol::VER => match v4_handler {
+                        Some(handler) => handler.handle_uni_stream(ver, &mut *stream).await,
+                        None => Ok(()),
+                    },
+                    Ok(ver) if ver == v5::protocol::VER => match v5_handler {
+                        Some(handler) => handler.handle_uni_stream(ver, &mut *stream).await,
+                        None => Ok(()),
+                    },
+                    Ok(ver) => Err(anyhow::anyhow!("tuic: no handler for uni-stream protocol version {ver:#x}")),
+                    Err(err) => Err(err.into()),
+                };
+                if let Err(err) = result {
+                    warnln!("tuic: dropped a uni-stream command: {err:#}");
                 }
                 stream.cancel_read(0);
             });
@@ -449,5 +441,200 @@ mod tests {
         incoming.read_exact(&mut payload).await.expect("read the 0-RTT payload");
         assert_eq!(&payload, b"zero");
         assert!(accepted.await, "the server rejected the 0-RTT flight");
+    }
+
+    struct StubListener;
+
+    #[async_trait::async_trait]
+    impl EarlyListener for StubListener {
+        async fn accept(&self, _ctx: &CancellationToken) -> anyhow::Result<Arc<dyn Conn>> {
+            anyhow::bail!("the uni-stream test never accepts a connection")
+        }
+
+        fn close(&self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    #[derive(Debug)]
+    struct StubAddr(std::net::SocketAddr);
+
+    impl murmur_std_compat::net::Addr for StubAddr {
+        fn network(&self) -> &str {
+            "udp"
+        }
+
+        fn string(&self) -> String {
+            self.0.to_string()
+        }
+    }
+
+    /// Hands out one uni stream, then fails the accept so the accept loop returns.
+    struct StubConn {
+        stream: parking_lot::Mutex<Option<crate::types::stream::StubUniStream>>,
+        addr: std::net::SocketAddr,
+    }
+
+    #[async_trait::async_trait]
+    impl Conn for StubConn {
+        fn local_addr(&self) -> Box<dyn murmur_std_compat::net::Addr> {
+            Box::new(StubAddr(self.addr))
+        }
+
+        fn remote_addr(&self) -> Box<dyn murmur_std_compat::net::Addr> {
+            Box::new(StubAddr(self.addr))
+        }
+
+        fn close_with_error(&self, _code: murmur_quic::ApplicationErrorCode, _reason: &str) -> anyhow::Result<()> {
+            Ok(())
+        }
+
+        fn config(&self) -> QuicConfig {
+            QuicConfig::default()
+        }
+
+        fn connection_stats(&self) -> murmur_quic::ConnectionStats {
+            murmur_quic::ConnectionStats::default()
+        }
+
+        fn connection_state(&self) -> murmur_quic::ConnectionState {
+            murmur_quic::ConnectionState::default()
+        }
+
+        fn context(&self) -> CancellationToken {
+            CancellationToken::new()
+        }
+
+        async fn handshake_complete(&self) {}
+
+        fn export_keying_material(&self, _label: &[u8], _context: &[u8], _length: usize) -> anyhow::Result<Vec<u8>> {
+            anyhow::bail!("the uni-stream test never exports keying material")
+        }
+
+        async fn open_stream(&self, _ctx: &CancellationToken) -> anyhow::Result<Box<dyn murmur_quic::Stream>> {
+            anyhow::bail!("the uni-stream test never opens a stream")
+        }
+
+        async fn open_uni_stream(&self, _ctx: &CancellationToken) -> anyhow::Result<Box<dyn murmur_quic::SendStream>> {
+            anyhow::bail!("the uni-stream test never opens a uni stream")
+        }
+
+        async fn accept_stream(&self, _ctx: &CancellationToken) -> anyhow::Result<Box<dyn murmur_quic::Stream>> {
+            anyhow::bail!("the uni-stream test never accepts a stream")
+        }
+
+        async fn accept_uni_stream(
+            &self,
+            _ctx: &CancellationToken,
+        ) -> anyhow::Result<Box<dyn murmur_quic::ReceiveStream>> {
+            match self.stream.lock().take() {
+                Some(stream) => Ok(Box::new(stream)),
+                None => anyhow::bail!("the stub conn carries one uni stream"),
+            }
+        }
+
+        fn send_datagram(&self, _data: &[u8]) -> anyhow::Result<()> {
+            anyhow::bail!("the uni-stream test never sends a datagram")
+        }
+
+        async fn receive_datagram(&self, _ctx: &CancellationToken) -> anyhow::Result<Vec<u8>> {
+            anyhow::bail!("the uni-stream test never receives a datagram")
+        }
+    }
+
+    /// Parses the uni-stream command with the real v5 codec and reports the payload it saw.
+    struct RecordingV5Handler(tokio::sync::Mutex<Option<tokio::sync::oneshot::Sender<usize>>>);
+
+    #[async_trait::async_trait]
+    impl types_type::ServerHandler for RecordingV5Handler {
+        fn auth_ok(&self) -> bool {
+            false
+        }
+
+        fn handle_timeout(&self) {}
+
+        async fn handle_stream(&self, _conn: murmur_common_net::bufconn::BufferedConn) -> anyhow::Result<()> {
+            anyhow::bail!("the uni-stream test never handles a stream")
+        }
+
+        async fn handle_message(&self, _message: &[u8]) -> anyhow::Result<()> {
+            anyhow::bail!("the uni-stream test never handles a datagram message")
+        }
+
+        async fn handle_uni_stream(
+            &self,
+            version: u8,
+            stream: &mut dyn murmur_quic::ReceiveStream,
+        ) -> anyhow::Result<()> {
+            assert_eq!(version, v5::protocol::VER, "the dispatcher hands over the stream's version byte");
+            let command_head = v5::protocol::read_command_head_after_ver(version, stream).await?;
+            let packet = v5::protocol::read_packet_with_head(command_head, stream).await?;
+            assert_eq!(usize::from(packet.size), packet.data.len(), "the declared size must have been read whole");
+            if let Some(tx) = self.0.lock().await.take() {
+                let _ = tx.send(packet.data.len());
+            }
+            Ok(())
+        }
+    }
+
+    fn stub_server() -> Arc<Server> {
+        Arc::new(Server {
+            option: Arc::new(ServerOption {
+                handle_tcp_fn: Arc::new(|_, _, _| anyhow::bail!("the uni-stream test never relays tcp")),
+                handle_udp_fn: Arc::new(|_, _, _| anyhow::bail!("the uni-stream test never relays udp")),
+                tls_config: listener_tls(),
+                quic_config: Arc::new(QuicConfig::default()),
+                tokens: Vec::new(),
+                users: HashMap::new(),
+                congestion_controller: String::new(),
+                authentication_timeout: Duration::from_secs(1),
+                max_udp_relay_packet_size: 1500,
+                cwnd: 0,
+                bbr_profile: String::new(),
+            }),
+            option_v4: None,
+            option_v5: None,
+            listener: Arc::new(StubListener),
+        })
+    }
+
+    /// A v5 `PACKET` command as the client's QUIC relay mode writes one: header, IPv4 address,
+    /// payload, so the command is `PACKET_OVER_HEAD` plus `payload_len` bytes long.
+    fn command_with_payload(payload_len: usize) -> Vec<u8> {
+        let addr = v5::protocol::new_address_addr_port(std::net::SocketAddr::from(([192, 0, 2, 1], 9)));
+        let size = u16::try_from(payload_len).expect("the test payloads fit the wire field");
+        let packet = v5::protocol::new_packet(1, 0, 1, 0, size, addr, bytes::Bytes::from(vec![0x5a; payload_len]));
+        let mut buf = bytes::BytesMut::new();
+        packet.write_to(&mut buf);
+        buf.to_vec()
+    }
+
+    /// A 5000-byte QUIC-relay datagram is a 5017-byte uni-stream command, so a reader that stops at
+    /// the old 4096-byte buffer never reaches the parse; the client may or may not close behind it.
+    #[tokio::test]
+    async fn a_uni_stream_command_above_the_old_buffer_size_reaches_the_handler_whole() {
+        for closes in [true, false] {
+            let command = command_with_payload(5000);
+            assert!(command.len() > 4096);
+            let (tx, rx) = tokio::sync::oneshot::channel();
+            let handler = ServerHandler {
+                server: stub_server(),
+                quic_conn: Arc::new(StubConn {
+                    stream: parking_lot::Mutex::new(Some(crate::types::stream::StubUniStream::new(command, closes))),
+                    addr: "198.51.100.7:9".parse().expect("a test address"),
+                }),
+                v4_handler: None,
+                v5_handler: Some(Arc::new(RecordingV5Handler(tokio::sync::Mutex::new(Some(tx))))),
+            };
+            tokio::spawn(async move {
+                let _ = handler.handle_uni_stream().await;
+            });
+
+            let seen = tokio::time::timeout(Duration::from_secs(5), rx)
+                .await
+                .expect("the handler was never reached")
+                .expect("the handler reported no payload");
+            assert_eq!(seen, 5000, "the whole payload must reach the parse (closes = {closes})");
+        }
     }
 }

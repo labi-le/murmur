@@ -11,10 +11,11 @@ use crate::types::type_ as types;
 use murmur_adapter_inbound::addition::Addition;
 use murmur_common::atomic::type_::Bool as AtomicBool2;
 use murmur_common::xsync::map::Map;
-use murmur_common_net::bufconn::{BufferedConn, BufioReader};
+use murmur_common_net::bufconn::BufferedConn;
 use murmur_common_net::io::Datagram;
 use murmur_common_pool as pool;
 use murmur_constant::adapters::{UDPPacket, WriteBack};
+use murmur_quic::ReceiveStream;
 use murmur_std_compat::net::Conn;
 use murmur_transport::socks5::socks5 as socks5_mod;
 
@@ -160,13 +161,11 @@ impl types::ServerHandler for ServerHandlerImpl {
         (self.option.handle_tcp_fn)(Box::new(conn), connect.addr.socks_addr(), &[])
     }
 
-    async fn handle_uni_stream(&self, reader: &mut BufioReader) -> anyhow::Result<()> {
-        let mut reader = protocol::BufioReaderRef(reader);
-        let reader = &mut reader;
-        let command_head = protocol::read_command_head(reader).await?;
+    async fn handle_uni_stream(&self, version: u8, stream: &mut dyn ReceiveStream) -> anyhow::Result<()> {
+        let command_head = protocol::read_command_head_after_ver(version, stream).await?;
         match command_head.type_ {
             protocol::CommandType::AUTHENTICATE_TYPE => {
-                let authenticate = protocol::read_authenticate_with_head(command_head, reader).await?;
+                let authenticate = protocol::read_authenticate_with_head(command_head, stream).await?;
                 let auth_ok = self.option.tokens.contains(&authenticate.tkn);
                 self.auth_once.call_once(|| {
                     if !auth_ok {
@@ -178,11 +177,11 @@ impl types::ServerHandler for ServerHandlerImpl {
                 });
             }
             protocol::CommandType::PACKET_TYPE => {
-                let packet = protocol::read_packet_with_head(command_head, reader).await?;
+                let packet = protocol::read_packet_with_head(command_head, stream).await?;
                 return self.parse_packet(&packet, types::UdpRelayMode::QUIC).await;
             }
             protocol::CommandType::DISSOCIATE_TYPE => {
-                let dissociate = protocol::read_dissociate_with_head(command_head, reader).await?;
+                let dissociate = protocol::read_dissociate_with_head(command_head, stream).await?;
                 let (write_closed, loaded) = self.udp_input_map.load_and_delete(&dissociate.assoc_id);
                 if loaded {
                     if let Some(write_closed) = write_closed {
@@ -252,3 +251,4 @@ impl UDPPacket for ServerUdpPacket {
         self.nat_key.clone()
     }
 }
+

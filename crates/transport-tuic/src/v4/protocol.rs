@@ -7,7 +7,6 @@ use std::sync::LazyLock;
 use bytes::{BufMut, Bytes, BytesMut};
 use tokio::io::AsyncReadExt;
 
-use murmur_common_net::bufconn::BufioReader;
 use murmur_component::dialer::bind::join_host_port;
 use murmur_constant::metadata::{AddrType, Metadata};
 use murmur_quic::ApplicationErrorCode;
@@ -16,9 +15,8 @@ use murmur_transport::socks5::socks5;
 /// A buffered reader generalized over the readers this
 /// crate parses commands from.
 ///
-/// That is any live `AsyncRead` conn or quic stream (a [`BufferedConn`] included), an in-memory
-/// [`SliceReader`] over a datagram/message payload, and a bare [`BufioReader`] (see its `impl`
-/// below for the fill limitation that comes with it).
+/// That is any live `AsyncRead` conn or quic stream (a [`BufferedConn`] included) and an in-memory
+/// [`SliceReader`] over a datagram/message payload.
 pub trait BufferedReader: Send {
     fn read_byte(&mut self) -> impl Future<Output = io::Result<u8>> + Send;
     fn read_full(&mut self, buf: &mut [u8]) -> impl Future<Output = io::Result<()>> + Send;
@@ -26,7 +24,7 @@ pub trait BufferedReader: Send {
 
 // Every live conn and quic stream parses commands through this bound; sealing it would narrow the
 // reader set `read_response` accepts, and the crate is `publish = false`, so nothing can collide.
-impl<T: tokio::io::AsyncRead + Unpin + Send> BufferedReader for T {
+impl<T: tokio::io::AsyncRead + Unpin + Send + ?Sized> BufferedReader for T {
     async fn read_byte(&mut self) -> io::Result<u8> {
         AsyncReadExt::read_u8(self).await
     }
@@ -65,41 +63,6 @@ impl BufferedReader for SliceReader<'_> {
         };
         buf.copy_from_slice(src);
         self.pos += buf.len();
-        Ok(())
-    }
-}
-
-/// The reader parameter of the uni-stream handler. A reader that refills itself from the stream
-/// it wraps on demand would be ideal; this crate's `BufioReader` is a
-/// detached buffer state (the conn it refills from is passed to `fill` explicitly elsewhere), and
-/// `types::ServerHandler::handle_uni_stream` takes no conn to refill from. This reads only what is
-/// already buffered and reports `UnexpectedEof` once it runs out; see the wave report.
-///
-/// `BufferedReader` cannot be implemented for `BufioReader` directly: `BufioReader` is defined in
-/// `common-net`, so from this crate's coherence check it is a foreign type, and this trait's own
-/// blanket impl over any `AsyncRead` type above makes rustc conservatively assume a future
-/// `common-net` release could add `AsyncRead for BufioReader` and conflict, even though it never
-/// will (`BufioReader`'s doc: "carries no reader of its own"). A local newtype sidesteps it: the
-/// wrapped `&mut BufioReader` is local to this crate, so the orphan rule no longer applies.
-pub(crate) struct BufioReaderRef<'a>(pub(crate) &'a mut BufioReader);
-
-impl BufferedReader for BufioReaderRef<'_> {
-    async fn read_byte(&mut self) -> io::Result<u8> {
-        if self.0.r >= self.0.w {
-            self.0.read_err()?;
-            return Err(io::Error::new(io::ErrorKind::UnexpectedEof, "EOF"));
-        }
-        let Some(&b) = self.0.buf.get(self.0.r) else {
-            return Err(io::Error::new(io::ErrorKind::UnexpectedEof, "EOF"));
-        };
-        self.0.r += 1;
-        Ok(b)
-    }
-
-    async fn read_full(&mut self, buf: &mut [u8]) -> io::Result<()> {
-        for byte in buf.iter_mut() {
-            *byte = self.read_byte().await?;
-        }
         Ok(())
     }
 }
@@ -149,8 +112,16 @@ pub const fn new_command_head(type_: CommandType) -> CommandHead {
     CommandHead { ver: VER, type_ }
 }
 
-pub async fn read_command_head<R: BufferedReader>(reader: &mut R) -> io::Result<CommandHead> {
+pub async fn read_command_head<R: BufferedReader + ?Sized>(reader: &mut R) -> io::Result<CommandHead> {
     let ver = reader.read_byte().await?;
+    read_command_head_after_ver(ver, reader).await
+}
+
+/// Reads the command head for a caller that has already read the version byte to pick a handler.
+pub async fn read_command_head_after_ver<R: BufferedReader + ?Sized>(
+    ver: u8,
+    reader: &mut R,
+) -> io::Result<CommandHead> {
     let type_ = CommandType(reader.read_byte().await?);
     Ok(CommandHead { ver, type_ })
 }
@@ -183,7 +154,7 @@ pub fn new_authenticate(tkn: [u8; 32]) -> Authenticate {
     Authenticate { command_head: new_command_head(CommandType::AUTHENTICATE_TYPE), tkn }
 }
 
-pub async fn read_authenticate_with_head<R: BufferedReader>(
+pub async fn read_authenticate_with_head<R: BufferedReader + ?Sized>(
     head: CommandHead,
     reader: &mut R,
 ) -> anyhow::Result<Authenticate> {
@@ -195,7 +166,7 @@ pub async fn read_authenticate_with_head<R: BufferedReader>(
     Ok(Authenticate { command_head: head, tkn })
 }
 
-pub async fn read_authenticate<R: BufferedReader>(reader: &mut R) -> anyhow::Result<Authenticate> {
+pub async fn read_authenticate<R: BufferedReader + ?Sized>(reader: &mut R) -> anyhow::Result<Authenticate> {
     let head = read_command_head(reader).await?;
     read_authenticate_with_head(head, reader).await
 }
@@ -229,7 +200,10 @@ pub fn new_connect(addr: Address) -> Connect {
     Connect { command_head: new_command_head(CommandType::CONNECT_TYPE), addr }
 }
 
-pub async fn read_connect_with_head<R: BufferedReader>(head: CommandHead, reader: &mut R) -> anyhow::Result<Connect> {
+pub async fn read_connect_with_head<R: BufferedReader + ?Sized>(
+    head: CommandHead,
+    reader: &mut R,
+) -> anyhow::Result<Connect> {
     if head.type_ != CommandType::CONNECT_TYPE {
         return Err(anyhow::anyhow!("error command type: {}", head.type_));
     }
@@ -237,7 +211,7 @@ pub async fn read_connect_with_head<R: BufferedReader>(head: CommandHead, reader
     Ok(Connect { command_head: head, addr })
 }
 
-pub async fn read_connect<R: BufferedReader>(reader: &mut R) -> anyhow::Result<Connect> {
+pub async fn read_connect<R: BufferedReader + ?Sized>(reader: &mut R) -> anyhow::Result<Connect> {
     let head = read_command_head(reader).await?;
     read_connect_with_head(head, reader).await
 }
@@ -268,7 +242,10 @@ pub fn new_packet(assoc_id: u32, len: u16, addr: Address, data: Bytes) -> Packet
     Packet { command_head: new_command_head(CommandType::PACKET_TYPE), assoc_id, len, addr, data }
 }
 
-pub async fn read_packet_with_head<R: BufferedReader>(head: CommandHead, reader: &mut R) -> anyhow::Result<Packet> {
+pub async fn read_packet_with_head<R: BufferedReader + ?Sized>(
+    head: CommandHead,
+    reader: &mut R,
+) -> anyhow::Result<Packet> {
     if head.type_ != CommandType::PACKET_TYPE {
         return Err(anyhow::anyhow!("error command type: {}", head.type_));
     }
@@ -284,7 +261,7 @@ pub async fn read_packet_with_head<R: BufferedReader>(head: CommandHead, reader:
     Ok(Packet { command_head: head, assoc_id, len, addr, data: Bytes::from(data) })
 }
 
-pub async fn read_packet<R: BufferedReader>(reader: &mut R) -> anyhow::Result<Packet> {
+pub async fn read_packet<R: BufferedReader + ?Sized>(reader: &mut R) -> anyhow::Result<Packet> {
     let head = read_command_head(reader).await?;
     read_packet_with_head(head, reader).await
 }
@@ -325,7 +302,7 @@ pub fn new_dissociate(assoc_id: u32) -> Dissociate {
     Dissociate { command_head: new_command_head(CommandType::DISSOCIATE_TYPE), assoc_id }
 }
 
-pub async fn read_dissociate_with_head<R: BufferedReader>(
+pub async fn read_dissociate_with_head<R: BufferedReader + ?Sized>(
     head: CommandHead,
     reader: &mut R,
 ) -> anyhow::Result<Dissociate> {
@@ -337,7 +314,7 @@ pub async fn read_dissociate_with_head<R: BufferedReader>(
     Ok(Dissociate { command_head: head, assoc_id: u32::from_be_bytes(assoc_id_buf) })
 }
 
-pub async fn read_dissociate<R: BufferedReader>(reader: &mut R) -> anyhow::Result<Dissociate> {
+pub async fn read_dissociate<R: BufferedReader + ?Sized>(reader: &mut R) -> anyhow::Result<Dissociate> {
     let head = read_command_head(reader).await?;
     read_dissociate_with_head(head, reader).await
 }
@@ -372,7 +349,7 @@ pub fn read_heartbeat_with_head(head: CommandHead) -> anyhow::Result<Heartbeat> 
     Ok(Heartbeat { command_head: head })
 }
 
-pub async fn read_heartbeat<R: BufferedReader>(reader: &mut R) -> anyhow::Result<Heartbeat> {
+pub async fn read_heartbeat<R: BufferedReader + ?Sized>(reader: &mut R) -> anyhow::Result<Heartbeat> {
     let head = read_command_head(reader).await?;
     read_heartbeat_with_head(head)
 }
@@ -405,7 +382,10 @@ pub fn new_response_failed() -> Response {
     new_response(0xff)
 }
 
-pub async fn read_response_with_head<R: BufferedReader>(head: CommandHead, reader: &mut R) -> anyhow::Result<Response> {
+pub async fn read_response_with_head<R: BufferedReader + ?Sized>(
+    head: CommandHead,
+    reader: &mut R,
+) -> anyhow::Result<Response> {
     if head.type_ != CommandType::RESPONSE_TYPE {
         return Err(anyhow::anyhow!("error command type: {}", head.type_));
     }
@@ -413,7 +393,7 @@ pub async fn read_response_with_head<R: BufferedReader>(head: CommandHead, reade
     Ok(Response { command_head: head, rep })
 }
 
-pub async fn read_response<R: BufferedReader>(reader: &mut R) -> anyhow::Result<Response> {
+pub async fn read_response<R: BufferedReader + ?Sized>(reader: &mut R) -> anyhow::Result<Response> {
     let head = read_command_head(reader).await?;
     read_response_with_head(head, reader).await
 }
@@ -478,10 +458,7 @@ pub fn new_address(metadata: &Metadata) -> Address {
         AddrType::ATYP_IPV6 => (ATYP_IPV6, ip_octets(metadata.dst_ip.expect("ATYP_IPV6 implies dst_ip"))),
         _ => {
             let mut addr = Vec::with_capacity(metadata.host.len() + 1);
-            #[expect(
-                clippy::cast_possible_truncation,
-                reason = "the domain-name length is a single byte on the wire"
-            )]
+            #[expect(clippy::cast_possible_truncation, reason = "the domain-name length is a single byte on the wire")]
             addr.push(metadata.host.len() as u8);
             addr.extend_from_slice(metadata.host.as_bytes());
             (ATYP_DOMAIN_NAME, addr)
@@ -503,7 +480,7 @@ pub fn new_address_addr_port(addr_port: SocketAddr) -> Address {
     Address { type_, addr, port }
 }
 
-pub async fn read_address<R: BufferedReader>(reader: &mut R) -> anyhow::Result<Address> {
+pub async fn read_address<R: BufferedReader + ?Sized>(reader: &mut R) -> anyhow::Result<Address> {
     let type_ = reader.read_byte().await?;
     let addr = match type_ {
         ATYP_IPV4 => {

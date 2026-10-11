@@ -74,6 +74,14 @@ pub const fn new_command_head(type_: CommandType) -> CommandHead {
 
 pub async fn read_command_head<R: AsyncRead + Unpin + ?Sized>(reader: &mut R) -> anyhow::Result<CommandHead> {
     let ver = reader.read_u8().await?;
+    read_command_head_after_ver(ver, reader).await
+}
+
+/// Reads the command head for a caller that has already read the version byte to pick a handler.
+pub async fn read_command_head_after_ver<R: AsyncRead + Unpin + ?Sized>(
+    ver: u8,
+    reader: &mut R,
+) -> anyhow::Result<CommandHead> {
     let type_ = reader.read_u8().await?;
     Ok(CommandHead { ver, type_: CommandType(type_) })
 }
@@ -397,10 +405,7 @@ pub fn new_address(metadata: &Metadata) -> Address {
             type_ = ATYP_DOMAIN_NAME;
             let host = metadata.host.as_bytes();
             addr = Vec::with_capacity(host.len() + 1);
-            #[expect(
-                clippy::cast_possible_truncation,
-                reason = "the domain-name length is a single byte on the wire"
-            )]
+            #[expect(clippy::cast_possible_truncation, reason = "the domain-name length is a single byte on the wire")]
             addr.push(host.len() as u8);
             addr.extend_from_slice(host);
         }

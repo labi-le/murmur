@@ -5,8 +5,9 @@ use chrono::{DateTime, Utc};
 use futures::future::BoxFuture;
 use tokio_util::sync::CancellationToken;
 
-use murmur_common_net::bufconn::{BufferedConn, BufioReader};
+use murmur_common_net::bufconn::BufferedConn;
 use murmur_constant::metadata::Metadata;
+use murmur_quic::ReceiveStream;
 use murmur_std_compat::net::{Conn, PacketConn};
 
 use crate::quic::Conn as QuicConn;
@@ -55,7 +56,9 @@ pub trait ServerHandler: Send + Sync {
 
     async fn handle_message(&self, message: &[u8]) -> anyhow::Result<()>;
 
-    async fn handle_uni_stream(&self, reader: &mut BufioReader) -> anyhow::Result<()>;
+    /// `version` is the head's version byte, read by the caller to pick the handler; the handler
+    /// reads the rest of the command off the stream, so a command is never cut at a buffer end.
+    async fn handle_uni_stream(&self, version: u8, stream: &mut dyn ReceiveStream) -> anyhow::Result<()>;
 }
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, PartialOrd, Ord, Hash)]

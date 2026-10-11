@@ -9,9 +9,10 @@ use murmur_adapter_inbound::addition::{with_in_user, Addition};
 use murmur_common::atomic::type_::Bool as AtomicBoolValue;
 use murmur_common::atomic::value::TypedValue;
 use murmur_common::xsync;
-use murmur_common_net::bufconn::{BufferedConn, BufioReader};
+use murmur_common_net::bufconn::BufferedConn;
 use murmur_common_net::io::Datagram;
 use murmur_constant::adapters::{UDPPacket, WriteBack};
+use murmur_quic::ReceiveStream;
 use murmur_std_compat::net::Conn as NetConn;
 use murmur_transport::socks5::socks5 as socks5_pkg;
 
@@ -152,31 +153,11 @@ impl types::type_::ServerHandler for ServerHandlerImpl {
         }
     }
 
-    /// The uni-stream handler. A reader that lazily pulls more bytes
-    /// from the quic receive stream as needed would be ideal; this crate's [`BufioReader`] carries
-    /// no conn of its own (see its doc comment), so the caller is expected to have already filled it
-    /// with the whole uni-stream message before calling in. Parsing runs against a `Cursor` over the
-    /// already-buffered bytes and the read position is advanced by however much that parse consumed.
-    async fn handle_uni_stream(&self, reader: &mut BufioReader) -> anyhow::Result<()> {
-        let data = reader.buffered_bytes().to_vec();
-        let mut cursor = std::io::Cursor::new(data.as_slice());
-        let result = self.handle_uni_stream_inner(&mut cursor).await;
-        #[expect(
-            clippy::cast_possible_truncation,
-            reason = "the cursor is positioned inside `data`, whose length is already a `usize`, so the position always fits"
-        )]
-        let consumed = cursor.position() as usize;
-        reader.r += consumed;
-        result
-    }
-}
-
-impl ServerHandlerImpl {
-    async fn handle_uni_stream_inner(&self, cursor: &mut std::io::Cursor<&[u8]>) -> anyhow::Result<()> {
-        let command_head = protocol::read_command_head(cursor).await?;
+    async fn handle_uni_stream(&self, version: u8, stream: &mut dyn ReceiveStream) -> anyhow::Result<()> {
+        let command_head = protocol::read_command_head_after_ver(version, stream).await?;
         match command_head.type_ {
             protocol::CommandType::AUTHENTICATE_TYPE => {
-                let authenticate = protocol::read_authenticate_with_head(command_head, cursor).await?;
+                let authenticate = protocol::read_authenticate_with_head(command_head, stream).await?;
                 let mut auth_ok = false;
                 let mut auth_uuid = uuid::Uuid::nil();
                 if let Some(password) = self.option.users.get(&authenticate.uuid) {
@@ -198,11 +179,11 @@ impl ServerHandlerImpl {
                 Ok(())
             }
             protocol::CommandType::PACKET_TYPE => {
-                let packet = protocol::read_packet_with_head(command_head, cursor).await?;
+                let packet = protocol::read_packet_with_head(command_head, stream).await?;
                 self.parse_packet(packet, types::type_::UdpRelayMode::QUIC).await
             }
             protocol::CommandType::DISSOCIATE_TYPE => {
-                let dissociate = protocol::read_dissociate_with_head(command_head, cursor).await?;
+                let dissociate = protocol::read_dissociate_with_head(command_head, stream).await?;
                 if let (Some(input), true) = self.udp_input_map.load_and_delete(&dissociate.assoc_id) {
                     input.write_closed.store(true);
                 }
@@ -274,7 +255,7 @@ pub fn new_server_handler(
 }
 
 #[cfg(test)]
-mod nat_key_tests {
+mod tests {
     use std::net::SocketAddr;
 
     use bytes::Bytes;
@@ -329,7 +310,12 @@ mod nat_key_tests {
 
         async fn handshake_complete(&self) {}
 
-        fn export_keying_material(&self, _label: &[u8], _context: &[u8], _length: usize) -> anyhow::Result<Vec<u8>> {
+        fn export_keying_material(
+            &self,
+            _label: &[u8],
+            _context: &[u8],
+            _length: usize,
+        ) -> anyhow::Result<Vec<u8>> {
             anyhow::bail!("not exercised by the nat_key test path")
         }
 
@@ -345,10 +331,7 @@ mod nat_key_tests {
             anyhow::bail!("not exercised by the nat_key test path")
         }
 
-        async fn accept_uni_stream(
-            &self,
-            _ctx: &CancellationToken,
-        ) -> anyhow::Result<Box<dyn murmur_quic::ReceiveStream>> {
+        async fn accept_uni_stream(&self, _ctx: &CancellationToken) -> anyhow::Result<Box<dyn ReceiveStream>> {
             anyhow::bail!("not exercised by the nat_key test path")
         }
 
@@ -407,5 +390,4 @@ mod nat_key_tests {
         assert_eq!(seen[0].0, remote);
         assert_eq!(seen[1].0, remote);
         assert_ne!(seen[0].1, seen[1].1, "two associations sharing one QUIC connection/peer must not share a NAT key");
-    }
 }
