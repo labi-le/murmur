@@ -27,6 +27,7 @@ use hyper_util::rt::{TokioExecutor, TokioIo};
 use hyper_util::server::conn::auto;
 use parking_lot::Mutex;
 use tokio::sync::mpsc;
+use tokio::time::Instant;
 use tokio_util::sync::CancellationToken;
 
 use murmur_std_compat::net::{Addr, Conn as NetConn, Listener as NetListener, PacketConn as NetPacketConn, TcpAddr};
@@ -37,6 +38,37 @@ use super::config::Config;
 use super::packetconn::{new_wrapped_packet_conn, SharedPacketConn, WrappedPacketConn};
 
 type ResponseBody = BoxBody<Bytes, Infallible>;
+
+/// The floor for a session's idle timeout; a live client re-POSTs at least once per long-poll
+/// cycle, so only a client that has stopped talking entirely is ever idle this long.
+const MIN_SESSION_IDLE_TIMEOUT: Duration = Duration::from_secs(60);
+
+/// How often the reaper sweeps the session table.
+const SESSION_SWEEP_INTERVAL: Duration = Duration::from_secs(15);
+
+/// The bound on live sessions per listener; past it the least recently active session is evicted.
+const MAX_SESSIONS: usize = 8192;
+
+/// The bound on the decoded session id, so the map key cannot be a whole header value.
+const MAX_SESSION_ID_LEN: usize = 64;
+
+/// Why a client-supplied session id was refused.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum SessionIdRejection {
+    Malformed,
+    TooLong,
+}
+
+/// Decodes the `X-Session-ID` header, enforcing the length bound on the map key it becomes.
+fn decode_session_id(header: &str) -> Result<Vec<u8>, SessionIdRejection> {
+    let Ok(session_id) = URL_SAFE_NO_PAD.decode(header) else {
+        return Err(SessionIdRejection::Malformed);
+    };
+    if session_id.len() > MAX_SESSION_ID_LEN {
+        return Err(SessionIdRejection::TooLong);
+    }
+    Ok(session_id)
+}
 
 /// Stands in for `http_body_util::channel::Channel` (its `channel` Cargo feature is not enabled
 /// for this crate): a `hyper::body::Body` that yields whatever `Bytes` chunks arrive on an `mpsc`
@@ -95,6 +127,7 @@ pub async fn listen(ctx: &CancellationToken, ln: Box<dyn NetListener>, cfg: Conf
     let shutdown = ctx.child_token();
     let packet_conn = new_wrapped_packet_conn(&shutdown, local);
     let server = new_server(shutdown.clone(), cfg.clone(), Arc::clone(&packet_conn));
+    tokio::spawn(Arc::clone(&server).reap_idle_sessions());
     let shared_packet_conn = SharedPacketConn(Arc::clone(&packet_conn));
     let mkcp_listener = mkcp::listener::listen(&shutdown, Box::new(shared_packet_conn), cfg.kcp.clone()).await?;
 
@@ -174,17 +207,31 @@ struct Server {
     cfg: Config,
     packet_conn: Arc<WrappedPacketConn>,
     sessions: DashMap<Vec<u8>, Arc<ServerSession>>,
+    max_sessions: usize,
 }
 
 fn new_server(ctx: CancellationToken, cfg: Config, packet_conn: Arc<WrappedPacketConn>) -> Arc<Server> {
-    Arc::new(Server { ctx, cfg, packet_conn, sessions: DashMap::new() })
+    new_server_with_max_sessions(ctx, cfg, packet_conn, MAX_SESSIONS)
+}
+
+fn new_server_with_max_sessions(
+    ctx: CancellationToken,
+    cfg: Config,
+    packet_conn: Arc<WrappedPacketConn>,
+    max_sessions: usize,
+) -> Arc<Server> {
+    Arc::new(Server { ctx, cfg, packet_conn, sessions: DashMap::new(), max_sessions })
 }
 
 impl Server {
     async fn serve_http(self: Arc<Self>, req: Request<Incoming>, remote_addr: TcpAddr) -> Response<ResponseBody> {
         let session_id_header = req.headers().get("X-Session-ID").and_then(|v| v.to_str().ok()).unwrap_or("");
-        let Ok(session_id) = URL_SAFE_NO_PAD.decode(session_id_header) else {
-            return text_response(StatusCode::BAD_REQUEST, "invalid session id");
+        let session_id = match decode_session_id(session_id_header) {
+            Ok(session_id) => session_id,
+            Err(SessionIdRejection::Malformed) => return text_response(StatusCode::BAD_REQUEST, "invalid session id"),
+            Err(SessionIdRejection::TooLong) => {
+                return text_response(StatusCode::BAD_REQUEST, "session id too long");
+            }
         };
         let body = match req.into_body().collect().await {
             Ok(collected) => collected.to_bytes(),
@@ -210,6 +257,9 @@ impl Server {
         if let Some(existing) = self.sessions.get(session_id) {
             return Ok(Arc::clone(&existing));
         }
+        if self.sessions.len() >= self.max_sessions {
+            self.evict_least_recently_active();
+        }
         let session_ctx = self.ctx.child_token();
         let session = Arc::new(ServerSession::new(session_ctx, session_id.to_owned(), remote_addr, Arc::clone(self)));
         match self.sessions.entry(session_id.to_owned()) {
@@ -225,8 +275,46 @@ impl Server {
         }
     }
 
-    fn remove_session(&self, session_id: &[u8]) {
-        self.sessions.remove(session_id);
+    /// Removes `session_id` only while it still maps to `session`: an evicted session's later
+    /// `close` must not remove the replacement a client created under the same id meanwhile.
+    fn remove_session_if(&self, session_id: &[u8], session: &Arc<ServerSession>) {
+        self.sessions.remove_if(session_id, |_, stored| Arc::ptr_eq(stored, session));
+    }
+
+    /// Evicts the session that has been quiet the longest, so a full table keeps serving new
+    /// clients instead of refusing them; an abandoned session is the quietest one.
+    fn evict_least_recently_active(&self) {
+        let victim = self
+            .sessions
+            .iter()
+            .min_by_key(|entry| entry.value().last_activity())
+            .map(|entry| Arc::clone(entry.value()));
+        if let Some(victim) = victim {
+            victim.close();
+        }
+    }
+
+    /// Closes every session idle past its own timeout.
+    fn sweep_idle_sessions(&self) {
+        let now = Instant::now();
+        let expired: Vec<Arc<ServerSession>> = self
+            .sessions
+            .iter()
+            .filter(|entry| now.duration_since(entry.value().last_activity()) >= entry.value().idle_timeout())
+            .map(|entry| Arc::clone(entry.value()))
+            .collect();
+        for session in expired {
+            session.close();
+        }
+    }
+
+    async fn reap_idle_sessions(self: Arc<Self>) {
+        loop {
+            tokio::select! {
+                () = self.ctx.cancelled() => return,
+                () = tokio::time::sleep(SESSION_SWEEP_INTERVAL) => self.sweep_idle_sessions(),
+            }
+        }
     }
 }
 
@@ -333,6 +421,8 @@ pub(crate) struct ServerSession {
     max_write_duration: Duration,
     max_simultaneous_write_connection: i64,
     writing_conns: Mutex<Vec<Arc<WritingConnection>>>,
+    last_activity: Mutex<Instant>,
+    idle_timeout: Duration,
 }
 
 fn err_context_canceled() -> io::Error {
@@ -344,18 +434,21 @@ impl ServerSession {
         let writer_buffer = usize::try_from(server.cfg.packet_writing_buffer.max(1)).unwrap_or(1);
         let (reader_tx, reader_rx) = mpsc::channel(256);
         let max_write_duration_ms = server.cfg.max_write_duration_ms.max(0).cast_unsigned();
+        let max_write_duration = Duration::from_millis(max_write_duration_ms);
         Self {
             ctx,
             session_id,
             remote_addr,
             max_write_size: server.cfg.max_write_size,
-            max_write_duration: Duration::from_millis(max_write_duration_ms),
+            max_write_duration,
             max_simultaneous_write_connection: server.cfg.max_simultaneous_write_connection,
             server,
             writer_queue: WriterQueue::new(writer_buffer),
             reader_tx,
             reader_rx: tokio::sync::Mutex::new(reader_rx),
             writing_conns: Mutex::new(Vec::new()),
+            last_activity: Mutex::new(Instant::now()),
+            idle_timeout: max_write_duration.saturating_mul(2).max(MIN_SESSION_IDLE_TIMEOUT),
         }
     }
 
@@ -363,7 +456,21 @@ impl ServerSession {
         &self.session_id
     }
 
+    /// The last traffic on this session, for the idle sweep.
+    fn last_activity(&self) -> Instant {
+        *self.last_activity.lock()
+    }
+
+    fn idle_timeout(&self) -> Duration {
+        self.idle_timeout
+    }
+
+    fn touch(&self) {
+        *self.last_activity.lock() = Instant::now();
+    }
+
     async fn ingest(&self, body: &[u8]) -> anyhow::Result<()> {
+        self.touch();
         let mut reader = body;
         while !reader.is_empty() {
             let packet = read_packet_bundle_sync(&mut reader)?;
@@ -461,12 +568,14 @@ impl ServerSession {
         if self.ctx.is_cancelled() {
             return Err(err_context_canceled());
         }
+        self.touch();
         self.writer_queue.try_push(p.to_vec());
         Ok(p.len())
     }
 
-    pub(crate) fn close(&self) {
-        self.server.remove_session(&self.session_id);
+    pub(crate) fn close(self: &Arc<Self>) {
+        self.server.remove_session_if(&self.session_id, self);
+        self.server.packet_conn.remove_session_if(&self.session_id, self);
         self.ctx.cancel();
     }
 }
@@ -572,6 +681,107 @@ mod tests {
             handle.await.expect("task");
         }
         assert_eq!(received, CONCURRENT, "every concurrently open long-poll response must get a packet");
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn an_abandoned_session_is_evicted_once_it_is_idle() {
+        let ctx = CancellationToken::new();
+        let local: Arc<dyn Addr> = Arc::new(TcpAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 0));
+        let packet_conn = new_wrapped_packet_conn(&ctx, local);
+        let server = new_server(ctx.clone(), test_config(), Arc::clone(&packet_conn));
+        let remote_addr = TcpAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 0);
+        let session = server.get_session(&[9, 9, 9], remote_addr).expect("get_session");
+        assert_eq!(server.sessions.len(), 1);
+        assert_eq!(packet_conn.session_count(), 1);
+
+        tokio::spawn(Arc::clone(&server).reap_idle_sessions());
+        tokio::time::sleep(session.idle_timeout() + SESSION_SWEEP_INTERVAL * 2).await;
+
+        assert!(server.sessions.is_empty(), "an abandoned session must leave the server's table");
+        assert_eq!(packet_conn.session_count(), 0, "an abandoned session must leave the packet conn's table");
+        assert!(session.write(&[1]).await.is_err(), "a reaped session must be closed");
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_session_that_keeps_polling_survives_the_idle_sweep() {
+        let ctx = CancellationToken::new();
+        let local: Arc<dyn Addr> = Arc::new(TcpAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 0));
+        let packet_conn = new_wrapped_packet_conn(&ctx, local);
+        let server = new_server(ctx.clone(), test_config(), Arc::clone(&packet_conn));
+        let remote_addr = TcpAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 0);
+        let session = server.get_session(&[5], remote_addr).expect("get_session");
+
+        let half = session.idle_timeout() / 2;
+        for _ in 0..3 {
+            tokio::time::advance(half).await;
+            session.ingest(&[]).await.expect("ingest");
+            server.sweep_idle_sessions();
+            assert_eq!(server.sessions.len(), 1, "a session that keeps polling must survive the sweep");
+        }
+
+        tokio::time::advance(session.idle_timeout()).await;
+        server.sweep_idle_sessions();
+        assert!(server.sessions.is_empty(), "the sweep must reap the session once its traffic stops");
+        assert_eq!(packet_conn.session_count(), 0);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_full_session_table_evicts_the_least_recently_active_session() {
+        const CAP: usize = 3;
+        let ctx = CancellationToken::new();
+        let local: Arc<dyn Addr> = Arc::new(TcpAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 0));
+        let packet_conn = new_wrapped_packet_conn(&ctx, local);
+        let server = new_server_with_max_sessions(ctx.clone(), test_config(), Arc::clone(&packet_conn), CAP);
+        let remote_addr = TcpAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 0);
+
+        let ids: Vec<Vec<u8>> = vec![vec![0], vec![1], vec![2]];
+        for id in &ids {
+            server.get_session(id, remote_addr).expect("get_session");
+            tokio::time::advance(Duration::from_secs(1)).await;
+        }
+        assert_eq!(server.sessions.len(), CAP);
+        assert_eq!(packet_conn.session_count(), CAP);
+
+        let newest = vec![9u8, 9];
+        server.get_session(&newest, remote_addr).expect("get_session");
+        assert_eq!(server.sessions.len(), CAP, "the table must stay at its cap");
+        assert!(!server.sessions.contains_key(&ids[0]), "the least recently active session must be evicted");
+        assert!(server.sessions.contains_key(&newest));
+        assert_eq!(packet_conn.session_count(), CAP, "the evicted session must leave the packet conn's table too");
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn closing_an_evicted_session_leaves_its_replacement_with_the_same_id() {
+        let ctx = CancellationToken::new();
+        let local: Arc<dyn Addr> = Arc::new(TcpAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 0));
+        let packet_conn = new_wrapped_packet_conn(&ctx, local);
+        let server = new_server(ctx.clone(), test_config(), Arc::clone(&packet_conn));
+        let remote_addr = TcpAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 0);
+        let id = vec![4u8, 2];
+
+        let first = server.get_session(&id, remote_addr).expect("get_session");
+        first.close();
+        assert!(server.sessions.is_empty());
+        let second = server.get_session(&id, remote_addr).expect("get_session");
+        first.close();
+
+        assert_eq!(server.sessions.len(), 1, "a stale close must not remove the replacement session");
+        assert!(Arc::ptr_eq(&second, server.sessions.get(&id).expect("replacement").value()));
+        assert_eq!(packet_conn.session_count(), 1, "the replacement must stay in the packet conn's table");
+    }
+
+    #[test]
+    fn an_over_long_session_id_is_rejected_before_it_becomes_a_session_key() {
+        assert_eq!(decode_session_id("%%%"), Err(SessionIdRejection::Malformed));
+
+        let at_bound = URL_SAFE_NO_PAD.encode(vec![0u8; MAX_SESSION_ID_LEN]);
+        assert!(decode_session_id(&at_bound).is_ok(), "an id at the bound is still accepted");
+
+        let too_long = URL_SAFE_NO_PAD.encode(vec![0u8; MAX_SESSION_ID_LEN + 1]);
+        assert_eq!(decode_session_id(&too_long), Err(SessionIdRejection::TooLong));
+
+        let client_id = URL_SAFE_NO_PAD.encode(vec![0u8; 16]);
+        assert_eq!(decode_session_id(&client_id).expect("the client's own id"), vec![0u8; 16]);
     }
 }
 

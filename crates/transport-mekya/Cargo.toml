@@ -38,6 +38,7 @@ murmur-transport-mkcp = { path = "../transport-mkcp" }
 
 [dev-dependencies]
 murmur-component-ca = { path = "../component-ca" }
+tokio = { workspace = true, features = ["test-util"] }
 
 [lints]
 workspace = true

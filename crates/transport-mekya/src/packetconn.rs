@@ -149,19 +149,38 @@ impl WrappedPacketConn {
         loop {
             let n = match session.read(&mut buf).await {
                 Ok(n) if n <= buf.len() => n,
-                _ => return,
+                _ => break,
             };
             let (payload, _) = buf.split_at(n);
             let payload = payload.to_vec();
             tokio::select! {
-                () = self.ctx.cancelled() => return,
+                () = self.ctx.cancelled() => break,
                 result = self.read_tx.send(Packet { addr: Arc::clone(&session), data: payload }) => {
                     if result.is_err() {
-                        return;
+                        break;
                     }
                 }
             }
         }
+        self.remove_session_if(session.session_id(), &session);
+    }
+
+    /// Drops `session_id` only while it still maps to `session`, so the removal that follows a
+    /// closed session can never take a replacement created under the same id with it.
+    pub(crate) fn remove_session_if(&self, session_id: &[u8], session: &Arc<ServerSession>) {
+        let mut state = self.state.lock();
+        let Some(sessions) = state.sessions.as_mut() else {
+            return;
+        };
+        if sessions.get(session_id).is_some_and(|stored| Arc::ptr_eq(stored, session)) {
+            sessions.remove(session_id);
+        }
+        drop(state);
+    }
+
+    #[cfg(test)]
+    pub(crate) fn session_count(&self) -> usize {
+        self.state.lock().sessions.as_ref().map_or(0, HashMap::len)
     }
 }
 
