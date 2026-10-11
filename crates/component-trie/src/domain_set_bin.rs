@@ -3,9 +3,10 @@ use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 
 use super::domain_set::DomainSet;
 
-/// The largest count a serialized set may declare — leaf bits, bitmap words or label bytes. Far
-/// past any real domain rule set, so a larger count is a malformed payload rather than work to do.
-const MAX_BIN_COUNT: i64 = 1 << 26;
+/// The largest count a serialized set or map may declare — leaf bits, bitmap words, label bytes or
+/// map values. Far past any real rule set, so a larger count is a malformed payload rather than
+/// work to do.
+pub(crate) const MAX_BIN_COUNT: i64 = 1 << 26;
 
 impl DomainSet {
     pub async fn write_bin<W: AsyncWrite + Unpin>(&self, w: &mut W) -> Result<()> {

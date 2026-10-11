@@ -2,7 +2,7 @@ use anyhow::{anyhow, Result};
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 
 use super::domain_map::{DomainMap, DomainMapIndex};
-use super::domain_set_bin::{read_domain_set_bin, read_i64_bin};
+use super::domain_set_bin::{read_domain_set_bin, read_i64_bin, MAX_BIN_COUNT};
 
 impl<T> DomainMap<T> {
     /// The wire format is unchanged. `write_value` appends the encoding of one
@@ -62,9 +62,12 @@ where
     if length < 1 {
         return Err(anyhow!("length is invalid"));
     }
+    if length > MAX_BIN_COUNT {
+        return Err(anyhow!("value count {length} exceeds the maximum of {MAX_BIN_COUNT}"));
+    }
     let mut buffer: Vec<u8> = Vec::new();
     let mut offset: usize = 0;
-    let mut values: Vec<T> = Vec::with_capacity(usize::try_from(length)?);
+    let mut values: Vec<T> = Vec::new();
     for _ in 0..length {
         loop {
             let rest = buffer.get(offset..).unwrap_or_default();
@@ -87,4 +90,39 @@ where
 
     mapping.init();
     Ok(mapping)
+}
+
+#[cfg(test)]
+mod tests {
+    use tokio::io::AsyncWriteExt;
+
+    use super::*;
+
+    /// A one-word domain set followed by an empty value list header, then `value_count`.
+    async fn map_stream(value_count: i64) -> Vec<u8> {
+        let mut stream: Vec<u8> = Vec::new();
+        stream.write_all(&[1]).await.expect("set version");
+        stream.write_all(&1i64.to_be_bytes()).await.expect("leaf count");
+        stream.write_all(&0u64.to_be_bytes()).await.expect("leaf");
+        stream.write_all(&1i64.to_be_bytes()).await.expect("bitmap count");
+        stream.write_all(&0u64.to_be_bytes()).await.expect("bitmap word");
+        stream.write_all(&1i64.to_be_bytes()).await.expect("label count");
+        stream.write_all(b"a").await.expect("label");
+        stream.write_all(&[0]).await.expect("separator");
+        stream.write_all(&[1]).await.expect("map version");
+        stream.write_all(&value_count.to_be_bytes()).await.expect("value count");
+        stream
+    }
+
+    #[tokio::test]
+    async fn a_map_declaring_a_value_count_past_the_bound_is_rejected() {
+        let stream = map_stream(1i64 << 40).await;
+
+        let err = read_domain_map_bin(&mut stream.as_slice(), |_: &[u8]| -> Result<Option<(u64, usize)>> { Ok(None) })
+            .await
+            .err()
+            .expect("implausible value count");
+
+        assert!(err.to_string().contains("exceeds the maximum"), "{err}");
+    }
 }
