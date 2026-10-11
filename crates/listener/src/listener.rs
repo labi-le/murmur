@@ -277,58 +277,64 @@ pub async fn re_create_socks(port: i32, tunnel: Arc<dyn Tunnel>) {
     state.udp_listener = Some(udp_listener);
 }
 
+/// Re-creates the redir halves, each on its own: a UDP bind that failed earlier is retried by the
+/// next reload (the relay is never marked done while `udp_listener` is empty), and a TCP half that
+/// already serves `addr` is left bound rather than rebound.
 pub async fn re_create_redir(port: i32, tunnel: Arc<dyn Tunnel>) {
     let mut state = REDIR_MUX.lock().await;
 
     let addr = gen_addr(&bind_address(), port, allow_lan());
 
+    let mut should_tcp_ignore = false;
+    let mut should_udp_ignore = false;
+
     if let Some(listener) = &state.listener {
         if listener.raw_address() == addr {
-            return;
+            should_tcp_ignore = true;
+        } else {
+            let _ = listener.close();
+            state.listener = None;
         }
-        let _ = listener.close();
-        state.listener = None;
     }
 
     if let Some(listener) = &state.udp_listener {
         if listener.raw_address() == addr {
-            return;
+            should_udp_ignore = true;
+        } else {
+            let _ = listener.close();
+            state.udp_listener = None;
         }
-        let _ = listener.close();
-        state.udp_listener = None;
+    }
+
+    if should_tcp_ignore && should_udp_ignore {
+        return;
     }
 
     if port_is_zero(&addr) {
         return;
     }
 
-    let listener = match redir_tcp::new(&addr, Arc::clone(&tunnel), &[]).await {
-        Ok(l) => l,
-        Err(e) => {
-            errorln!("Start Redir server error: {}", e);
-            return;
+    if !should_tcp_ignore {
+        match redir_tcp::new(&addr, Arc::clone(&tunnel), &[]).await {
+            Ok(listener) => {
+                infoln!("Redirect proxy listening at: {}", listener.address());
+                state.listener = Some(listener);
+            }
+            Err(e) => {
+                errorln!("Start Redir server error: {}", e);
+                return;
+            }
         }
-    };
+    }
 
-    let mut deferred_err: Option<anyhow::Error> = None;
-    let udp_listener = match tproxy_udp::new_udp(&addr, tunnel, Vec::new()).await {
-        Ok(l) => Some(l),
-        Err(e) => {
-            warnln!("Failed to start Redir UDP Listener: {}", e);
-            deferred_err = Some(e);
-            None
+    if !should_udp_ignore {
+        match tproxy_udp::new_udp(&addr, tunnel, Vec::new()).await {
+            Ok(l) => state.udp_listener = Some(l),
+            Err(e) => {
+                warnln!("Failed to start Redir UDP Listener: {}", e);
+                errorln!("Start Redir server error: {}", e);
+            }
         }
-    };
-
-    infoln!("Redirect proxy listening at: {}", listener.address());
-    state.udp_listener = udp_listener;
-    state.listener = Some(listener);
-    drop(state);
-
-    // the shared `err` variable is still set from the UDP failure above, so the
-    // deferred error check fires once more after the success log line.
-    if let Some(e) = deferred_err {
-        errorln!("Start Redir server error: {}", e);
     }
 }
 
@@ -497,56 +503,62 @@ pub async fn re_create_tuic(config: LcTuicServer, tunnel: Arc<dyn Tunnel>) {
     state.last_conf = config;
 }
 
+/// The tproxy counterpart of [`re_create_redir`], with the same per-half retry.
 pub async fn re_create_tproxy(port: i32, tunnel: Arc<dyn Tunnel>) {
     let mut state = TPROXY_MUX.lock().await;
 
     let addr = gen_addr(&bind_address(), port, allow_lan());
 
+    let mut should_tcp_ignore = false;
+    let mut should_udp_ignore = false;
+
     if let Some(listener) = &state.listener {
         if listener.raw_address() == addr {
-            return;
+            should_tcp_ignore = true;
+        } else {
+            let _ = listener.close();
+            state.listener = None;
         }
-        let _ = listener.close();
-        state.listener = None;
     }
 
     if let Some(listener) = &state.udp_listener {
         if listener.raw_address() == addr {
-            return;
+            should_udp_ignore = true;
+        } else {
+            let _ = listener.close();
+            state.udp_listener = None;
         }
-        let _ = listener.close();
-        state.udp_listener = None;
+    }
+
+    if should_tcp_ignore && should_udp_ignore {
+        return;
     }
 
     if port_is_zero(&addr) {
         return;
     }
 
-    let listener = match tproxy_tcp::new(&addr, Arc::clone(&tunnel), Vec::new()).await {
-        Ok(l) => l,
-        Err(e) => {
-            errorln!("Start TProxy server error: {}", e);
-            return;
+    if !should_tcp_ignore {
+        match tproxy_tcp::new(&addr, Arc::clone(&tunnel), Vec::new()).await {
+            Ok(listener) => {
+                infoln!("TProxy server listening at: {}", listener.address());
+                state.listener = Some(listener);
+            }
+            Err(e) => {
+                errorln!("Start TProxy server error: {}", e);
+                return;
+            }
         }
-    };
+    }
 
-    let mut deferred_err: Option<anyhow::Error> = None;
-    let udp_listener = match tproxy_udp::new_udp(&addr, tunnel, Vec::new()).await {
-        Ok(l) => Some(l),
-        Err(e) => {
-            warnln!("Failed to start TProxy UDP Listener: {}", e);
-            deferred_err = Some(e);
-            None
+    if !should_udp_ignore {
+        match tproxy_udp::new_udp(&addr, tunnel, Vec::new()).await {
+            Ok(l) => state.udp_listener = Some(l),
+            Err(e) => {
+                warnln!("Failed to start TProxy UDP Listener: {}", e);
+                errorln!("Start TProxy server error: {}", e);
+            }
         }
-    };
-
-    infoln!("TProxy server listening at: {}", listener.address());
-    state.udp_listener = udp_listener;
-    state.listener = Some(listener);
-    drop(state);
-
-    if let Some(e) = deferred_err {
-        errorln!("Start TProxy server error: {}", e);
     }
 }
 
@@ -807,10 +819,12 @@ fn gen_addr(host: &str, port: i32, allow_lan: bool) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use murmur_common::observable::subscriber::Subscription;
     use murmur_common_net::io::Stream;
     use murmur_component_nat::table::Table;
     use murmur_constant::adapters::{NatTable, UDPPacket};
     use murmur_constant::metadata::Metadata;
+    use murmur_log::Event;
 
     #[tokio::test]
     async fn wildcard_lan_address_accepts_ipv4_tcp_connections() {
@@ -913,5 +927,63 @@ mod tests {
             assert_eq!(stored.mtu, 9000);
             assert_eq!(stored.stack, config.stack);
         }
+    }
+
+    async fn redir_state(port: i32) -> (bool, bool) {
+        let state = REDIR_MUX.lock().await;
+        let addr = gen_addr(&bind_address(), port, allow_lan());
+        (state.listener.as_ref().is_some_and(|listener| listener.raw_address() == addr), state.udp_listener.is_some())
+    }
+
+    async fn close_redir() {
+        let mut state = REDIR_MUX.lock().await;
+        if let Some(listener) = state.listener.take() {
+            let _ = listener.close();
+        }
+        if let Some(listener) = state.udp_listener.take() {
+            let _ = listener.close();
+        }
+    }
+
+    /// Waits for `want` redir-UDP warnings, so a retry that never happens fails the count instead
+    /// of hanging the run.
+    async fn redir_udp_warnings(logs: &Subscription<Event>, want: usize) -> usize {
+        let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(5);
+        let mut seen = 0;
+        while seen < want {
+            let Ok(Some(event)) = tokio::time::timeout_at(deadline, logs.recv()).await else {
+                break;
+            };
+            if event.payload.contains("Failed to start Redir UDP Listener") {
+                seen += 1;
+            }
+        }
+        seen
+    }
+
+    /// The redir UDP half tolerates a failed bind and stays absent, so the next re-create has to
+    /// reach the UDP bind again even though the TCP half already serves the same address.
+    #[tokio::test]
+    async fn a_failed_redir_udp_bind_is_retried_on_the_next_re_create() {
+        let logs = murmur_log::subscribe().await.expect("a log subscription");
+        let holder = std::net::UdpSocket::bind((std::net::Ipv4Addr::LOCALHOST, 0)).expect("a held UDP port");
+        let port = i32::from(holder.local_addr().expect("the held address").port());
+
+        re_create_redir(port, null_tunnel()).await;
+
+        let (tcp_bound, udp_bound) = redir_state(port).await;
+        assert!(tcp_bound, "the TCP half takes the address the held UDP port leaves free");
+        assert!(!udp_bound, "the held UDP port cannot be bound");
+        assert_eq!(redir_udp_warnings(&logs, 1).await, 1);
+
+        drop(holder);
+        re_create_redir(port, null_tunnel()).await;
+
+        if !redir_state(port).await.1 {
+            assert_eq!(redir_udp_warnings(&logs, 1).await, 1, "the retry must reach the UDP bind");
+        }
+
+        close_redir().await;
+        murmur_log::un_subscribe(logs).await;
     }
 }
