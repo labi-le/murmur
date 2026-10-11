@@ -277,9 +277,10 @@ pub async fn re_create_socks(port: i32, tunnel: Arc<dyn Tunnel>) {
     state.udp_listener = Some(udp_listener);
 }
 
-/// Re-creates the redir halves, each on its own: a UDP bind that failed earlier is retried by the
-/// next reload (the relay is never marked done while `udp_listener` is empty), and a TCP half that
-/// already serves `addr` is left bound rather than rebound.
+/// Re-creates the redir halves.
+///
+/// Each half is bound on its own: a UDP bind that failed earlier is retried by the next reload
+/// (`udp_listener` stays empty), and a TCP half already serving `addr` stays bound.
 pub async fn re_create_redir(port: i32, tunnel: Arc<dyn Tunnel>) {
     let mut state = REDIR_MUX.lock().await;
 
@@ -336,6 +337,8 @@ pub async fn re_create_redir(port: i32, tunnel: Arc<dyn Tunnel>) {
             }
         }
     }
+
+    drop(state);
 }
 
 pub async fn re_create_shadow_socks(shadow_socks_config: &str, tunnel: Arc<dyn Tunnel>) {
@@ -560,6 +563,8 @@ pub async fn re_create_tproxy(port: i32, tunnel: Arc<dyn Tunnel>) {
             }
         }
     }
+
+    drop(state);
 }
 
 pub async fn re_create_mixed(port: i32, tunnel: Arc<dyn Tunnel>) {
