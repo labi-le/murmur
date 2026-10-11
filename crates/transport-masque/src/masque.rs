@@ -1562,6 +1562,10 @@ pub mod h3 {
     const MAX_QUARTER_STREAM_ID: u64 = (1 << 60) - 1;
     const STREAM_DATAGRAM_QUEUE_LEN: usize = 32;
 
+    /// A SETTINGS frame is (identifier, value) varint pairs of at most ten bytes each, so 16 KiB is
+    /// far above any real one, and the peer declares its length in two varint bytes.
+    const MAX_SETTINGS_FRAME_LEN: u64 = 16 * 1024;
+
     /// The frames preceding the final response may not exceed the field-section size this client
     /// advertises, which bounds both the allocation and the loop.
     const MAX_RESPONSE_PREAMBLE_BYTES: u64 = DEFAULT_MAX_FIELD_SECTION_SIZE;
@@ -1614,6 +1618,18 @@ pub mod h3 {
             Err(quinn::ReadExactError::FinishedEarly(_)) => Err(anyhow!("unexpected EOF")),
             Err(quinn::ReadExactError::ReadError(err)) => Err(anyhow!("{err}")),
         }
+    }
+
+    /// Reads one frame payload of the peer-declared `length`, which is bounded by `max_len` before
+    /// anything is allocated for it.
+    async fn read_payload_capped(recv: &mut RecvStream, length: u64, max_len: u64) -> anyhow::Result<Vec<u8>> {
+        if length > max_len {
+            return Err(anyhow!("http3: frame payload exceeds {max_len} bytes"));
+        }
+        let length = usize::try_from(length).map_err(|_err| anyhow!("http3: frame payload too large"))?;
+        let mut payload = vec![0u8; length];
+        read_full(recv, &mut payload).await?;
+        Ok(payload)
     }
 
     async fn discard(recv: &mut RecvStream, length: u64) -> anyhow::Result<()> {
@@ -1817,9 +1833,11 @@ pub mod h3 {
                 self.close_with_error(H3_MISSING_SETTINGS, "missing SETTINGS frame");
                 return Err(anyhow!("http3: missing SETTINGS frame"));
             }
-            let length = usize::try_from(length).map_err(|_err| anyhow!("http3: SETTINGS frame too large"))?;
-            let mut payload = vec![0u8; length];
-            read_full(recv, &mut payload).await?;
+            if length > MAX_SETTINGS_FRAME_LEN {
+                self.close_with_error(H3_EXCESSIVE_LOAD, "SETTINGS frame too large");
+                return Err(anyhow!("http3: SETTINGS frame exceeds {MAX_SETTINGS_FRAME_LEN} bytes"));
+            }
+            let payload = read_payload_capped(recv, length, MAX_SETTINGS_FRAME_LEN).await?;
             let settings = parse_settings(&payload).inspect_err(|_err| {
                 self.close_with_error(H3_SETTINGS_ERROR, "invalid SETTINGS frame");
             })?;
@@ -2210,10 +2228,7 @@ pub mod h3 {
         }
 
         async fn read_payload(&mut self, length: u64) -> anyhow::Result<Vec<u8>> {
-            let length = usize::try_from(length).map_err(|_err| anyhow!("http3: frame payload too large"))?;
-            let mut payload = vec![0u8; length];
-            read_full(&mut self.recv, &mut payload).await?;
-            Ok(payload)
+            read_payload_capped(&mut self.recv, length, DEFAULT_MAX_FIELD_SECTION_SIZE).await
         }
     }
 
@@ -3172,6 +3187,15 @@ pub mod h3 {
             }
         }
 
+        /// Starts a server control stream and writes its stream type.
+        async fn open_control_stream(pair: &TestPair) -> SendStream {
+            let mut control = pair.server.open_uni().await.expect("open the server control stream");
+            let mut stream_type: Vec<u8> = Vec::new();
+            quicvarint::append(&mut stream_type, STREAM_TYPE_CONTROL);
+            control.write_all(&stream_type).await.expect("write the control stream type");
+            control
+        }
+
         /// Writes one HTTP/3 frame header declaring `length`, with no payload.
         async fn write_frame_header(send: &mut SendStream, frame_type: u64, length: u64) {
             let mut header: Vec<u8> = Vec::new();
@@ -3204,6 +3228,40 @@ pub mod h3 {
             stream.send_request_header(&head).await.expect("write the request head");
             let (send, _recv) = pair.server.accept_bi().await.expect("the server accepts the request stream");
             (stream, send)
+        }
+
+        #[tokio::test]
+        async fn a_settings_frame_longer_than_the_cap_closes_the_connection_instead_of_allocating() {
+            let pair = connect_pair().await;
+            let mut control = open_control_stream(&pair).await;
+            write_frame_header(&mut control, FRAME_SETTINGS, 1 << 30).await;
+
+            let closed = timeout(FRAME_TIMEOUT, pair.server.closed())
+                .await
+                .expect("the client fails closed on a SETTINGS frame past the cap");
+            match closed {
+                ConnectionError::ApplicationClosed(app) => {
+                    assert_eq!(app.error_code, VarInt::from_u32(H3_EXCESSIVE_LOAD));
+                    assert_eq!(String::from_utf8_lossy(&app.reason), "SETTINGS frame too large");
+                }
+                err => panic!("expected an application close, got {err}"),
+            }
+        }
+
+        #[tokio::test]
+        async fn a_settings_frame_within_the_cap_is_parsed() {
+            let pair = connect_pair().await;
+            let mut control = open_control_stream(&pair).await;
+            let mut payload: Vec<u8> = Vec::new();
+            quicvarint::append(&mut payload, SETTING_MAX_FIELD_SECTION_SIZE);
+            quicvarint::append(&mut payload, 4096);
+            write_frame_header(&mut control, FRAME_SETTINGS, payload.len() as u64).await;
+            control.write_all(&payload).await.expect("write the SETTINGS payload");
+
+            let settings = timeout(FRAME_TIMEOUT, pair.client.received_settings())
+                .await
+                .expect("a SETTINGS frame within the cap is accepted");
+            assert_eq!(settings.max_field_section_size, 4096);
         }
 
         #[tokio::test]
