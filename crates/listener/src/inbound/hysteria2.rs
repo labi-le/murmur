@@ -595,7 +595,7 @@ fn reverse_proxy_tls_config(server_name: String) -> tls_c::Config {
         server_name: _,
         client_auth,
         client_cas,
-        insecure_skip_verify: _,
+        insecure_skip_verify,
         cipher_suites,
         session_tickets_disabled,
         min_version,
@@ -622,7 +622,7 @@ fn reverse_proxy_tls_config(server_name: String) -> tls_c::Config {
         server_name,
         client_auth,
         client_cas,
-        insecure_skip_verify: true,
+        insecure_skip_verify,
         cipher_suites,
         session_tickets_disabled,
         min_version,
@@ -1159,5 +1159,40 @@ mod tests {
 
         assert_eq!(response.status(), http::StatusCode::OK);
         assert_eq!(&response.body()[..], b"upstream body");
+    }
+
+    /// The decoy origin's certificate is what tells the probe it reached the site the config
+    /// named; relaying an unverified one hands the disguise to anyone on the path.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn the_https_masquerade_refuses_an_upstream_it_cannot_verify() {
+        murmur_testsupport_probe::ensure_test_crypto_provider();
+        let loader = new_tls_key_pair_loader(tls_certificate(), tls_private_key()).expect("test key pair loads");
+        let server_config = Arc::new(tls_c::Config {
+            certificates: vec![loader().expect("certificate loads")],
+            next_protos: vec!["http/1.1".to_owned()],
+            ..Default::default()
+        });
+
+        let upstream = tokio::net::TcpListener::bind("127.0.0.1:0").await.expect("bind the upstream");
+        let upstream_addr = upstream.local_addr().expect("upstream address");
+        tokio::spawn(async move {
+            let Ok((raw, _)) = upstream.accept().await else { return };
+            let mut conn = tls_c::server(Box::new(raw), server_config);
+            let mut buf = vec![0u8; 4096];
+            if conn.read(&mut buf).await.is_err() {
+                return;
+            }
+            let body = b"upstream body";
+            let head = format!("HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n", body.len());
+            let _ = conn.write_all(head.as_bytes()).await;
+            let _ = conn.write_all(body).await;
+        });
+
+        let tunnel: Arc<dyn Tunnel> = Arc::new(LoopbackTunnel::new());
+        let masquerade =
+            Masquerade::parse(&format!("https://{upstream_addr}/"), tunnel).expect("parse the https masquerade");
+        let response = masquerade.serve(&masquerade_request("/")).await;
+
+        assert_eq!(response.status(), http::StatusCode::BAD_GATEWAY, "an unverifiable upstream is not relayed");
     }
 }
