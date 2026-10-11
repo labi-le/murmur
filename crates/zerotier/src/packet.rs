@@ -199,9 +199,6 @@ impl Verb {
 #[derive(Debug, Clone)]
 pub struct Packet {
     data: Vec<u8>,
-    /// Retained after the wire buffer is handed to a transport, so a request's
-    /// ID survives for deduplication bookkeeping.
-    sent_packet_id: u64,
     /// Append errors are sticky so a caller cannot ignore one and then transmit
     /// a truncated packet.
     err: bool,
@@ -229,7 +226,7 @@ impl Packet {
         field_mut(&mut data, DEST_OFFSET, SOURCE_OFFSET).copy_from_slice(&destination.bytes());
         field_mut(&mut data, SOURCE_OFFSET, FLAGS_OFFSET).copy_from_slice(&source.bytes());
         set_byte_at(&mut data, VERB_OFFSET, verb.bits());
-        Ok(Self { data, sent_packet_id: 0, err: false })
+        Ok(Self { data, err: false })
     }
 
     /// Copies and validates the common bounds of one wire packet.
@@ -237,7 +234,7 @@ impl Packet {
         if data.len() < MIN_PACKET_SIZE || data.len() > MAX_PACKET_SIZE {
             return Err(PacketError::Invalid);
         }
-        Ok(Self { data: data.to_vec(), sent_packet_id: 0, err: false })
+        Ok(Self { data: data.to_vec(), err: false })
     }
 
     #[must_use]
@@ -424,10 +421,7 @@ impl Packet {
     /// The packet IV read as a network-order identifier.
     #[must_use]
     pub fn packet_id(&self) -> u64 {
-        if self.data.len() >= DEST_OFFSET {
-            return u64::from_be_bytes(field(&self.data, IV_OFFSET, DEST_OFFSET).try_into().unwrap_or_default());
-        }
-        self.sent_packet_id
+        u64::from_be_bytes(array::<8>(field(&self.data, IV_OFFSET, DEST_OFFSET)).unwrap_or_default())
     }
 
     /// Authenticates the packet and, when `encrypt` is set, encrypts its verb
@@ -700,6 +694,16 @@ fn aes_ctr_in_place(key: &[u8; 32], iv_prefix: &[u8], data: &mut [u8]) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The identifier the node deduplicates by is the packet's own IV field.
+    #[test]
+    fn packet_id_reads_the_iv_field() {
+        let mut bytes = vec![0u8; MIN_PACKET_SIZE];
+        bytes[..DEST_OFFSET].copy_from_slice(&0x0123_4567_89ab_cdefu64.to_be_bytes());
+
+        let packet = Packet::parse(&bytes).expect("a minimum-size packet parses");
+        assert_eq!(packet.packet_id(), 0x0123_4567_89ab_cdef);
+    }
 
     fn secret() -> Identity {
         Identity::generate()
