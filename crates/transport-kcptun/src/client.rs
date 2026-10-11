@@ -1,9 +1,9 @@
 //! Deviations, forced by the crate's types:
 //!
 //! * `CancellationToken` carries its own cancel handle, so `close` cancels `ctx` directly.
-//! * a one-shot initializer sets up the connection count, the mux set, the scavenger and the
-//!   round-robin cursor; Rust needs interior mutability for that, so the four live behind
-//!   atomics, a `parking_lot::Mutex` and an `OnceLock`. The connection lock guards the blocking
+//! * a one-shot initializer sets up the mux set, the scavenger and the round-robin cursor; Rust
+//!   needs interior mutability for that, so the three live behind an atomic, a
+//!   `parking_lot::Mutex` and an `OnceLock`. The connection lock guards the blocking
 //!   create call; it is a `tokio::sync::Mutex` so the lock survives the `.await` and the future
 //!   stays `Send`.
 //! * the session slot is `None` when the session has expired.
@@ -36,12 +36,6 @@ pub type DialFn = Box<
         + Sync,
 >;
 
-/// `numconn` is a 16-bit counter, so only the low half of the configured count is kept.
-fn low_u16(x: i32) -> u16 {
-    let [lo, hi, ..] = x.cast_unsigned().to_le_bytes();
-    u16::from_le_bytes([lo, hi])
-}
-
 /// A session wrapper with an expiry date.
 #[derive(Clone)]
 struct TimedSession {
@@ -54,7 +48,6 @@ pub struct Client {
     config: Config,
     block: Option<Arc<dyn kcp::BlockCrypt>>,
     ctx: CancellationToken,
-    numconn: AtomicU16,
     muxes: Mutex<Vec<TimedSession>>,
     rr: AtomicU16,
     conn_mu: tokio::sync::Mutex<()>,
@@ -77,7 +70,6 @@ impl Client {
             config,
             block,
             ctx: CancellationToken::new(),
-            numconn: AtomicU16::new(0),
             muxes: Mutex::new(Vec::new()),
             rr: AtomicU16::new(0),
             conn_mu: tokio::sync::Mutex::new(()),
@@ -153,7 +145,9 @@ impl Client {
         reason = "each slot guard outlives the entry borrowed from it, so neither lock can be released before the clone completes"
     )]
     pub async fn open_stream(&self, ctx: &CancellationToken, dial: &DialFn) -> Result<Box<dyn NetConn>> {
-        let slots = self.config.conn.cast_unsigned() as usize;
+        let numconn = u16::try_from(self.config.conn)
+            .map_err(|_| anyhow::anyhow!("kcptun: conn must be between 1 and 65535, got {}", self.config.conn))?;
+        let slots = usize::from(numconn);
         self.once.call_once(|| {
             let (tx, rx) = mpsc::channel(128);
             if self.config.auto_expire > 0 {
@@ -161,14 +155,12 @@ impl Client {
             }
             let _ = self.ch_scavenger.set(tx);
 
-            self.numconn.store(low_u16(self.config.conn), Ordering::SeqCst);
             *self.muxes.lock() = vec![TimedSession { session: None, expiry_date: DateTime::<Utc>::MIN_UTC }; slots];
             self.rr.store(0, Ordering::SeqCst);
         });
 
         let session = {
             let _guard = self.conn_mu.lock().await;
-            let numconn = self.numconn.load(Ordering::SeqCst);
             let idx = (self.rr.load(Ordering::SeqCst) % numconn) as usize;
 
             let (current, expiry_date) = {
@@ -263,5 +255,46 @@ async fn scavenger(ctx: CancellationToken, mut ch: mpsc::Receiver<TimedSession>,
             }
             () = ctx.cancelled() => return,
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn unreachable_dial() -> DialFn {
+        Box::new(|_ctx| Box::pin(async { Err(anyhow::anyhow!("the test dial must not be reached")) }))
+    }
+
+    /// Bug #108: `numconn` took only the low 16 bits of `conn` while `slots` took the whole `i32`,
+    /// so a multiple of 65536 divided by zero and a negative value asked for a ~4 GiB slot vector.
+    #[tokio::test]
+    async fn open_stream_rejects_a_conn_outside_the_u16_range() {
+        for conn in [65_536, 131_072, -1] {
+            let mut config = Config::default();
+            config.conn = conn;
+            let client = Client::new(config);
+            let ctx = CancellationToken::new();
+
+            let err = client
+                .open_stream(&ctx, &unreachable_dial())
+                .await
+                .err()
+                .unwrap_or_else(|| panic!("conn {conn} must be rejected before any dial"));
+
+            assert!(err.to_string().contains("conn"), "conn {conn}: {err}");
+        }
+    }
+
+    #[tokio::test]
+    async fn open_stream_dials_when_conn_is_within_the_u16_range() {
+        let mut config = Config::default();
+        config.conn = 2;
+        let client = Client::new(config);
+        let ctx = CancellationToken::new();
+
+        let err = client.open_stream(&ctx, &unreachable_dial()).await.err().expect("the stubbed dial fails");
+
+        assert!(err.to_string().contains("the test dial must not be reached"), "{err}");
     }
 }
