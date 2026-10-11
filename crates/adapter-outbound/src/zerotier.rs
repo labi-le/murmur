@@ -940,6 +940,8 @@ async fn run_runtime(
             refresh_direct_paths(&host.shared, &inputs.interface_name).await;
             next_direct_paths = SystemTime::now();
         }
+        // `UdpWire` keeps its queue open for the wire's lifetime, so the loop can only leave
+        // through the cancellation arm; a runtime thread that unwinds is reaped by `start`.
         tokio::select! {
             () = cancel.cancelled() => break,
             () = host.shared.wake.notified() => {}
@@ -954,14 +956,6 @@ async fn run_runtime(
     }
     flush_datagrams(&wire, &host.shared).await;
     node.close();
-    // A loop that ends without a cancellation would otherwise leave callers waiting on a wire that
-    // no longer exists.
-    if !cancel.is_cancelled() {
-        shared.set_network_failure(
-            Some(Arc::new(anyhow!("ZeroTier runtime stopped: the UDP wire is no longer readable"))),
-            "",
-        );
-    }
 }
 
 /// What the stack transmitted becomes ZeroTier frames.
