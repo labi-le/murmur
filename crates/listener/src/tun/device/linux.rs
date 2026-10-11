@@ -259,12 +259,14 @@ fn write_ifreq_name(ifr: &mut libc::ifreq, name: &str) -> io::Result<()> {
     Ok(())
 }
 
-#[expect(unsafe_code, reason = "if_nametoindex only reads the NUL-terminated name")]
+#[expect(unsafe_code, reason = "if_nametoindex on a live CString local")]
 fn ifindex(name: &str) -> Result<u32> {
-    // Safety: `if_nametoindex` only reads the NUL-terminated name.
-    let index = unsafe { libc::if_nametoindex(name.as_ptr().cast()) };
+    let name = std::ffi::CString::new(name)
+        .map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "interface name contains a NUL byte"))?;
+    // Safety: `name` is a live `CString`, so the pointer is NUL-terminated for the call.
+    let index = unsafe { libc::if_nametoindex(name.as_ptr()) };
     if index == 0 {
-        return Err(io::Error::last_os_error()).with_context(|| format!("if_nametoindex {name}"));
+        return Err(io::Error::last_os_error()).with_context(|| format!("if_nametoindex {}", name.to_string_lossy()));
     }
     Ok(index)
 }
@@ -272,7 +274,7 @@ fn ifindex(name: &str) -> Result<u32> {
 #[cfg(test)]
 #[allow(unsafe_code, reason = "tests seed a live kernel request struct the same way the production ioctl paths do")]
 mod tests {
-    use super::{read_ifreq_name, write_ifreq_name};
+    use super::{ifindex, read_ifreq_name, write_ifreq_name};
 
     fn zeroed_ifreq() -> libc::ifreq {
         unsafe { std::mem::zeroed() }
@@ -331,5 +333,13 @@ mod tests {
 
         let exactly = "n".repeat(libc::IF_NAMESIZE - 1);
         assert!(write_ifreq_name(&mut ifr, &exactly).is_ok(), "one byte under the limit fits");
+    }
+
+    /// The syscall reads a C string, so a `&str` view whose allocation continues past it must
+    /// still resolve to the name in the view rather than to the longer byte run behind it.
+    #[test]
+    fn ifindex_hands_the_syscall_a_terminated_name() {
+        let padded = format!("lo{}", "n".repeat(16));
+        assert_eq!(ifindex(&padded[..2]).expect("the view names an interface"), ifindex("lo").expect("lo"));
     }
 }
