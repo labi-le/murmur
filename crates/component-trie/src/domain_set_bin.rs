@@ -10,6 +10,10 @@ pub(crate) const MAX_BIN_COUNT: i64 = 1 << 26;
 
 impl DomainSet {
     pub async fn write_bin<W: AsyncWrite + Unpin>(&self, w: &mut W) -> Result<()> {
+        if self.leaves.is_empty() || self.label_bitmap.is_empty() || self.labels.is_empty() {
+            return Err(anyhow!("empty domainSet"));
+        }
+
         w.write_all(&[1]).await?;
 
         w.write_all(&i64::try_from(self.leaves.len())?.to_be_bytes()).await?;
@@ -92,6 +96,34 @@ mod tests {
     use tokio::io::AsyncWriteExt;
 
     use super::read_domain_set_bin;
+    use crate::domain_set::{DomainSet, DomainSetBuilder};
+
+    #[tokio::test]
+    async fn an_empty_set_is_refused_instead_of_written_as_a_stream_the_reader_rejects() {
+        let mut stream: Vec<u8> = Vec::new();
+
+        let err = DomainSet::default().write_bin(&mut stream).await.err().expect("empty set");
+
+        assert!(stream.is_empty(), "the writer must not emit a partial stream");
+        assert!(err.to_string().contains("empty domainSet"), "{err}");
+    }
+
+    #[tokio::test]
+    async fn a_built_set_round_trips_through_the_writer_and_the_reader() {
+        let mut builder = DomainSetBuilder::default();
+        builder.insert("example.com").expect("valid domain");
+        builder.insert("a.example.com").expect("valid domain");
+        let set = builder.build().expect("non-empty set");
+
+        let mut stream: Vec<u8> = Vec::new();
+        set.write_bin(&mut stream).await.expect("non-empty set");
+
+        let restored = read_domain_set_bin(&mut stream.as_slice()).await.expect("valid stream");
+
+        assert_eq!(restored, set);
+        assert!(restored.has("example.com"));
+        assert!(restored.has("a.example.com"));
+    }
 
     #[tokio::test]
     async fn a_stream_declaring_a_leaf_count_past_the_bound_is_rejected() {
