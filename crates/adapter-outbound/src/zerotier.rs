@@ -603,17 +603,34 @@ impl ZeroTier {
         if self.ctx.is_cancelled() || self.shared.state.lock().closed {
             return Err(anyhow!("{OUTBOUND_CLOSED}"));
         }
-        if self.runtime.lock().is_some() {
+        if self.live_runtime_stored() {
             return Ok(());
         }
         let _guard = self.start_lock.lock().await;
         if self.ctx.is_cancelled() || self.shared.state.lock().closed {
             return Err(anyhow!("{OUTBOUND_CLOSED}"));
         }
-        if self.runtime.lock().is_some() {
+        if self.live_runtime_stored() {
             return Ok(());
         }
         self.start_runtime().await
+    }
+
+    /// Whether the stored runtime is still running. A handle whose thread has returned is dropped
+    /// here, so `start` never reports a node the adapter no longer has.
+    fn live_runtime_stored(&self) -> bool {
+        let stopped = {
+            let mut runtime = self.runtime.lock();
+            match runtime.as_ref() {
+                None => return false,
+                Some(handle) if !handle.thread.is_finished() => return true,
+                Some(_) => runtime.take(),
+            }
+        };
+        if let Some(stopped) = stopped {
+            stopped.close();
+        }
+        false
     }
 
     async fn start_runtime(&self) -> Result<()> {
@@ -2031,6 +2048,46 @@ mod tests {
         );
         assert!(outbound.ensure_started(&ctx).await.is_err());
         assert!(outbound.close().is_ok());
+    }
+
+    /// Waits until a runtime thread has returned, so a test pins what a stopped runtime leaves
+    /// behind instead of a timing window.
+    fn wait_for_thread_exit(thread: &std::thread::JoinHandle<()>) {
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while !thread.is_finished() {
+            assert!(Instant::now() < deadline, "the runtime thread did not return");
+            std::thread::yield_now();
+        }
+    }
+
+    fn ad_hoc_outbound(name: &str, state_dir: &str) -> Arc<ZeroTier> {
+        ZeroTier::new(ZeroTierOption {
+            name: name.to_owned(),
+            network: "ff0000ff00000000".to_owned(),
+            state_dir: state_dir.to_owned(),
+            ..Default::default()
+        })
+        .expect("an ad-hoc network ID is a valid option")
+    }
+
+    /// A handle whose thread has already returned must not be reported as a running node.
+    #[tokio::test]
+    async fn a_start_after_the_runtime_thread_stopped_starts_a_new_runtime() {
+        let state_dir = format!("zerotier-test-stopped-{}", std::process::id());
+        let _ = std::fs::remove_dir_all(PATH.resolve(&state_dir));
+        let outbound = ad_hoc_outbound("zt-stopped", &state_dir);
+        let stopped = RuntimeHandle { cancel: outbound.ctx.child_token(), thread: std::thread::spawn(|| {}) };
+        wait_for_thread_exit(&stopped.thread);
+        *outbound.runtime.lock() = Some(stopped);
+
+        outbound.start().await.expect("the stopped runtime is replaced by a live one");
+        assert!(
+            outbound.runtime.lock().as_ref().is_some_and(|handle| !handle.thread.is_finished()),
+            "start must leave a live runtime, not the dead handle it found"
+        );
+
+        outbound.close().expect("close");
+        let _ = std::fs::remove_dir_all(PATH.resolve(&state_dir));
     }
 
     /// Only a host that is not already an address is resolved.
