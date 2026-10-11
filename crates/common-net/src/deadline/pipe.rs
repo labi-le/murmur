@@ -111,18 +111,26 @@ impl CloseSignalWaiter {
 /// A point in time at which the deadline fires, and the signal it fires through.
 #[derive(Debug)]
 pub struct PipeDeadline {
-    mu: Mutex<PipeDeadlineInner>,
+    mu: Arc<Mutex<PipeDeadlineInner>>,
 }
 
 #[derive(Debug)]
 struct PipeDeadlineInner {
     timer: Option<tokio::task::JoinHandle<()>>,
     cancel: Arc<CloseSignal>,
+    /// Bumped by every `set`, so a timer that fired out of an already-replaced arm can tell.
+    generation: u64,
 }
 
 #[must_use]
 pub fn make_pipe_deadline() -> PipeDeadline {
-    PipeDeadline { mu: Mutex::new(PipeDeadlineInner { timer: None, cancel: Arc::new(CloseSignal::new()) }) }
+    PipeDeadline {
+        mu: Arc::new(Mutex::new(PipeDeadlineInner {
+            timer: None,
+            cancel: Arc::new(CloseSignal::new()),
+            generation: 0,
+        })),
+    }
 }
 
 impl PipeDeadline {
@@ -131,12 +139,17 @@ impl PipeDeadline {
     /// future.
     ///
     /// `None` disarms it. A `t` in the past fires it immediately.
+    ///
+    /// A `set` that races an already-firing timer always wins: the timer closes the signal only if
+    /// the generation it captured is still current under this method's own mutex.
     pub fn set(&self, t: Option<DateTime<Utc>>) {
         let mut inner = self.mu.lock();
 
         if let Some(timer) = inner.timer.take() {
             timer.abort();
         }
+        inner.generation += 1;
+        let generation = inner.generation;
 
         let closed = inner.cancel.is_closed();
         let Some(t) = t else {
@@ -155,9 +168,13 @@ impl PipeDeadline {
                 inner.cancel = Arc::new(CloseSignal::new());
             }
             let cancel = Arc::clone(&inner.cancel);
+            let mu = Arc::clone(&self.mu);
             inner.timer = Some(tokio::spawn(async move {
                 tokio::time::sleep(until.to_std().unwrap_or(Duration::MAX)).await;
-                cancel.close();
+                let inner = mu.lock();
+                if inner.generation == generation {
+                    cancel.close();
+                }
             }));
             return;
         }
@@ -193,6 +210,7 @@ mod tests {
     use std::sync::atomic::{AtomicUsize, Ordering};
     use std::sync::Weak;
     use std::task::{Poll, Wake, Waker};
+    use std::time::Instant;
 
     use super::*;
 
@@ -376,6 +394,32 @@ mod tests {
         tokio::time::timeout(Duration::from_millis(50), re_armed.wait())
             .await
             .expect_err("a disarmed deadline must not fire");
+    }
+
+    /// A `set` racing an already-firing timer must win, so a re-arm is not cut short and a clear is
+    /// not overruled. Heavy: real timers and 4000 iterations spin-waiting onto the firing edge (a
+    /// paused clock removes the race), so `make test-heavy` runs it.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    #[ignore = "heavy: 4000-iteration real-timer race soak, see make test-heavy"]
+    async fn pipe_deadline_set_always_wins_a_race_with_the_firing_timer() {
+        for i in 0..4000u32 {
+            let deadline = make_pipe_deadline();
+            deadline.set(Some(Utc::now() + TimeDelta::microseconds(300)));
+            let until = Instant::now() + Duration::from_micros(300 + u64::from(i % 1500));
+            while Instant::now() < until {
+                std::hint::spin_loop();
+            }
+            if i % 2 == 0 {
+                deadline.set(None);
+            } else {
+                deadline.set(Some(Utc::now() + TimeDelta::seconds(60)));
+            }
+            tokio::time::sleep(Duration::from_millis(1)).await;
+            assert!(
+                !deadline.wait().is_closed(),
+                "iteration {i}: a set must win a race with an already-firing timer"
+            );
+        }
     }
 
     /// Every waiter registered before the close is woken, and a waiter arriving after it returns
