@@ -27,10 +27,7 @@ pub(crate) struct Digest<M: Bmixer> {
 }
 
 impl<M: Bmixer> Digest<M> {
-    #[expect(
-        clippy::unused_self,
-        reason = "the block size is read off a digest, as the interface states"
-    )]
+    #[expect(clippy::unused_self, reason = "the block size is read off a digest, as the interface states")]
     pub(crate) const fn block_size(&self) -> usize {
         1
     }

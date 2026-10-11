@@ -25,10 +25,7 @@ impl<T> OnceState<T> {
 
     /// The same panic value cannot be re-thrown on every call, since a Rust panic payload can only
     /// be resumed once; later calls panic with the first panic's message.
-    #[allow(
-        clippy::panic,
-        reason = "the once cell re-panics the stored payload on every call"
-    )]
+    #[allow(clippy::panic, reason = "the once cell re-panics the stored payload on every call")]
     fn raise(&mut self) -> ! {
         match self.panic_value.take() {
             Some(value) => resume_unwind(value),
