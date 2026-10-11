@@ -1,8 +1,10 @@
 //!
 //! Reflection over `dst` and struct tags at run time has no Rust counterpart, so a target struct
-//! describes itself through `serde` attributes instead. The tag is spelled out on the
-//! field, `omitempty` becomes an `Option` field or `#[serde(default)]`, an anonymous embedded
-//! struct and a `,remain` field both become `#[serde(flatten)]`, and `"-"` becomes `#[serde(skip)]`:
+//! describes itself through `serde` attributes instead.
+//!
+//! The tag is spelled out on the field, `omitempty` becomes an `Option` field or
+//! `#[serde(default)]`, an anonymous embedded struct and a `,remain` field both become
+//! `#[serde(flatten)]`, and `"-"` becomes `#[serde(skip)]`:
 //!
 //! ```text
 //! #[derive(Deserialize)]
