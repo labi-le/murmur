@@ -186,6 +186,7 @@ impl PipeDeadline {
     }
 
     /// The signal that closes when the deadline is exceeded.
+    #[must_use]
     pub fn wait(&self) -> Arc<CloseSignal> {
         Arc::clone(&self.mu.lock().cancel)
     }
