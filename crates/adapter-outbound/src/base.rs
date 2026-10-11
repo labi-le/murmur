@@ -16,9 +16,7 @@ use uuid::Uuid;
 use murmur_common::utils::uuid::new_uuid_v4;
 use murmur_common_net::io::{CancellableStream, Datagram, ExtendedStream, Stream};
 use murmur_common_net::tcpip::split_host_port;
-use murmur_common_net::{
-    new_deadline_enhance_packet_conn, new_enhance_datagram, new_ref_packet_conn, EnhancePacketConn, WaitReadFrom,
-};
+use murmur_common_net::{new_deadline_enhance_packet_conn, new_enhance_datagram, EnhancePacketConn, WaitReadFrom};
 use murmur_component::dialer::dialer::new_dialer;
 use murmur_component::dialer::options::{
     with_interface, with_mptcp, with_only_single_stack, with_prefer_ipv4, with_prefer_ipv6, with_routing_mark,
@@ -694,6 +692,7 @@ pub fn new_conn(c: Box<dyn Stream>, a: &dyn CProxyAdapter) -> Box<dyn CConn> {
 
 pub struct PacketConnWrapper {
     enhance: Mutex<Arc<dyn EnhancePacketConn>>,
+    keep_alive: Mutex<Vec<Arc<dyn Any + Send + Sync>>>,
     chain: Mutex<Chain>,
     pd_chain: Mutex<Chain>,
     adapter_name: String,
@@ -789,9 +788,9 @@ impl CPacketConn for PacketConnWrapper {
 
 impl AddRef for PacketConnWrapper {
     fn add_ref(&self, ref_: Arc<dyn Any + Send + Sync>) {
-        let mut guard = self.enhance.lock();
-        let inner_pc = Arc::clone(&*guard).into_packet_conn();
-        *guard = new_ref_packet_conn(inner_pc, ref_);
+        // Wrapping `enhance` in a ref-holding conn would hide the deadline layer installed by
+        // `new_packet_conn`; the marker is held beside it instead, exactly as `ConnWrapper` does.
+        self.keep_alive.lock().push(ref_);
     }
 }
 
@@ -836,6 +835,7 @@ pub fn new_packet_conn(pc: Arc<dyn Datagram>, a: Arc<dyn ProxyAdapter>) -> Arc<d
     let epc = new_deadline_enhance_packet_conn(enhanced);
     let cpc = PacketConnWrapper {
         enhance: Mutex::new(epc),
+        keep_alive: Mutex::new(Vec::new()),
         chain: Mutex::new(Chain::default()),
         pd_chain: Mutex::new(Chain::default()),
         adapter_name: a.name(),
@@ -984,6 +984,8 @@ pub fn new_auto_close_proxy_adapter(adapter: Arc<dyn ProxyAdapter>) -> Arc<dyn P
 
 #[cfg(test)]
 mod tests {
+    use std::time::Duration;
+
     use super::*;
 
     const PUBLIC_KEY: &str = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA";
@@ -1108,5 +1110,203 @@ mod tests {
         assert!(!direct.tfo && !flattened.basic_option.tfo);
         assert!(direct.interface.is_empty() && direct.dialer_proxy.is_empty() && direct.routing_mark == 0);
         assert_eq!(direct.ip_version, DNSPrefer::default());
+    }
+
+    struct NeverYieldsDatagram;
+
+    #[async_trait]
+    impl Datagram for NeverYieldsDatagram {
+        async fn recv_from(&self, _buf: &mut [u8]) -> io::Result<(usize, SocketAddr)> {
+            std::future::pending().await
+        }
+
+        async fn send_to(&self, buf: &[u8], _addr: SocketAddr) -> io::Result<usize> {
+            Ok(buf.len())
+        }
+
+        fn local_addr(&self) -> io::Result<SocketAddr> {
+            Ok(SocketAddr::from((std::net::Ipv4Addr::LOCALHOST, 1)))
+        }
+    }
+
+    struct StubAdapter;
+
+    #[async_trait]
+    impl CProxyAdapter for StubAdapter {
+        fn name(&self) -> String {
+            "stub".to_owned()
+        }
+
+        fn type_(&self) -> AdapterType {
+            AdapterType::DIRECT
+        }
+
+        fn addr(&self) -> String {
+            "127.0.0.1:1".to_owned()
+        }
+
+        fn support_udp(&self) -> bool {
+            true
+        }
+
+        fn proxy_info(&self) -> ProxyInfo {
+            ProxyInfo::default()
+        }
+
+        fn marshal_json(&self) -> Result<Vec<u8>> {
+            Ok(Vec::new())
+        }
+
+        async fn dial_context(&self, _ctx: &CancellationToken, _metadata: &mut Metadata) -> Result<Box<dyn CConn>> {
+            Err(anyhow!("StubAdapter has no dial"))
+        }
+
+        async fn listen_packet_context(
+            &self,
+            _ctx: &CancellationToken,
+            _metadata: &mut Metadata,
+        ) -> Result<Arc<dyn CPacketConn>> {
+            Err(anyhow!("StubAdapter has no packet listener"))
+        }
+
+        fn support_uot(&self) -> bool {
+            false
+        }
+
+        fn is_l3_protocol(&self, _metadata: &Metadata) -> bool {
+            false
+        }
+
+        fn unwrap(&self, _metadata: &Metadata, _touch: bool) -> Option<Arc<dyn Proxy>> {
+            None
+        }
+
+        fn close(&self) -> Result<()> {
+            Ok(())
+        }
+    }
+
+    #[async_trait]
+    impl ProxyAdapter for StubAdapter {
+        fn dial_options(&self) -> Vec<DialerOption> {
+            Vec::new()
+        }
+
+        async fn resolve_udp(&self, _ctx: &CancellationToken, _metadata: &mut Metadata) -> Result<()> {
+            Ok(())
+        }
+    }
+
+    fn stub_packet_conn() -> Arc<dyn CPacketConn> {
+        new_packet_conn(Arc::new(NeverYieldsDatagram), Arc::new(StubAdapter))
+    }
+
+    fn packet_conn_wrapper(pc: &Arc<dyn CPacketConn>) -> &PacketConnWrapper {
+        let any: &dyn Any = pc.as_ref();
+        any.downcast_ref::<PacketConnWrapper>().expect("new_packet_conn hands out a PacketConnWrapper")
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_read_deadline_set_after_add_ref_still_ends_the_parked_read() {
+        let pc = stub_packet_conn();
+        let wrapper = packet_conn_wrapper(&pc);
+        wrapper.add_ref(Arc::new(()));
+
+        wrapper
+            .set_read_deadline(Some(tokio::time::Instant::now() + Duration::from_millis(50)))
+            .expect("arming a read deadline on the wrapper must succeed");
+
+        let read = tokio::time::timeout(Duration::from_millis(500), wrapper.wait_read_from()).await;
+        let (_data, _put, _addr, result) = read.expect("the armed read deadline must end the parked read");
+        let err = result.expect_err("a read past its deadline must fail instead of parking");
+        assert_eq!(err.kind(), io::ErrorKind::TimedOut, "{err}");
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn clearing_the_read_deadline_after_add_ref_parks_the_read_again() {
+        let pc = stub_packet_conn();
+        let wrapper = packet_conn_wrapper(&pc);
+        wrapper.add_ref(Arc::new(()));
+
+        wrapper
+            .set_read_deadline(Some(tokio::time::Instant::now() + Duration::from_millis(50)))
+            .expect("arming a read deadline on the wrapper must succeed");
+        let read = tokio::time::timeout(Duration::from_millis(500), wrapper.wait_read_from()).await;
+        let (_data, _put, _addr, result) = read.expect("the armed read deadline must end the parked read");
+        assert!(result.is_err(), "a read past its deadline must fail instead of parking");
+
+        wrapper.set_read_deadline(None).expect("clearing a read deadline on the wrapper must succeed");
+        let parked = tokio::time::timeout(Duration::from_millis(500), wrapper.wait_read_from()).await;
+        assert!(parked.is_err(), "a cleared read deadline must leave the read parked");
+    }
+
+    struct DeadlineRecordingConn {
+        calls: Arc<Mutex<Vec<(&'static str, Option<tokio::time::Instant>)>>>,
+    }
+
+    #[async_trait]
+    impl PacketConn for DeadlineRecordingConn {
+        async fn read_from(&self, _buf: &mut [u8]) -> io::Result<(usize, Box<dyn Addr>)> {
+            std::future::pending().await
+        }
+
+        async fn write_to(&self, buf: &[u8], _addr: &dyn Addr) -> io::Result<usize> {
+            Ok(buf.len())
+        }
+
+        fn local_addr(&self) -> io::Result<Box<dyn Addr>> {
+            Err(io::ErrorKind::NotConnected.into())
+        }
+
+        fn close(&self) -> io::Result<()> {
+            Ok(())
+        }
+
+        fn set_deadline(&self, deadline: Option<tokio::time::Instant>) -> io::Result<()> {
+            self.calls.lock().push(("deadline", deadline));
+            Ok(())
+        }
+
+        fn set_read_deadline(&self, deadline: Option<tokio::time::Instant>) -> io::Result<()> {
+            self.calls.lock().push(("read", deadline));
+            Ok(())
+        }
+
+        fn set_write_deadline(&self, deadline: Option<tokio::time::Instant>) -> io::Result<()> {
+            self.calls.lock().push(("write", deadline));
+            Ok(())
+        }
+    }
+
+    #[async_trait]
+    impl WaitReadFrom for DeadlineRecordingConn {
+        async fn wait_read_from(
+            &self,
+        ) -> (Vec<u8>, Option<Box<dyn FnOnce() + Send>>, Option<Box<dyn Addr>>, io::Result<()>) {
+            std::future::pending().await
+        }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn add_ref_keeps_every_deadline_setter_reaching_the_enhance_layer() {
+        let pc = stub_packet_conn();
+        let wrapper = packet_conn_wrapper(&pc);
+        let calls = Arc::new(Mutex::new(Vec::new()));
+        let installed: Arc<dyn EnhancePacketConn> = Arc::new(DeadlineRecordingConn { calls: Arc::clone(&calls) });
+        *wrapper.enhance.lock() = Arc::clone(&installed);
+
+        wrapper.add_ref(Arc::new(()));
+        assert!(Arc::ptr_eq(&installed, &wrapper.enhance.lock()), "add_ref must keep the enhance layer in place");
+
+        let read_deadline = tokio::time::Instant::now() + Duration::from_secs(1);
+        let write_deadline = tokio::time::Instant::now() + Duration::from_secs(2);
+        wrapper.set_write_deadline(Some(write_deadline)).expect("a write deadline must be accepted");
+        wrapper.set_read_deadline(Some(read_deadline)).expect("a read deadline must be accepted");
+        wrapper.set_deadline(None).expect("clearing the combined deadline must be accepted");
+
+        assert_eq!(
+            calls.lock().as_slice(),
+            &[("write", Some(write_deadline)), ("read", Some(read_deadline)), ("deadline", None)]
+        );
     }
 }
