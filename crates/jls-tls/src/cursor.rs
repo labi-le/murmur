@@ -146,15 +146,19 @@ pub(crate) fn build_handshake_message(msg_type: u8, body: &[u8]) -> Result<Vec<u
     Ok(w.buf)
 }
 
+/// The declared body length of the handshake message at the head of `buf`, once its header has
+/// arrived; a caller can refuse an over-long message before it is buffered.
+pub(crate) fn declared_handshake_body_len(buf: &[u8]) -> Option<usize> {
+    let [_, b1, b2, b3] = buf.get(..4)?.try_into().ok()?;
+    Some((u32::from(b1) << 16 | u32::from(b2) << 8 | u32::from(b3)) as usize)
+}
+
 /// If `buf` contains at least one complete `[type(1) || len(3) || body]`
 /// handshake message, drains and returns it; otherwise returns `None`. Used
 /// for reassembling handshake messages that may be fragmented across, or
 /// coalesced within, TLS records.
 pub(crate) fn take_handshake_message(buf: &mut Vec<u8>) -> Option<Vec<u8>> {
-    let header: [u8; 4] = buf.get(..4)?.try_into().ok()?;
-    let [_, b1, b2, b3] = header;
-    let body_len = (u32::from(b1) << 16 | u32::from(b2) << 8 | u32::from(b3)) as usize;
-    let total = 4 + body_len;
+    let total = 4 + declared_handshake_body_len(buf)?;
     if buf.len() < total {
         return None;
     }

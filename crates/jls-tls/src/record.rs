@@ -15,7 +15,7 @@ use aes_gcm::aead::{Aead, Nonce, Payload};
 use aes_gcm::{Aes128Gcm, KeyInit};
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 
-use crate::cursor::take_handshake_message;
+use crate::cursor::{declared_handshake_body_len, take_handshake_message};
 use crate::error::{Result, TlsError};
 use crate::keys::record_nonce;
 
@@ -32,6 +32,11 @@ pub(crate) const MAX_PLAINTEXT_RECORD: usize = 16384;
 // The largest body a record may declare, per version.
 pub(crate) const MAX_CIPHERTEXT_RECORD: usize = MAX_PLAINTEXT_RECORD + 2048;
 pub(crate) const MAX_CIPHERTEXT_RECORD_TLS13: usize = MAX_PLAINTEXT_RECORD + 256;
+
+// RFC 8446 allows a handshake message to declare up to 2^24-1 bytes, but no real flight reaches
+// the conventional 64 KiB `maxHandshake`; the cap bounds the reassembly buffer a peer can grow
+// before authentication.
+pub(crate) const MAX_HANDSHAKE_MESSAGE: usize = 65_536;
 
 /// Direction-scoped AEAD state: static key/IV plus a strictly increasing
 /// sequence number used to derive each record's nonce.
@@ -197,6 +202,9 @@ impl<R: AsyncRead + Unpin, W: AsyncWrite + Unpin> RecordIo<R, W> {
         loop {
             if let Some(msg) = take_handshake_message(&mut self.hs_incoming) {
                 return Ok(msg);
+            }
+            if declared_handshake_body_len(&self.hs_incoming).is_some_and(|len| len > MAX_HANDSHAKE_MESSAGE) {
+                return Err(TlsError::protocol("record: oversized handshake message"));
             }
             let (content_type, payload) = self.read_one_record().await?;
             match content_type {

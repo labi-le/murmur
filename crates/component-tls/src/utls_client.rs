@@ -63,6 +63,10 @@ const HANDSHAKE_KEY_UPDATE: u8 = 24;
 
 const MAX_FRAGMENT_LEN: usize = 16384;
 const MAX_RECORD_LEN: usize = MAX_FRAGMENT_LEN + 512;
+/// A handshake message may declare up to 2^24-1 bytes, but nothing above the conventional 64 KiB
+/// `maxHandshake` appears in a real flight; the cap bounds the pre-authentication reassembly
+/// buffer a hostile peer can grow.
+const MAX_HANDSHAKE_MESSAGE: usize = 65_536;
 const TAG_LEN: usize = 16;
 const IV_LEN: usize = 12;
 const LEGACY_RECORD_VERSION: [u8; 2] = [0x03, 0x03];
@@ -1326,6 +1330,9 @@ impl UtlsClient {
                 (usize::from(second) << 16) | (usize::from(third) << 8) | usize::from(fourth)
             });
             if let Some(length) = pending_length {
+                if length > MAX_HANDSHAKE_MESSAGE {
+                    return Err(anyhow!("tls: oversized handshake message"));
+                }
                 if self.handshake_buffer.len() >= 4 + length {
                     return Ok(self.handshake_buffer.drain(..4 + length).collect());
                 }
@@ -2095,6 +2102,35 @@ mod tests {
         assert_ne!(client.server_key, keys.server_key, "the peer's next generation is installed");
         assert_eq!(client.client_key, keys.client_key, "an unrequested update must not switch the write keys");
         assert!(client.pending_control.is_empty(), "nothing may be queued in reply");
+    }
+
+    /// A peer that declares more than the message cap in its handshake header must be refused on
+    /// that record, before the reassembly buffer can grow towards 16 MiB.
+    #[tokio::test]
+    async fn an_oversized_declared_handshake_message_is_rejected_before_buffering() {
+        let mut message = vec![HANDSHAKE_SERVER_HELLO, 0xff, 0xff, 0xff];
+        message.extend_from_slice(&[0u8; 64]);
+        let mut record = Vec::new();
+        write_plaintext_record(&mut record, CONTENT_HANDSHAKE, &message);
+
+        let mut client = UtlsClient::new(
+            Arc::new(Config::default()),
+            Arc::new(rustls::crypto::aws_lc_rs::default_provider()),
+            Vec::new(),
+            KeySharePrivateKeys::default(),
+        );
+        let mut stream = ScriptedStream {
+            to_client: Mutex::new(VecDeque::from(record)),
+            written: Arc::new(Mutex::new(Vec::new())),
+            one_byte_per_read: false,
+            script: Mutex::new(None),
+        };
+
+        let error = client
+            .read_handshake_message(&mut stream)
+            .await
+            .expect_err("an over-cap declared handshake message must be rejected");
+        assert_eq!(error.to_string(), "tls: oversized handshake message");
     }
 
     /// The buffered half of `poll_read` must hand out the bytes at `plain_offset` on, not the

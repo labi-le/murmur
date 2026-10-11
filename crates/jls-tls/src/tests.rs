@@ -412,6 +412,30 @@ async fn non_tls_probe_is_replayable_with_its_bytes() {
     assert_eq!(err.replayable_prefix().as_deref(), Some(probe.as_slice()));
 }
 
+/// A `handshake` record whose message header declares far more than the reassembly cap must be
+/// refused on that record, so the pre-authentication buffer stays bounded.
+#[tokio::test]
+async fn a_declared_handshake_message_beyond_the_cap_is_rejected_on_its_record() {
+    let (mut client_io, server_io) = tokio::io::duplex(64 * 1024);
+
+    let mut message = vec![messages::MSG_CLIENT_HELLO, 0xff, 0xff, 0xff];
+    message.extend_from_slice(&[0u8; 64]);
+    let len: u16 = message.len().try_into().expect("the record fits a u16 length");
+    let mut wire = record::outer_header(record::CONTENT_HANDSHAKE, record::LEGACY_VERSION_INITIAL, len).to_vec();
+    wire.extend_from_slice(&message);
+    client_io.write_all(&wire).await.expect("write the record");
+    client_io.shutdown().await.expect("close the write half");
+
+    let (server_read, _server_write) = tokio::io::split(TestStream(server_io));
+    let mut sink = tokio::io::sink();
+    let mut rio = RecordIo::from_halves(server_read, &mut sink);
+    let error = tokio::time::timeout(Duration::from_secs(5), rio.read_handshake_message())
+        .await
+        .expect("the reader must not hang")
+        .expect_err("an over-cap declared handshake message must be rejected");
+    assert_eq!(error.to_string(), "tls: protocol error: record: oversized handshake message");
+}
+
 /// The `ClientHello` a `client_handshake` client puts on the wire: the
 /// placeholder hello fixes the JLS auth data, the real one carries the
 /// `FakeRandom` sealed into that same auth data.
