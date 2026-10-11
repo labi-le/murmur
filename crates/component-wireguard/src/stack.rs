@@ -1001,6 +1001,11 @@ impl<D: phy::Device> Driver<D> {
                     if !tcp.may_recv() {
                         break;
                     }
+                    // The slot is reserved before smoltcp releases the bytes: a full queue stops the
+                    // drain, it never discards what the socket already handed over.
+                    let Ok(permit) = entry.events.try_reserve() else {
+                        break;
+                    };
                     let mut chunk = vec![0u8; TCP_SOCKET_BUFFER];
                     let Ok(size) = tcp.recv_slice(&mut chunk) else {
                         break;
@@ -1009,22 +1014,21 @@ impl<D: phy::Device> Driver<D> {
                         break;
                     }
                     chunk.truncate(size);
-                    if entry.events.try_send(Event::Data(chunk)).is_err() {
-                        break;
-                    }
+                    permit.send(Event::Data(chunk));
                     entry.signal.wake();
                 } else {
                     let udp: &mut udp::Socket = sockets.get_mut(entry.handle);
                     if !udp.can_recv() {
                         break;
                     }
+                    let Ok(permit) = entry.events.try_reserve() else {
+                        break;
+                    };
                     let mut chunk = vec![0u8; mtu];
                     match udp.recv_slice(&mut chunk) {
                         Ok((size, meta)) => {
                             chunk.truncate(size);
-                            if entry.events.try_send(Event::Datagram(chunk, meta.endpoint)).is_err() {
-                                break;
-                            }
+                            permit.send(Event::Datagram(chunk, meta.endpoint));
                             entry.signal.wake();
                         }
                         Err(_) => break,
@@ -1060,10 +1064,15 @@ impl<D: phy::Device> Driver<D> {
                         break;
                     }
                     let chunk: Vec<u8> = entry.outbox.iter().take(TCP_SOCKET_BUFFER).copied().collect();
-                    if tcp.send_slice(&chunk).is_err() {
+                    let Ok(accepted) = tcp.send_slice(&chunk) else {
+                        break;
+                    };
+                    if accepted == 0 {
+                        // A full transmit buffer takes nothing: the rest stays queued for the next
+                        // pass, which the ACKs that free the buffer wake.
                         break;
                     }
-                    entry.outbox.drain(..chunk.len());
+                    entry.outbox.drain(..accepted);
                 }
                 if entry.closing {
                     tcp.close();

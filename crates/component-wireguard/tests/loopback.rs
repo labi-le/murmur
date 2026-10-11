@@ -35,6 +35,7 @@ use murmur_component_wireguard::keys::{PresharedKey, StaticKey};
 use murmur_component_wireguard::stack::{Events, Stack, StackConfig, PACKET_QUEUE_SIZE, UDP_SOCKET_PACKETS};
 use smoltcp::phy::{self, DeviceCapabilities, Medium};
 use smoltcp::time::Instant as SmolInstant;
+use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
 
 /// One direction of a wire: a queue the driver drains, and the peer's queue to fill. The
 /// events handle belongs to the stack that drains the queue, exactly as a packet device
@@ -680,4 +681,87 @@ async fn a_non_reading_socket_bounds_the_backlog_the_stack_keeps() {
         "the backlog must be bounded by the queue and the socket's own buffer, not by the \
          sender's stream: {received} of {SENT} datagrams"
     );
+}
+
+/// The byte at stream offset `i` in this test's pattern, so a hole in the stream is visible as a
+/// mismatch rather than only as a short total.
+fn pattern_byte(offset: usize) -> u8 {
+    (offset % 251) as u8
+}
+
+fn assert_pattern(bytes: &[u8], offset: usize) {
+    for (index, byte) in bytes.iter().enumerate() {
+        assert_eq!(
+            usize::from(*byte),
+            usize::from(pattern_byte(offset + index)),
+            "a byte went missing at stream offset {}",
+            offset + index
+        );
+    }
+}
+
+/// A peer that stops reading closes its window. What the writer handed over has to stay queued
+/// and arrive once the reader drains, instead of being discarded on the way out.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_closed_window_keeps_the_writers_bytes_queued() {
+    let (a, b, a_events, b_events) = linked();
+    let client = Stack::with_device(
+        StackConfig { local_addresses: vec![prefix("10.0.0.2/32")], mtu: 1500 },
+        loopback(&a, 1500),
+        a_events,
+    )
+    .expect("client stack");
+    let server = Stack::with_device(
+        StackConfig { local_addresses: vec![prefix("10.0.0.1/32")], mtu: 1500 },
+        loopback(&b, 1500),
+        b_events,
+    )
+    .expect("server stack");
+
+    let port = 51_831;
+    with_timeout("arm_tcp_port", server.arm_tcp_port(port)).await.expect("arm");
+    let destination = SocketAddr::new(IpAddr::V4(Ipv4Addr::new(10, 0, 0, 1)), port);
+    let mut writer = with_timeout("dial_tcp", client.dial_tcp(None, destination)).await.expect("dial");
+    let mut reader = with_timeout("accept_tcp", server.accept_tcp()).await.expect("accept");
+
+    const TOTAL: usize = 4 * 1024 * 1024;
+    let mut read_buffer = vec![0u8; 64 * 1024];
+    let mut chunk = vec![0u8; 4096];
+    let mut written = 0usize;
+    let mut received = 0usize;
+
+    while written < TOTAL {
+        for (offset, byte) in chunk.iter_mut().enumerate() {
+            *byte = pattern_byte(written + offset);
+        }
+        match tokio::time::timeout(Duration::from_millis(500), writer.write(&chunk)).await {
+            Ok(Ok(0)) => panic!("the writer accepted nothing after {written} bytes"),
+            Ok(Ok(accepted)) => written += accepted,
+            Ok(Err(err)) => panic!("the writer failed after {written} bytes: {err}"),
+            Err(_) => {
+                // The window is shut until the reader takes something: drain what it will, and the
+                // writer resumes with the bytes it kept.
+                let mut drained = 0usize;
+                while let Ok(Ok(size)) =
+                    tokio::time::timeout(Duration::from_millis(50), reader.read(&mut read_buffer)).await
+                {
+                    assert!(size > 0, "the stream ended {TOTAL} bytes short of the pattern");
+                    assert_pattern(&read_buffer[..size], received);
+                    received += size;
+                    drained += size;
+                }
+                assert!(drained > 0, "the writer stalled after {written} bytes and the reader could take none");
+            }
+        }
+    }
+
+    while received < TOTAL {
+        let size = with_timeout("read", reader.read(&mut read_buffer))
+            .await
+            .expect("the reader never got the whole stream the writer handed over");
+        assert!(size > 0, "the stream ended after {received} of {TOTAL} bytes");
+        assert_pattern(&read_buffer[..size], received);
+        received += size;
+    }
+    assert_eq!(received, written, "every byte the writer handed over must arrive");
 }
