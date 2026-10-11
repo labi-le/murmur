@@ -329,12 +329,9 @@ mod tests {
     fn repeated_timestamp_certificate() -> CertificateOfMembership {
         let mut raw = vec![1u8];
         raw.extend_from_slice(&4u16.to_be_bytes());
-        for (id, value) in [
-            (QUALIFIER_TIMESTAMP, 1u64),
-            (QUALIFIER_TIMESTAMP, 2),
-            (QUALIFIER_NETWORK, 3),
-            (QUALIFIER_MEMBER, 4),
-        ] {
+        for (id, value) in
+            [(QUALIFIER_TIMESTAMP, 1u64), (QUALIFIER_TIMESTAMP, 2), (QUALIFIER_NETWORK, 3), (QUALIFIER_MEMBER, 4)]
+        {
             raw.extend_from_slice(&id.to_be_bytes());
             raw.extend_from_slice(&value.to_be_bytes());
             raw.extend_from_slice(&0u64.to_be_bytes());

@@ -1270,12 +1270,8 @@ mod tests {
         ];
         let config =
             NetworkConfigData { capabilities: vec![raises_super_accept, reads_super_accept], ..Default::default() };
-        let context = FrameRuleContext {
-            inbound: true,
-            source_zt: Address::new(1),
-            destination_zt: local,
-            ..Default::default()
-        };
+        let context =
+            FrameRuleContext { inbound: true, source_zt: Address::new(1), destination_zt: local, ..Default::default() };
 
         assert!(
             !config.allows_frame(&frame(ETHER_TYPE_IPV4, 20), context),
@@ -1355,21 +1351,15 @@ mod tests {
             ],
             ..Default::default()
         };
-        let agreeing = FrameRuleContext {
-            local_tags: vec![tag(7, 7, 0)],
-            remote_tags: vec![tag(7, 7, 0)],
-            ..context()
-        };
+        let agreeing =
+            FrameRuleContext { local_tags: vec![tag(7, 7, 0)], remote_tags: vec![tag(7, 7, 0)], ..context() };
         assert!(
             !config.allows_frame(&frame(ETHER_TYPE_IPV4, 20), agreeing),
             "the operand is part of the comparison, so agreeing tags that differ from it do not match"
         );
 
-        let matching = FrameRuleContext {
-            local_tags: vec![tag(7, 42, 0)],
-            remote_tags: vec![tag(7, 42, 0)],
-            ..context()
-        };
+        let matching =
+            FrameRuleContext { local_tags: vec![tag(7, 42, 0)], remote_tags: vec![tag(7, 42, 0)], ..context() };
         assert!(config.allows_frame(&frame(ETHER_TYPE_IPV4, 20), matching));
     }
 
@@ -1378,10 +1368,7 @@ mod tests {
     fn a_not_flagged_tag_rule_does_not_apply_to_an_absent_local_tag() {
         let config = NetworkConfigData {
             rules: vec![
-                NetworkRule {
-                    rule_type: RULE_MATCH_TAG_SENDER | RULE_FLAG_NOT,
-                    value: vec![0, 0, 0, 9, 0, 0, 0, 42],
-                },
+                NetworkRule { rule_type: RULE_MATCH_TAG_SENDER | RULE_FLAG_NOT, value: vec![0, 0, 0, 9, 0, 0, 0, 42] },
                 NetworkRule { rule_type: RULE_ACTION_ACCEPT, value: Vec::new() },
                 NetworkRule { rule_type: RULE_ACTION_DROP, value: Vec::new() },
             ],
@@ -1401,10 +1388,7 @@ mod tests {
     fn a_not_flagged_tag_rule_compares_a_present_local_tag() {
         let config = NetworkConfigData {
             rules: vec![
-                NetworkRule {
-                    rule_type: RULE_MATCH_TAG_SENDER | RULE_FLAG_NOT,
-                    value: vec![0, 0, 0, 7, 0, 0, 0, 42],
-                },
+                NetworkRule { rule_type: RULE_MATCH_TAG_SENDER | RULE_FLAG_NOT, value: vec![0, 0, 0, 7, 0, 0, 0, 42] },
                 NetworkRule { rule_type: RULE_ACTION_ACCEPT, value: Vec::new() },
                 NetworkRule { rule_type: RULE_ACTION_DROP, value: Vec::new() },
             ],
@@ -1412,7 +1396,10 @@ mod tests {
         };
         let mut equal = context();
         equal.local_tags = vec![tag(7, 42, 0)];
-        assert!(!config.allows_frame(&frame(ETHER_TYPE_IPV4, 20), equal), "the value matches, so the NOT rule does not");
+        assert!(
+            !config.allows_frame(&frame(ETHER_TYPE_IPV4, 20), equal),
+            "the value matches, so the NOT rule does not"
+        );
 
         let mut different = context();
         different.local_tags = vec![tag(7, 7, 0)];
