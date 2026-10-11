@@ -5,9 +5,14 @@ use chrono::{DateTime, TimeDelta, Utc};
 use dashmap::DashMap;
 use parking_lot::Mutex;
 
+use super::handshake_kip::KIP_HANDSHAKE_SKEW;
 use super::kip::KIP_HELLO_NONCE_SIZE;
 
-pub(crate) static HANDSHAKE_REPLAY_TTL: LazyLock<TimeDelta> = LazyLock::new(|| TimeDelta::seconds(60));
+/// How long a client nonce stays remembered. The timestamp check accepts a hello up to
+/// `KIP_HANDSHAKE_SKEW` either side of the server clock, so the memory has to outlast twice that
+/// window (plus a margin) or a hello it still accepts finds its nonce forgotten.
+pub(crate) static HANDSHAKE_REPLAY_TTL: LazyLock<TimeDelta> =
+    LazyLock::new(|| TimeDelta::seconds(2 * KIP_HANDSHAKE_SKEW.num_seconds() + 30));
 
 struct NonceSetInner {
     m: HashMap<[u8; KIP_HELLO_NONCE_SIZE], DateTime<Utc>>,
@@ -33,7 +38,7 @@ impl NonceSet {
         let ttl = if ttl <= TimeDelta::zero() { TimeDelta::seconds(60) } else { ttl };
 
         if now - inner.last_prune > ttl / 2 || inner.m.len() > self.max_entries {
-            inner.m.retain(|_, exp| now < *exp);
+            inner.m.retain(|_, exp| now <= *exp);
             inner.last_prune = now;
             while inner.m.len() > self.max_entries {
                 if let Some(key) = inner.m.keys().next().copied() {
@@ -45,7 +50,7 @@ impl NonceSet {
         }
 
         if let Some(exp) = inner.m.get(&nonce) {
-            if now < *exp {
+            if now <= *exp {
                 return false;
             }
         }
@@ -75,3 +80,45 @@ pub(crate) static GLOBAL_HANDSHAKE_REPLAY: LazyLock<HandshakeReplayProtector> =
 
 pub(crate) type ReplayAllowFunc =
     std::sync::Arc<dyn Fn(&str, [u8; KIP_HELLO_NONCE_SIZE], DateTime<Utc>) -> bool + Send + Sync>;
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn handshake_replay_memory_outlives_the_timestamp_window() {
+        let window = 2 * KIP_HANDSHAKE_SKEW.num_seconds();
+        assert!(
+            HANDSHAKE_REPLAY_TTL.num_seconds() > window,
+            "replay memory of {} s must outlast the {window}-second timestamp window",
+            HANDSHAKE_REPLAY_TTL.num_seconds()
+        );
+    }
+
+    #[test]
+    fn nonce_set_rejects_a_replay_at_the_ttl_boundary() {
+        let set = NonceSet::new(4096);
+        let ttl = TimeDelta::seconds(60);
+        let t0 = DateTime::<Utc>::UNIX_EPOCH + TimeDelta::seconds(1_000);
+        let nonce = [7u8; KIP_HELLO_NONCE_SIZE];
+
+        assert!(set.allow(nonce, t0, ttl), "first use must be allowed");
+        assert!(!set.allow(nonce, t0, ttl), "an immediate replay must be rejected");
+        assert!(!set.allow(nonce, t0 + ttl, ttl), "a replay at the TTL boundary must still be rejected");
+        assert!(set.allow(nonce, t0 + ttl + TimeDelta::seconds(1), ttl), "a use past the TTL must be allowed");
+    }
+
+    #[test]
+    fn pruning_at_the_ttl_boundary_keeps_the_nonce_remembered() {
+        let set = NonceSet::new(4096);
+        let ttl = TimeDelta::seconds(60);
+        let t0 = DateTime::<Utc>::UNIX_EPOCH + TimeDelta::seconds(1_000);
+        let nonce = [9u8; KIP_HELLO_NONCE_SIZE];
+        let other = [10u8; KIP_HELLO_NONCE_SIZE];
+
+        assert!(set.allow(nonce, t0, ttl), "first use must be allowed");
+        // Pushes the prune past its interval with the boundary entry still in the map.
+        assert!(set.allow(other, t0 + ttl, ttl), "unrelated nonce must be allowed");
+        assert!(!set.allow(nonce, t0 + ttl, ttl), "a pruned entry at its expiry instant must still be rejected");
+    }
+}
