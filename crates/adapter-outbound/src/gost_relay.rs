@@ -66,9 +66,10 @@ impl std::fmt::Debug for GostRelayOption {
     }
 }
 
-/// `self_weak` upgrades to the `Arc<GostRelay>` the `g` receiver already is,
-/// needed only by `new_packet_conn` (which retains the adapter for `resolve_udp`); populated by
-/// `Arc::new_cyclic` — DEVIATION, see the wave report.
+/// `self_weak` upgrades to the `Arc<GostRelay>` the `g` receiver already is.
+///
+/// It is needed only by `new_packet_conn` (which retains the adapter for `resolve_udp`);
+/// populated by `Arc::new_cyclic` — DEVIATION, see the wave report.
 pub struct GostRelay {
     base: Base,
     dialer: Arc<dyn CDialer>,

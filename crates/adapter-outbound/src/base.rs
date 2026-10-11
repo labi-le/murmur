@@ -497,11 +497,13 @@ impl CDialer for BasicDialer {
 }
 
 /// A keep-alive marker: rewrapping the inner conn keeps the marker alive; `keep_alive` does that
-/// directly instead. `stream` is wrapped in
-/// `CancellableStream` so `close`/`set_*_deadline` below have a real, always-available mechanism
-/// to fail a parked read/write even when the dialed `Stream` has no `old_conn` of its own (a raw
-/// `TcpStream`/`TfoConn`): `Stream::shutdown_read`/`shutdown_write` alone only half-close such a
-/// conn, which is a clean EOF, not the hard error a killed connection produces.
+/// directly instead.
+///
+/// `stream` is wrapped in `CancellableStream` so `close`/`set_*_deadline` below have a real,
+/// always-available mechanism to fail a parked read/write even when the dialed `Stream` has no
+/// `old_conn` of its own (a raw `TcpStream`/`TfoConn`): `Stream::shutdown_read`/`shutdown_write`
+/// alone only half-close such a conn, which is a clean EOF, not the hard error a killed
+/// connection produces.
 pub struct ConnWrapper {
     stream: CancellableStream<Box<dyn Stream>>,
     keep_alive: Mutex<Vec<Arc<dyn Any + Send + Sync>>>,
@@ -826,9 +828,12 @@ pub(crate) fn arc_packet_conn_as_datagram(pc: Arc<dyn PacketConn>) -> Arc<dyn Da
     Arc::new(ArcPacketConnAsDatagram(pc))
 }
 
-/// `constant::adapters::PacketConn` still requires the old
-/// `EnhancePacketConn` (`murmur_std_compat::net::PacketConn`-based); bridging the dial's `Datagram` through it
-/// here, rather than making `PacketConnWrapper` itself old-typed, is the S10 transport-boundary
+/// Bridges the dial's `Datagram` onto the old-typed `PacketConn` the constant layer still
+/// requires.
+///
+/// `constant::adapters::PacketConn` still requires the old `EnhancePacketConn`
+/// (`murmur_std_compat::net::PacketConn`-based); bridging the dial's `Datagram` through it here,
+/// rather than making `PacketConnWrapper` itself old-typed, is the S10 transport-boundary
 /// exception.
 pub fn new_packet_conn(pc: Arc<dyn Datagram>, a: Arc<dyn ProxyAdapter>) -> Arc<dyn CPacketConn> {
     let enhanced = new_enhance_datagram(pc);
@@ -848,10 +853,12 @@ pub fn new_packet_conn(pc: Arc<dyn Datagram>, a: Arc<dyn ProxyAdapter>) -> Arc<d
     Arc::new(cpc)
 }
 
-/// The adapter is closed from a GC finalizer the first time it becomes
-/// unreachable; Rust has no finalizers, so `Drop` (fired deterministically on the last `Arc` drop)
-/// is the closest behaviour-preserving equivalent — strictly better, since it can never race a
-/// pending close against a GC pause. A keep-alive guard additionally keeps the adapter alive so
+/// Closes the wrapped adapter once when the last `Arc` to it drops.
+///
+/// The adapter is closed from a GC finalizer the first time it becomes unreachable; Rust has no
+/// finalizers, so `Drop` (fired deterministically on the last `Arc` drop) is the closest
+/// behaviour-preserving equivalent — strictly better, since it can never race a pending close
+/// against a GC pause. A keep-alive guard additionally keeps the adapter alive so
 /// the close cannot fire mid-use; the packet-conn half is implemented (`Arc<dyn CPacketConn>`
 /// upcasts to `&dyn Any` to test for `PacketConnWrapper`), but `murmur_std_compat::net::Conn`
 /// deliberately carries no such supertrait, so the `Conn`/TCP half of that guard has no

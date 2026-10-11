@@ -179,9 +179,11 @@ impl murmur_common_net::io::Datagram for MuxPacketConnAsDatagram {
     }
 }
 
-/// `self_weak` upgrades to an `Arc<Self>` for [`new_packet_conn`], which needs an
-/// owned adapter handle to push onto the packet conn's chain (the method-value receiver `s` is
-/// already that handle; Rust needs `Arc::new_cyclic` to get one from `&self`).
+/// `self_weak` upgrades to an `Arc<Self>` for [`new_packet_conn`].
+///
+/// `new_packet_conn` needs an owned adapter handle to push onto the packet conn's chain (the
+/// method-value receiver `s` is already that handle; Rust needs `Arc::new_cyclic` to get one from
+/// `&self`).
 pub struct SingMux {
     inner: Arc<dyn ProxyAdapter>,
     client: Arc<Client>,

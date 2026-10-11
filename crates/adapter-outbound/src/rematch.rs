@@ -36,9 +36,10 @@ impl std::fmt::Debug for RematchOption {
     }
 }
 
-/// `self_weak` upgrades to the `Arc<Rematch>` the `l` receiver already is, needed
-/// only by `new_packet_conn` (which retains the adapter for `resolve_udp`); populated by
-/// `Arc::new_cyclic` — DEVIATION, see the wave report.
+/// `self_weak` upgrades to the `Arc<Rematch>` the `l` receiver already is.
+///
+/// It is needed only by `new_packet_conn` (which retains the adapter for `resolve_udp`);
+/// populated by `Arc::new_cyclic` — DEVIATION, see the wave report.
 pub struct Rematch {
     base: Base,
     target_rematch_name: Option<String>,

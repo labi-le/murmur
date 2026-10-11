@@ -18,9 +18,10 @@ use murmur_constant::metadata::Metadata;
 use super::base::{new_conn, new_packet_conn, Base, BaseOption, BasicOption, ProxyAdapter};
 use super::util::resolve_ip_with_resolver;
 
-/// `self_weak` upgrades to the `Arc<Direct>` the `d` receiver already is, needed only by
-/// `new_packet_conn` (which retains the adapter for `resolve_udp`); populated by each constructor
-/// via `Arc::new_cyclic` — DEVIATION, see the wave report.
+/// `self_weak` upgrades to the `Arc<Direct>` the `d` receiver already is.
+///
+/// It is needed only by `new_packet_conn` (which retains the adapter for `resolve_udp`);
+/// populated by each constructor via `Arc::new_cyclic` — DEVIATION, see the wave report.
 pub struct Direct {
     base: Base,
     loop_back: Option<Arc<Detector>>,
