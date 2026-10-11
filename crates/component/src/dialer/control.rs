@@ -21,7 +21,7 @@ use tokio::net::{TcpListener, TcpStream, UdpSocket};
 use tokio_util::sync::CancellationToken;
 
 use crate::keepalive::tcp_keepalive::tcp_keep_alive;
-use crate::keepalive::tcp_keepalive_config::{KeepAliveConfig, KeepAliveFields};
+use crate::keepalive::tcp_keepalive_config::{tcp_keep_alive_stream, KeepAliveConfig, KeepAliveFields};
 use crate::mptcp::MultipathTcpFlag;
 use crate::resolver::resolver::{lookup_ip_with_resolver, proxy_server_host_resolver};
 use murmur_common::time::TimeDuration;
@@ -805,7 +805,7 @@ impl StdListenConfig {
         socket.listen(listener_backlog())?;
 
         let listener = TcpListener::from_std(std::net::TcpListener::from(socket))?;
-        Ok(Box::new(TcpAcceptor::new(listener)))
+        Ok(Box::new(KeepAliveAcceptor::new(Box::new(TcpAcceptor::new(listener)), self.keep_alive_config)))
     }
 
     pub async fn listen_packet(
@@ -883,6 +883,39 @@ fn set_tfo_listener(socket: &Socket) -> io::Result<()> {
         return Err(io::Error::last_os_error());
     }
     Ok(())
+}
+
+/// Arms the listen config's keep-alive settings on every accepted connection; the dial half arms
+/// the same settings in `dial_addr_proto`, and an accepted conn reaches the socket through
+/// `Stream::as_socket` rather than as a `TcpStream`.
+struct KeepAliveAcceptor {
+    inner: Box<dyn Acceptor>,
+    keep_alive: KeepAliveConfig,
+}
+
+impl KeepAliveAcceptor {
+    fn new(inner: Box<dyn Acceptor>, keep_alive: KeepAliveConfig) -> Self {
+        Self { inner, keep_alive }
+    }
+}
+
+#[async_trait::async_trait]
+impl Acceptor for KeepAliveAcceptor {
+    // cancel-safe: forwards to the wrapped acceptor's `accept`, and the keep-alive call that
+    // follows it is a socket option on a connection that has already been accepted.
+    async fn accept(&self) -> io::Result<Box<dyn Stream>> {
+        let stream = self.inner.accept().await?;
+        tcp_keep_alive_stream(&*stream, self.keep_alive);
+        Ok(stream)
+    }
+
+    fn close(&self) -> io::Result<()> {
+        self.inner.close()
+    }
+
+    fn addr(&self) -> io::Result<SocketAddr> {
+        self.inner.addr()
+    }
 }
 
 /// The connected datagram conn a `udp` dial returns.
@@ -1459,3 +1492,44 @@ mod mptcp_probe_tests {
     }
 }
 
+#[cfg(all(test, any(target_os = "linux", target_os = "android")))]
+mod listener_keep_alive_tests {
+    use std::time::Duration;
+
+    use murmur_common_net::io::Stream;
+    use tokio::time::timeout;
+    use tokio_util::sync::CancellationToken;
+
+    use super::{KeepAliveConfig, StdListenConfig};
+
+    const SECOND: i64 = 1_000_000_000;
+
+    /// The listener half arms the accepted connection with the settings its own config carries —
+    /// enabled or disabled — rather than leaving the OS default or consulting the global
+    /// keep-alive settings the config was built from.
+    #[tokio::test]
+    async fn an_accepted_connection_follows_the_listen_configs_keep_alive() {
+        for (enable, idle) in [(false, 0), (true, 30 * SECOND)] {
+            let listen_config = StdListenConfig {
+                keep_alive_config: KeepAliveConfig { enable, idle, interval: 0 },
+                ..StdListenConfig::default()
+            };
+            let listener = listen_config.listen(&CancellationToken::new(), "tcp4", "127.0.0.1:0").await.unwrap();
+            let _client = timeout(Duration::from_secs(5), tokio::net::TcpStream::connect(listener.addr().unwrap()))
+                .await
+                .unwrap()
+                .unwrap();
+            let accepted = timeout(Duration::from_secs(5), listener.accept()).await.unwrap().unwrap();
+
+            let socket = accepted.as_socket().expect("an accepted TcpStream exposes its socket");
+            assert_eq!(socket.keepalive().unwrap(), enable, "SO_KEEPALIVE must follow the listen config");
+            if enable {
+                assert_eq!(
+                    socket.tcp_keepalive_time().unwrap(),
+                    Duration::from_secs(30),
+                    "TCP_KEEPIDLE must follow the listen config"
+                );
+            }
+        }
+    }
+}

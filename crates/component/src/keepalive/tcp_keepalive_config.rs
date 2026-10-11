@@ -3,6 +3,8 @@ use std::io;
 use socket2::{SockRef, TcpKeepalive};
 
 use murmur_common::time::{duration_from_nanos, TimeDuration};
+use murmur_common_net::io::Stream;
+use murmur_log::warnln;
 use murmur_std_compat::net::Conn;
 
 use super::tcp_keepalive::{disable_keep_alive, keep_alive_idle, keep_alive_interval};
@@ -33,34 +35,50 @@ impl TcpConn for tokio::net::TcpStream {
     }
 
     fn set_keep_alive_config(&self, config: KeepAliveConfig) -> io::Result<()> {
-        let socket = SockRef::from(self);
-        socket.set_keepalive(config.enable)?;
-        if !config.enable {
-            return Ok(());
-        }
-        let mut keepalive = TcpKeepalive::new();
-        if config.idle >= 0 {
-            keepalive = keepalive.with_time(duration_from_nanos(config.idle));
-        }
-        #[cfg(any(
-            target_os = "android",
-            target_os = "dragonfly",
-            target_os = "freebsd",
-            target_os = "fuchsia",
-            target_os = "illumos",
-            target_os = "ios",
-            target_os = "linux",
-            target_os = "macos",
-            target_os = "netbsd",
-            target_os = "tvos",
-            target_os = "watchos",
-            target_os = "windows",
-            target_os = "cygwin",
-        ))]
-        if config.interval >= 0 {
-            keepalive = keepalive.with_interval(duration_from_nanos(config.interval));
-        }
-        socket.set_tcp_keepalive(&keepalive)
+        set_socket_keep_alive(&SockRef::from(self), config)
+    }
+}
+
+/// Applies `config` to a live socket: `TcpConn` is the dial half's way in, and an accepted
+/// connection reaches the same socket through `Stream::as_socket`.
+pub fn set_socket_keep_alive(socket: &SockRef<'_>, config: KeepAliveConfig) -> io::Result<()> {
+    socket.set_keepalive(config.enable)?;
+    if !config.enable {
+        return Ok(());
+    }
+    let mut keepalive = TcpKeepalive::new();
+    if config.idle >= 0 {
+        keepalive = keepalive.with_time(duration_from_nanos(config.idle));
+    }
+    #[cfg(any(
+        target_os = "android",
+        target_os = "dragonfly",
+        target_os = "freebsd",
+        target_os = "fuchsia",
+        target_os = "illumos",
+        target_os = "ios",
+        target_os = "linux",
+        target_os = "macos",
+        target_os = "netbsd",
+        target_os = "tvos",
+        target_os = "watchos",
+        target_os = "windows",
+        target_os = "cygwin",
+    ))]
+    if config.interval >= 0 {
+        keepalive = keepalive.with_interval(duration_from_nanos(config.interval));
+    }
+    socket.set_tcp_keepalive(&keepalive)
+}
+
+/// The accept half of `tcp_keep_alive`: an accepted connection is a `Stream`, which exposes its
+/// OS socket through `as_socket`; one without a socket has no keep-alive to set.
+pub fn tcp_keep_alive_stream(stream: &dyn Stream, config: KeepAliveConfig) {
+    let Some(socket) = stream.as_socket() else {
+        return;
+    };
+    if let Err(err) = set_socket_keep_alive(&socket, config) {
+        warnln!("keep-alive settings were not applied to the accepted connection: {err}");
     }
 }
 
