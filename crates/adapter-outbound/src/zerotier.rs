@@ -906,6 +906,10 @@ async fn run_runtime(
         let now = SystemTime::now();
         let next_maintenance = node.process_background_tasks(now);
         node.run_callbacks();
+        // A reader that has stopped means the transmit half is dead: report it and stop draining.
+        if stack.as_ref().is_some_and(|installed| report_stopped_reader(installed, &shared)) {
+            stack = None;
+        }
         // What the stack transmitted becomes ZeroTier frames.
         if let Some(installed) = stack.as_ref() {
             pump_stack_packets(&link, &mut node, installed, &shared);
@@ -1304,46 +1308,80 @@ enum ApplyOutcome {
 struct NetworkStack {
     device: Arc<dyn IpStack>,
     packets: std::sync::mpsc::Receiver<Vec<u8>>,
+    /// Why the reader stopped, set by the reader thread before it returns.
+    stopped: Arc<Mutex<Option<Arc<anyhow::Error>>>>,
+    /// The reader thread, so the loop can notice that it has stopped.
+    reader: std::thread::JoinHandle<()>,
 }
 
 impl NetworkStack {
     /// The read half of the stack pump. Closing the device ends the thread, which is what device
     /// invalidation relies on.
-    fn spawn(device: Arc<dyn IpStack>) -> Self {
+    fn spawn(device: Arc<dyn IpStack>) -> Result<Self, std::io::Error> {
         let (sender, packets) = std::sync::mpsc::sync_channel(STACK_QUEUE_DEPTH);
         let reader = Arc::clone(&device);
+        let stopped = Arc::new(Mutex::new(None));
+        let reason = Arc::clone(&stopped);
         let spawned = std::thread::Builder::new().name("zerotier-stack".to_owned()).spawn(move || {
             let batch = reader.batch_size().max(1);
             let mtu = reader.mtu().map_or(64 * 1024, |mtu| usize::try_from(mtu).unwrap_or(usize::MAX)).max(1);
             let mut buffers = vec![vec![0u8; mtu]; batch];
             let mut sizes = vec![0usize; batch];
+            let stopped = |error: anyhow::Error| {
+                *reason.lock() = Some(Arc::new(error));
+            };
             loop {
                 let count = match reader.read(&mut buffers, &mut sizes, 0) {
                     Ok(count) => count,
                     Err(err) => {
-                        debugln!("read from the ZeroTier IP stack device: {err}");
+                        let err = anyhow!("read from the ZeroTier IP stack device: {err}");
+                        debugln!("{err}");
+                        stopped(err);
                         return;
                     }
                 };
                 for (buffer, size) in buffers.iter().zip(&sizes).take(count) {
                     let Some(payload) = buffer.get(..*size) else {
-                        debugln!(
+                        let err = anyhow!(
                             "the ZeroTier IP stack device reported {size} bytes, more than the {} byte buffer holds",
                             buffer.len()
                         );
+                        debugln!("{err}");
+                        stopped(err);
                         return;
                     };
                     if sender.send(payload.to_vec()).is_err() {
+                        stopped(anyhow!("the ZeroTier IP stack reader's consumer is gone"));
                         return;
                     }
                 }
             }
         });
-        if let Err(err) = spawned {
-            errorln!("spawn the ZeroTier IP stack reader: {err}");
-        }
-        Self { device, packets }
+        let reader = match spawned {
+            Ok(reader) => reader,
+            Err(err) => {
+                let _ = device.close();
+                return Err(err);
+            }
+        };
+        Ok(Self { device, packets, stopped, reader })
     }
+}
+
+/// Reports a stack whose reader thread has stopped, so a dead transmit half fails closed instead
+/// of queueing packets nobody reads. Returns whether it reported a stop.
+fn report_stopped_reader(stack: &NetworkStack, shared: &Arc<ZeroTierShared>) -> bool {
+    if !stack.reader.is_finished() {
+        return false;
+    }
+    let reason = stack.stopped.lock().take();
+    let err = Arc::new(reason.map_or_else(
+        || anyhow!("ZeroTier IP stack reader stopped"),
+        |reason| anyhow!("ZeroTier IP stack reader stopped: {reason}"),
+    ));
+    debugln!("[ZeroTier]({}) {err}", shared.outbound);
+    shared.set_network_failure(Some(err), "");
+    true
 }
 
 /// the device-generation dance, the IP link configuration and
@@ -1416,7 +1454,10 @@ fn apply_network_config(
     if let Some(old) = old_device {
         let _ = old.close();
     }
-    ApplyOutcome::Installed(Some(NetworkStack::spawn(device)))
+    match NetworkStack::spawn(device) {
+        Ok(stack) => ApplyOutcome::Installed(Some(stack)),
+        Err(err) => ApplyOutcome::Failed(anyhow!("spawn the ZeroTier IP stack reader: {err}")),
+    }
 }
 
 /// Reports whether the snapshot matches the current generation, dropping the runtime comparison
@@ -2259,7 +2300,7 @@ mod tests {
     async fn a_device_reporting_more_than_the_buffer_holds_stops_the_reader() {
         let device = Arc::new(OversizedDevice::new(1500));
         let reads = Arc::clone(&device.reads);
-        let stack = NetworkStack::spawn(device);
+        let stack = NetworkStack::spawn(device).expect("the reader thread starts");
 
         assert!(
             matches!(
@@ -2269,6 +2310,30 @@ mod tests {
             "the reader must stop instead of queueing a truncated frame"
         );
         assert_eq!(reads.load(Ordering::SeqCst), 1, "the oversized report ended the read loop");
+    }
+
+    /// A reader that has stopped must be reported, so the data plane fails closed instead of
+    /// queueing packets nobody reads.
+    #[tokio::test]
+    async fn a_stopped_stack_reader_is_reported() {
+        let stack = NetworkStack::spawn(Arc::new(OversizedDevice::new(1500))).expect("the reader thread starts");
+        let shared = Arc::new(ZeroTierShared::new("zt-reader".to_owned(), 0));
+
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while !report_stopped_reader(&stack, &shared) {
+            assert!(Instant::now() < deadline, "the stopped reader was never reported");
+            std::thread::yield_now();
+        }
+
+        let reported = shared.state.lock().network_err.clone();
+        assert!(
+            reported.as_ref().is_some_and(|err| err.to_string().contains("more than the 1500 byte buffer holds")),
+            "the report names why the reader stopped: {reported:?}"
+        );
+        let Err(err) = network_stack_for(&shared, IpAddr::V4(Ipv4Addr::new(192, 0, 2, 1))) else {
+            panic!("the data plane must fail closed once the reader is gone");
+        };
+        assert!(err.to_string().contains("reader stopped"), "the failure names the stopped reader: {err}");
     }
 
     /// Abandoning a start must stop the runtime thread it spawned, or the next start runs a second
