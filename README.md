@@ -784,7 +784,7 @@ are each fixed in-tree and re-run green on their own targets, so they are record
 open defects" as closed rather than open. No workspace-wide sweep has been re-run since those
 fixes, and the toolchain-dependent harnesses that accounted for most of the 26 `#[ignore]`d tests
 have since been removed from the tree, so read those totals as the state of that sweep, not of the
-tree today. Today the only `#[ignore]`d test is the real-timer soak that `make test-heavy` runs.
+tree today. Today the only `#[ignore]`d tests are the two real-timer soaks that `make test-heavy` runs.
 
 A lint campaign ran over the whole workspace: at its start `cargo clippy`
 reported 6,576 diagnostics (5,587 in production code, 989 in test targets) under the manifest's

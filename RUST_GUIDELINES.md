@@ -2826,7 +2826,7 @@ workflow triggers on a push to `main`, any pull request, and
 started at 6,576 diagnostics, 5,587 of them in production code), `cargo fmt --all
 -- --check` is clean, `cargo deny check`, `cargo audit`, `cargo machete` and
 `typos` all report nothing, and `cargo test --all-features --no-fail-fast` passes
-2811 tests with 0 failures and one documented `#[ignore]`d soak. Which of the
+its tests with 0 failures and two documented `#[ignore]`d soaks. Which of the
 rules below the toolchain enforces, and how the rest were audited, is written up
 in [`docs/guidelines-review.md`](docs/guidelines-review.md); its one open item is
 the cancel-safety note pass.
