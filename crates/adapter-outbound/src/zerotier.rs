@@ -1308,8 +1308,11 @@ impl NetworkStack {
                     }
                 };
                 for (buffer, size) in buffers.iter().zip(&sizes).take(count) {
-                    let Some(payload) = buffer.get(..(*size).min(mtu)) else {
-                        debugln!("the ZeroTier IP stack device reported {size} bytes, more than the buffer holds");
+                    let Some(payload) = buffer.get(..*size) else {
+                        debugln!(
+                            "the ZeroTier IP stack device reported {size} bytes, more than the {} byte buffer holds",
+                            buffer.len()
+                        );
                         return;
                     };
                     if sender.send(payload.to_vec()).is_err() {
@@ -1748,7 +1751,9 @@ mod tests {
     use std::path::PathBuf;
     use std::time::Instant;
 
+    use async_trait::async_trait;
     use murmur_constant_features::WITH_GVISOR;
+    use murmur_std_compat::net::{Conn as NetConn, PacketConn as NetPacketConn};
     use murmur_zerotier::dictionary::{append_dictionary_entry, append_dictionary_uint};
     use murmur_zerotier::frame::{Frame, FrameDestination, ETHER_TYPE_ARP, ETHER_TYPE_IPV4};
     use murmur_zerotier::mac::{mac_for_address, Mac};
@@ -2138,6 +2143,104 @@ mod tests {
 
         outbound.close().expect("close");
         let _ = std::fs::remove_dir_all(&resolved);
+    }
+
+    /// A stack device that reports one byte more than the buffer it was handed, the way a buggy or
+    /// hostile device would; no shipped device does.
+    struct OversizedDevice {
+        mtu: u32,
+        reads: std::sync::atomic::AtomicUsize,
+    }
+
+    impl OversizedDevice {
+        fn new(mtu: u32) -> Self {
+            Self { mtu, reads: std::sync::atomic::AtomicUsize::new(0) }
+        }
+
+        fn reads(&self) -> usize {
+            self.reads.load(Ordering::SeqCst)
+        }
+    }
+
+    #[async_trait]
+    impl IpStack for OversizedDevice {
+        async fn start(&self) -> Result<()> {
+            Ok(())
+        }
+
+        async fn dial_tcp(
+            &self,
+            _ctx: &CancellationToken,
+            _network: &str,
+            _source: SocketAddr,
+            _destination: SocketAddr,
+        ) -> Result<Box<dyn NetConn>> {
+            Err(anyhow!("the stack reader never dials"))
+        }
+
+        async fn dial_udp(
+            &self,
+            _ctx: &CancellationToken,
+            _network: &str,
+            _source: SocketAddr,
+            _destination: SocketAddr,
+        ) -> Result<Box<dyn NetConn>> {
+            Err(anyhow!("the stack reader never dials"))
+        }
+
+        async fn listen_udp(
+            &self,
+            _ctx: &CancellationToken,
+            _network: &str,
+            _local: SocketAddr,
+        ) -> Result<Box<dyn NetPacketConn>> {
+            Err(anyhow!("the stack reader never listens"))
+        }
+
+        fn read(&self, buffers: &mut [Vec<u8>], sizes: &mut [usize], _offset: usize) -> Result<usize> {
+            let (Some(buffer), Some(size)) = (buffers.first(), sizes.first_mut()) else {
+                return Ok(0);
+            };
+            *size = buffer.len() + 1;
+            self.reads.fetch_add(1, Ordering::SeqCst);
+            Ok(1)
+        }
+
+        fn write(&self, _buffers: &[Vec<u8>], _offset: usize) -> Result<usize> {
+            Ok(0)
+        }
+
+        fn mtu(&self) -> Result<u32> {
+            Ok(self.mtu)
+        }
+
+        fn name(&self) -> Result<String> {
+            Ok("oversized".to_owned())
+        }
+
+        fn batch_size(&self) -> usize {
+            1
+        }
+
+        fn close(&self) -> Result<()> {
+            Ok(())
+        }
+    }
+
+    /// Forwarding the first `mtu` bytes of an oversized report hands a corrupt frame to the peer.
+    #[tokio::test]
+    async fn a_device_reporting_more_than_the_buffer_holds_stops_the_reader() {
+        let device = Arc::new(OversizedDevice::new(1500));
+        let stack = NetworkStack::spawn(Arc::clone(&device) as Arc<dyn IpStack>);
+
+        assert!(
+            matches!(
+                stack.packets.recv_timeout(Duration::from_secs(5)),
+                Err(std::sync::mpsc::RecvTimeoutError::Disconnected)
+            ),
+            "the reader must stop instead of queueing a truncated frame"
+        );
+        assert_eq!(device.reads(), 1, "the oversized report ended the read loop");
     }
 
     /// Only a host that is not already an address is resolved.
