@@ -361,7 +361,7 @@ impl<K: Eq + Hash + Clone, V: Clone> LruCache<K, V> {
         self.set_with_expire_locked(&mut state, key, value, expires.timestamp());
     }
 
-    #[expect(clippy::expect_used, reason = "`push_back` has just appended the element this reads as the front")]
+    #[expect(clippy::expect_used, reason = "the list overflowed max_size, so it is non-empty")]
     pub(crate) fn set_with_expire_locked(&self, state: &mut Cache<K, V>, key: K, value: V, expires: i64) {
         if let Some(index) = state.cache.get(&key).copied() {
             state.lru.move_to_back(index);
@@ -374,8 +374,8 @@ impl<K: Eq + Hash + Clone, V: Clone> LruCache<K, V> {
             state.cache.insert(key, index);
 
             if self.max_size > 0 && state.lru.len() > self.max_size {
-                let front = state.lru.front().expect("the element just pushed is the front");
-                self.delete_element(state, front);
+                let oldest = state.lru.front().expect("the list is non-empty");
+                self.delete_element(state, oldest);
             }
         }
 
