@@ -436,8 +436,7 @@ async fn complete_authenticated_handshake_inner<S: AsyncRead + AsyncWrite + Unpi
 
     let client_finished_msg = record_layer.read_handshake_message().await?;
     let client_verify_data = handshake::parse_finished(&client_finished_msg)?;
-    let expected = schedule.finished_verify_data(&schedule.client_handshake_secret, &through_server_finished);
-    if client_verify_data != expected {
+    if !schedule.verify_finished(&schedule.client_handshake_secret, &through_server_finished, &client_verify_data) {
         return Err(anyhow!("REALITY: client Finished does not verify"));
     }
 

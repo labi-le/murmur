@@ -220,6 +220,26 @@ impl KeySchedule {
             }
         }
     }
+
+    /// Verifies a received `Finished.verify_data` against the transcript. `verify_slice` decides
+    /// equality without early exit, and a value of the wrong length is an error rather than a
+    /// prefix match.
+    pub(crate) fn verify_finished(&self, secret: &[u8], transcript_digest: &[u8], received: &[u8]) -> bool {
+        let finished_key = hkdf_expand_label(self.suite, secret, "finished", &[], self.suite.hash_len());
+        #[expect(clippy::expect_used, reason = "HMAC accepts a key of any length, so `new_from_slice` cannot fail")]
+        match self.suite.transcript() {
+            Transcript::Sha256(_) => {
+                let mut mac = Hmac::<Sha256>::new_from_slice(&finished_key).expect("HMAC accepts any key length");
+                mac.update(transcript_digest);
+                mac.verify_slice(received).is_ok()
+            }
+            Transcript::Sha384(_) => {
+                let mut mac = Hmac::<Sha384>::new_from_slice(&finished_key).expect("HMAC accepts any key length");
+                mac.update(transcript_digest);
+                mac.verify_slice(received).is_ok()
+            }
+        }
+    }
 }
 
 /// Record-layer AEAD nonce: the derived IV XORed with the big-endian 64-bit sequence number,

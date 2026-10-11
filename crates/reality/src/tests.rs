@@ -113,6 +113,31 @@ async fn wrong_short_id_falls_back_instead_of_authenticating() {
     server_task.await.expect("server task should not panic");
 }
 
+/// The REALITY MAC checks accept exactly the value they recompute: a one-byte difference and a
+/// value of the wrong length are both rejected.
+#[test]
+fn the_mac_checks_accept_only_the_recomputed_value() {
+    let auth_key = [0x11u8; 32];
+    let leaf_public = [0x22u8; 32];
+    let signature = crate::cert::hmac_signature(&auth_key, &leaf_public);
+    assert!(crate::cert::verify_signature(&auth_key, &leaf_public, &signature));
+    assert!(!crate::cert::verify_signature(&auth_key, &[0x23u8; 32], &signature), "another leaf key");
+    let mut one_byte_off = signature;
+    one_byte_off[63] ^= 1;
+    assert!(!crate::cert::verify_signature(&auth_key, &leaf_public, &one_byte_off));
+    assert!(!crate::cert::verify_signature(&auth_key, &leaf_public, &signature[..63]), "a truncated signature");
+
+    let schedule = crate::suite::KeySchedule::new(CipherSuite::Aes128GcmSha256, &[0x33u8; 32], &[0x44u8; 32]);
+    let secret = &schedule.server_handshake_secret;
+    let digest = [0x55u8; 32];
+    let finished = schedule.finished_verify_data(secret, &digest);
+    assert!(schedule.verify_finished(secret, &digest, &finished));
+    assert!(!schedule.verify_finished(secret, &digest, &finished[..31]), "a truncated Finished");
+    let mut one_byte_off = finished;
+    one_byte_off[0] ^= 0x80;
+    assert!(!schedule.verify_finished(secret, &digest, &one_byte_off));
+}
+
 /// A `ClientHello` whose `key_share` body is missing its list-length prefix
 /// still round-trips through this crate's own parser, so only the wire shape itself catches it --
 /// and the wire shape is exactly what a real REALITY server parses.

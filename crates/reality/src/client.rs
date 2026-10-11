@@ -112,8 +112,7 @@ where
 
     let finished_msg = record_layer.read_handshake_message().await?;
     let server_verify_data = handshake::parse_finished(&finished_msg)?;
-    let expected = schedule.finished_verify_data(&schedule.server_handshake_secret, &pre_finished_digest);
-    if server_verify_data != expected {
+    if !schedule.verify_finished(&schedule.server_handshake_secret, &pre_finished_digest, &server_verify_data) {
         return Err(anyhow!("REALITY: server Finished does not verify"));
     }
     transcript.update(&finished_msg);
@@ -130,8 +129,7 @@ where
     record_layer.set_write_keys(suite, client_ap_key, client_ap_iv);
     record_layer.set_read_keys(suite, server_ap_key, server_ap_iv);
 
-    let expected_hmac = cert::hmac_signature(&auth_key, &leaf_public);
-    let verified = expected_hmac == leaf_signature;
+    let verified = cert::verify_signature(&auth_key, &leaf_public, &leaf_signature);
 
     murmur_log::debugln!("REALITY authentication: {verified}, cipher suite: {:?}", suite);
 

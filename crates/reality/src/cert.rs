@@ -93,6 +93,16 @@ pub(crate) fn hmac_signature(auth_key: &[u8], ed25519_public: &[u8; 32]) -> [u8;
     mac.finalize().into_bytes().into()
 }
 
+/// Verifies a peer certificate's "signature" field against `HMAC-SHA512(AuthKey, ed25519_public)`.
+/// `verify_slice` decides equality without early exit, so the peer cannot recover the expected
+/// value from the comparison's duration; a signature of the wrong length is an error.
+pub(crate) fn verify_signature(auth_key: &[u8], ed25519_public: &[u8; 32], signature: &[u8]) -> bool {
+    #[expect(clippy::expect_used, reason = "HMAC accepts a key of any length, so `new_from_slice` cannot fail")]
+    let mut mac = Hmac::<Sha512>::new_from_slice(auth_key).expect("HMAC accepts any key length");
+    mac.update(ed25519_public);
+    mac.verify_slice(signature).is_ok()
+}
+
 /// A minimal, non-recursive-descent-general DER reader: just enough to walk into an arbitrary
 /// leaf certificate's `TBSCertificate.subjectPublicKeyInfo` (to check for an Ed25519 key) and
 /// the outer `Certificate.signatureValue`, without depending on this crate's own encoder's exact
