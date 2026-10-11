@@ -2,6 +2,8 @@ use murmur_common::utils::ranges::IntRanges;
 use murmur_constant::metadata::NetWork;
 use murmur_constant::sniffer::sniffer::Sniffer;
 
+use super::dispatcher::ErrorUnsupportedSniffer;
+
 #[derive(Clone, Debug, Default)]
 pub struct SnifferConfig {
     pub override_dest: bool,
@@ -27,7 +29,7 @@ impl Sniffer for BaseSniffer {
     }
 
     fn sniff_data(&self, _bytes: &[u8]) -> anyhow::Result<String> {
-        Err(anyhow::anyhow!("TODO"))
+        Err(ErrorUnsupportedSniffer.into())
     }
 
     fn protocol(&self) -> String {
@@ -36,5 +38,20 @@ impl Sniffer for BaseSniffer {
 
     fn support_port(&self, port: u16) -> bool {
         self.ports.check(port)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::dispatcher::ErrorUnsupportedSniffer;
+
+    #[test]
+    fn base_sniffer_names_the_unsupported_protocol() {
+        let sniffer = BaseSniffer::new(IntRanges::default(), NetWork::TCP);
+
+        let err = sniffer.sniff_data(b"").unwrap_err();
+
+        assert!(err.is::<ErrorUnsupportedSniffer>(), "expected a named unsupported-protocol error, got {err}");
     }
 }
