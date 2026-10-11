@@ -194,7 +194,10 @@ impl Datagram for DnsPacketConn {
         }
 
         if buf.len() > SAFE_DNS_PACKET_SIZE {
-            return Ok(buf.len());
+            return Err(io::Error::other(format!(
+                "dns query of {} bytes exceeds the {SAFE_DNS_PACKET_SIZE} byte relay buffer",
+                buf.len()
+            )));
         }
 
         let mut relay_buf = pool::get(SAFE_DNS_PACKET_SIZE);
@@ -243,5 +246,27 @@ impl Datagram for DnsPacketConn {
     fn close(&self) -> io::Result<()> {
         self.ctx.cancel();
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::net::{Ipv4Addr, SocketAddr};
+
+    use super::*;
+
+    #[tokio::test]
+    async fn an_oversize_udp_query_fails_closed_instead_of_reporting_success() {
+        let pc = DnsPacketConn::new(CancellationToken::new());
+        let addr = SocketAddr::from((Ipv4Addr::LOCALHOST, 53));
+        let query = vec![0u8; SAFE_DNS_PACKET_SIZE + 1];
+
+        let err = pc.send_to(&query, addr).await.expect_err("a discarded query must not be reported as sent");
+        let err = err.to_string();
+        assert!(err.contains(&query.len().to_string()), "{err}");
+        assert!(err.contains(&SAFE_DNS_PACKET_SIZE.to_string()), "{err}");
+
+        let mut response = pc.response.lock().await;
+        assert!(response.try_recv().is_err(), "a rejected query must not queue a reply");
     }
 }
