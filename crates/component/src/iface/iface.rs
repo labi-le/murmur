@@ -138,9 +138,9 @@ pub async fn interfaces() -> anyhow::Result<HashMap<String, Arc<Interface>>> {
 }
 
 pub async fn resolve_interface(name: &str) -> anyhow::Result<Arc<Interface>> {
-    let ifaces = interfaces().await?;
+    let cache = get_cache().await?;
 
-    match ifaces.get(name) {
+    match cache.if_map_by_name.get(name) {
         Some(iface) => Ok(Arc::clone(iface)),
         None => Err(ErrIfaceNotFound.into()),
     }
@@ -201,5 +201,24 @@ impl Interface {
         }
 
         fallback.ok_or_else(|| ErrAddrNotFound.into())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The lookup is paid once per dial attempt and once per racer; it must hand out the cached
+    /// entry itself rather than copy the whole interface table to read one key.
+    #[tokio::test]
+    async fn resolve_interface_returns_the_cached_entry() {
+        flush_cache();
+        let cache = get_cache().await.expect("cache");
+        let Some((name, cached)) = cache.if_map_by_name.iter().next().map(|(n, i)| (n.clone(), Arc::clone(i))) else {
+            return;
+        };
+
+        let resolved = resolve_interface(&name).await.expect("a listed interface resolves");
+        assert!(Arc::ptr_eq(&resolved, &cached), "resolve_interface must return the cached entry, not a copy");
     }
 }
