@@ -330,7 +330,7 @@ impl RequestParser {
             match self.header_phase {
                 HeaderPhase::Done => return Poll::Ready(Ok(())),
                 HeaderPhase::RequestLine => {
-                    ready!(poll_read_line(conn, cx, &mut self.line, None))?;
+                    ready!(poll_read_line(conn, cx, &mut self.line, Some(MAX_LINE_LENGTH)))?;
                     let line = String::from_utf8_lossy(strip_line_ending(&self.line)).into_owned();
                     let Some((method, request_uri, proto)) = parse_request_line(&line) else {
                         return Poll::Ready(Err(protocol_error(format!("malformed HTTP request {line:?}"))));
@@ -359,7 +359,7 @@ impl RequestParser {
                     self.header_phase = HeaderPhase::HeaderLine;
                 }
                 HeaderPhase::HeaderLine => {
-                    ready!(poll_read_line(conn, cx, &mut self.line, None))?;
+                    ready!(poll_read_line(conn, cx, &mut self.line, Some(MAX_LINE_LENGTH)))?;
                     let raw = strip_line_ending(&self.line).to_vec();
                     self.line.clear();
                     if raw.is_empty() {
@@ -806,6 +806,42 @@ mod tests {
 
     const UPGRADE_HEADERS: &str =
         "GET / HTTP/1.1\r\nHost: example.com\r\nConnection: Upgrade\r\nTransfer-Encoding: chunked\r\n\r\n";
+
+    /// Bug #106: the request line was accumulated with no bound, so a peer that opens the listener
+    /// and never sends `\n` grows the parser's `line` buffer by one byte per socket read forever.
+    #[tokio::test]
+    async fn request_line_over_4096_bytes_errors() {
+        let (client_side, server_side) = tokio::io::duplex(1 << 20);
+        let mut server = new_http_obfs_server(Box::new(PipeConn(server_side)));
+        let mut client = PipeConn(client_side);
+        client.write_all(b"GET ").await.expect("write request line start");
+        client.write_all(&vec![b'a'; 64 * 1024]).await.expect("write unterminated request line");
+
+        let mut buf = [0u8; 16];
+        let result = tokio::time::timeout(Duration::from_secs(5), server.read(&mut buf))
+            .await
+            .expect("must not hang reading an unterminated request line");
+        let err = result.expect_err("an unterminated 4096+ byte request line must be rejected");
+        assert_eq!(err.to_string(), "header line too long");
+    }
+
+    /// Bug #106: the header-line call site passed no limit either, so the same unbounded growth
+    /// happened one phase later.
+    #[tokio::test]
+    async fn header_line_over_4096_bytes_errors() {
+        let (client_side, server_side) = tokio::io::duplex(1 << 20);
+        let mut server = new_http_obfs_server(Box::new(PipeConn(server_side)));
+        let mut client = PipeConn(client_side);
+        client.write_all(b"GET / HTTP/1.1\r\nX-A: ").await.expect("write request and header start");
+        client.write_all(&vec![b'a'; 64 * 1024]).await.expect("write unterminated header line");
+
+        let mut buf = [0u8; 16];
+        let result = tokio::time::timeout(Duration::from_secs(5), server.read(&mut buf))
+            .await
+            .expect("must not hang reading an unterminated header line");
+        let err = result.expect_err("an unterminated 4096+ byte header line must be rejected");
+        assert_eq!(err.to_string(), "header line too long");
+    }
 
     /// Parent bug: `poll_read_line` pushed bytes into `self.line` with no bound while waiting for
     /// `\n`, so a chunk-size line that never terminates grows the `Vec` without limit. A line over
