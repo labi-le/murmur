@@ -158,6 +158,27 @@ pub(crate) fn fallback_parse_network(network: &str, addr: Option<IpAddr>) -> Str
     network.to_owned()
 }
 
+/// The `IP_UNICAST_IF` value, in the network byte order MSDN documents for that option;
+/// `IPV6_UNICAST_IF` and Darwin's `IP_BOUND_IF` take the index in host byte order instead.
+#[cfg(any(windows, test))]
+#[must_use]
+pub(crate) const fn unicast_if_network_order_bytes(iface_idx: i32) -> [u8; 4] {
+    iface_idx.cast_unsigned().to_be_bytes()
+}
+
+#[cfg(test)]
+mod unicast_if_tests {
+    use super::unicast_if_network_order_bytes;
+
+    #[test]
+    fn the_windows_ipv4_bind_option_is_given_the_network_order_index() {
+        assert_eq!(unicast_if_network_order_bytes(1), [0, 0, 0, 1]);
+        assert_eq!(unicast_if_network_order_bytes(0x0102_0304), [1, 2, 3, 4]);
+        assert_eq!(unicast_if_network_order_bytes(256), [0, 0, 1, 0]);
+        assert_eq!(unicast_if_network_order_bytes(-1), [0xff, 0xff, 0xff, 0xff]);
+    }
+}
+
 #[cfg(test)]
 mod host_port_tests {
     use super::join_host_port;
