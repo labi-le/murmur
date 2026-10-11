@@ -24,6 +24,8 @@ use crate::keepalive::tcp_keepalive::tcp_keep_alive;
 use crate::keepalive::tcp_keepalive_config::{tcp_keep_alive_stream, KeepAliveConfig, KeepAliveFields};
 use crate::mptcp::MultipathTcpFlag;
 use crate::resolver::resolver::{lookup_ip_with_resolver, proxy_server_host_resolver};
+#[cfg(unix)]
+use murmur_common::net::unix_socket_address_unsupported;
 use murmur_common::time::TimeDuration;
 use murmur_common_net::io::{Acceptor, Datagram, Stream, TcpAcceptor, UdpAcceptor};
 #[cfg(windows)]
@@ -536,11 +538,23 @@ fn closed_conn_error() -> io::Error {
     io::Error::new(io::ErrorKind::NotConnected, "use of closed network connection")
 }
 
-/// The accepted network argument kinds; `Some(true)` is datagram.
-fn network_kind(network: &str) -> Option<bool> {
+/// The accepted network argument kinds.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum NetworkKind {
+    Stream,
+    Datagram,
+    #[cfg(unix)]
+    Unix,
+}
+
+/// The accepted network argument kinds; `unix` is listen-only, and only where the platform has
+/// unix-domain sockets.
+fn network_kind(network: &str) -> Option<NetworkKind> {
     match network {
-        "tcp" | "tcp4" | "tcp6" => Some(false),
-        "udp" | "udp4" | "udp6" => Some(true),
+        "tcp" | "tcp4" | "tcp6" => Some(NetworkKind::Stream),
+        "udp" | "udp4" | "udp6" => Some(NetworkKind::Datagram),
+        #[cfg(unix)]
+        "unix" => Some(NetworkKind::Unix),
         _ => None,
     }
 }
@@ -605,8 +619,14 @@ impl StdDialer {
             return Err(anyhow::anyhow!("context canceled"));
         }
 
-        let Some(is_udp) = network_kind(network) else {
-            return Err(anyhow::anyhow!("dial {network} {address}: unknown network {network}"));
+        let is_udp = match network_kind(network) {
+            Some(NetworkKind::Stream) => false,
+            Some(NetworkKind::Datagram) => true,
+            #[cfg(unix)]
+            Some(NetworkKind::Unix) => {
+                return Err(anyhow::anyhow!("dial {network} {address}: unix sockets are listen-only"));
+            }
+            None => return Err(anyhow::anyhow!("dial {network} {address}: unknown network {network}")),
         };
 
         let mut errs = Vec::new();
@@ -757,8 +777,11 @@ impl StdListenConfig {
         network: &str,
         address: &str,
     ) -> anyhow::Result<Box<dyn Acceptor>> {
-        if network_kind(network) != Some(false) {
-            return Err(anyhow::anyhow!("listen {network} {address}: unknown network {network}"));
+        match network_kind(network) {
+            Some(NetworkKind::Stream) => {}
+            #[cfg(unix)]
+            Some(NetworkKind::Unix) => return Self::listen_unix(address),
+            _ => return Err(anyhow::anyhow!("listen {network} {address}: unknown network {network}")),
         }
 
         if let Some(protocol) = mptcp_protocol(self.multipath_tcp) {
@@ -768,6 +791,15 @@ impl StdListenConfig {
         }
 
         self.listen_proto(network, address, Protocol::TCP).await
+    }
+
+    /// Binds the unix-domain socket a controller's `unix_addr` names. No listen-config setting is
+    /// consulted: they are all IP-shaped (keep-alive, TFO, MPTCP, routing mark, interface bind),
+    /// so neither they nor a control hook apply to a unix socket, and the caller removes a stale
+    /// path itself.
+    #[cfg(unix)]
+    fn listen_unix(address: &str) -> anyhow::Result<Box<dyn Acceptor>> {
+        Ok(Box::new(UnixAcceptor::new(tokio::net::UnixListener::bind(address)?)))
     }
 
     /// One full listen attempt with a fixed protocol. The MPTCP path runs this whole attempt with
@@ -820,7 +852,7 @@ impl StdListenConfig {
         network: &str,
         address: &str,
     ) -> anyhow::Result<Box<dyn Datagram>> {
-        if network_kind(network) != Some(true) {
+        if network_kind(network) != Some(NetworkKind::Datagram) {
             return Err(anyhow::anyhow!("listen {network} {address}: unknown network {network}"));
         }
 
@@ -920,6 +952,45 @@ impl Acceptor for KeepAliveAcceptor {
 
     fn addr(&self) -> io::Result<SocketAddr> {
         self.inner.addr()
+    }
+}
+
+/// The unix-domain listener `StdListenConfig::listen_unix` hands out. `Acceptor`'s address
+/// accessors are IP-shaped, so `addr` reports why a unix path is not one instead of inventing an
+/// address; the caller's log line tolerates the failure.
+#[cfg(unix)]
+struct UnixAcceptor {
+    listener: tokio::net::UnixListener,
+    closed: CancellationToken,
+}
+
+#[cfg(unix)]
+impl UnixAcceptor {
+    fn new(listener: tokio::net::UnixListener) -> Self {
+        Self { listener, closed: CancellationToken::new() }
+    }
+}
+
+#[cfg(unix)]
+#[async_trait::async_trait]
+impl Acceptor for UnixAcceptor {
+    // cancel-safe: tokio's accept leaves an unaccepted connection in the listener's queue.
+    async fn accept(&self) -> io::Result<Box<dyn Stream>> {
+        let (stream, _) = tokio::select! {
+            biased;
+            () = self.closed.cancelled() => return Err(closed_conn_error()),
+            result = self.listener.accept() => result?,
+        };
+        Ok(Box::new(stream))
+    }
+
+    fn close(&self) -> io::Result<()> {
+        self.closed.cancel();
+        Ok(())
+    }
+
+    fn addr(&self) -> io::Result<SocketAddr> {
+        Err(unix_socket_address_unsupported())
     }
 }
 
@@ -1551,5 +1622,49 @@ mod listener_keep_alive_tests {
                 );
             }
         }
+    }
+}
+
+#[cfg(all(test, unix))]
+mod unix_listener_tests {
+    use std::io;
+
+    use murmur_common_net::io::Stream;
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    use tokio_util::sync::CancellationToken;
+
+    use super::{StdDialer, StdListenConfig};
+
+    /// The controller's unix socket binds through the same listen config as the TCP one, accepts a
+    /// connection, and answers the address accessors with the reason instead of an invented
+    /// address.
+    #[tokio::test]
+    async fn a_unix_listen_binds_and_accepts_a_connection() {
+        let path = std::env::temp_dir().join(format!("murmur-unix-listen-{}.sock", std::process::id()));
+        let _ = std::fs::remove_file(&path);
+        let acceptor =
+            StdListenConfig::default().listen(&CancellationToken::new(), "unix", path.to_str().unwrap()).await.unwrap();
+
+        let mut client = tokio::net::UnixStream::connect(&path).await.unwrap();
+        let mut accepted = acceptor.accept().await.unwrap();
+        client.write_all(b"x").await.unwrap();
+        let mut byte = [0; 1];
+        accepted.read_exact(&mut byte).await.unwrap();
+        assert_eq!(&byte, b"x");
+
+        assert_eq!(acceptor.addr().unwrap_err().kind(), io::ErrorKind::Unsupported);
+        assert_eq!(accepted.local_addr().unwrap_err().kind(), io::ErrorKind::Unsupported);
+        assert_eq!(accepted.peer_addr().unwrap_err().kind(), io::ErrorKind::Unsupported);
+
+        let _ = std::fs::remove_file(&path);
+    }
+
+    /// The dial half keeps refusing `unix`, naming the reason.
+    #[tokio::test]
+    async fn a_unix_dial_is_refused_by_name() {
+        let dialed =
+            StdDialer::default().dial_context(&CancellationToken::new(), "unix", "/tmp/murmur-unix-dial.sock").await;
+        let err = dialed.err().expect("a unix dial must be refused");
+        assert!(err.to_string().contains("unix sockets are listen-only"), "{err}");
     }
 }

@@ -207,6 +207,33 @@ impl Stream for TcpStream {
     }
 }
 
+/// A unix socket reaches the `Stream` contract, because a listener has to hand one out, but not
+/// its address accessors: a unix address is a filesystem path, which `SocketAddr` cannot carry.
+/// `as_socket` stays `None` for the same reason — the socket options behind it are IP-shaped.
+#[cfg(unix)]
+impl Stream for tokio::net::UnixStream {
+    fn local_addr(&self) -> io::Result<SocketAddr> {
+        Err(unix_socket_address_unsupported())
+    }
+    fn peer_addr(&self) -> io::Result<SocketAddr> {
+        Err(unix_socket_address_unsupported())
+    }
+    fn shutdown_read(&self) -> io::Result<()> {
+        socket2::SockRef::from(self).shutdown(std::net::Shutdown::Read)
+    }
+    fn shutdown_write(&self) -> io::Result<()> {
+        socket2::SockRef::from(self).shutdown(std::net::Shutdown::Write)
+    }
+}
+
+/// Why a unix socket cannot answer `Stream`'s address accessors; a listener whose `addr` is
+/// equally unrepresentable reports the same reason.
+#[cfg(unix)]
+#[must_use]
+pub fn unix_socket_address_unsupported() -> io::Error {
+    io::Error::new(io::ErrorKind::Unsupported, "a unix socket address is a path, not a std::net::SocketAddr")
+}
+
 #[async_trait]
 impl Datagram for UdpSocket {
     async fn recv_from(&self, buf: &mut [u8]) -> io::Result<(usize, SocketAddr)> {
