@@ -32,7 +32,7 @@ use murmur_component_wireguard::cookie::{address_bytes, CookieChecker, CookieGen
 use murmur_component_wireguard::device::{Device, DeviceConfig, PeerConfig, QUEUE_HANDSHAKE_SIZE};
 use murmur_component_wireguard::handshake::Initiator;
 use murmur_component_wireguard::keys::{PresharedKey, StaticKey};
-use murmur_component_wireguard::stack::{Events, Stack, StackConfig};
+use murmur_component_wireguard::stack::{Events, Stack, StackConfig, PACKET_QUEUE_SIZE, UDP_SOCKET_PACKETS};
 use smoltcp::phy::{self, DeviceCapabilities, Medium};
 use smoltcp::time::Instant as SmolInstant;
 
@@ -176,6 +176,53 @@ async fn a_udp_datagram_crosses_the_stack() {
     assert_eq!(&buffer[..size], b"ping");
     assert_eq!(source.ip(), IpAddr::V4(Ipv4Addr::new(10, 0, 0, 2)));
     assert_ne!(source.port(), 0, "the client socket must hold a real ephemeral port");
+}
+
+/// A socket whose reader has stopped polling must not let the peer's stream pile up in this
+/// process. The read side drains `smoltcp`'s receive buffer into the per-socket event queue, so
+/// that queue's bound is what stops the drain once the consumer stalls: the backlog the socket
+/// will hand over stays at the queue plus the `smoltcp` buffer rather than growing with the
+/// sender's stream, and reading again restarts the drain.
+#[tokio::test]
+async fn a_non_reading_socket_bounds_the_backlog_the_stack_keeps() {
+    const SENT: usize = 4096;
+    let (_, server_end, _, server_events) = linked();
+    let server = Stack::with_device(
+        StackConfig { local_addresses: vec![prefix("10.0.0.1/32")], mtu: 1500 },
+        loopback(&server_end, 1500),
+        server_events,
+    )
+    .expect("server stack");
+
+    let bound = SocketAddr::new(IpAddr::V4(Ipv4Addr::new(10, 0, 0, 1)), 9);
+    let listener = with_timeout("listen_udp", server.listen_udp(Some(bound))).await.expect("bind");
+
+    // The reader never runs while the peer writes, which is the stalled-consumer case. The
+    // packets are paced so the driver moves each one off the wire before the next arrives:
+    // only the event queue's bound can then stop the stack emptying the receive buffer.
+    for _ in 0..SENT {
+        server_end.inbound.push(udp_packet(Ipv4Addr::new(10, 0, 0, 2), Ipv4Addr::new(10, 0, 0, 1), b"x"));
+        tokio::time::sleep(Duration::from_micros(200)).await;
+    }
+    // Let the tail of the stream arrive and be dropped by the socket's own `smoltcp` buffer, so
+    // nothing is left in flight when the reader starts.
+    tokio::time::sleep(Duration::from_millis(200)).await;
+
+    let mut buffer = [0u8; 64];
+    let mut received = 0usize;
+    loop {
+        match tokio::time::timeout(Duration::from_secs(1), listener.recv_from(&mut buffer)).await {
+            Ok(Ok(_)) => received += 1,
+            Ok(Err(_)) | Err(_) => break,
+        }
+        assert!(received <= SENT, "the sender only wrote {SENT} datagrams");
+    }
+    assert!(received > PACKET_QUEUE_SIZE, "reading must restart the drain, got {received}");
+    assert!(
+        received <= PACKET_QUEUE_SIZE + 2 * UDP_SOCKET_PACKETS,
+        "a stalled reader must bound the backlog to the queue and the socket's own buffer, \
+         not to the sender's whole stream: got {received} of {SENT}"
+    );
 }
 
 /// A minimal IPv4 + UDP packet; the device only reads the IP header and the length.

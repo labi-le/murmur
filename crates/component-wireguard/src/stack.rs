@@ -32,7 +32,7 @@ use crate::device::Tun;
 /// to pin megabytes per connection.
 const TCP_SOCKET_BUFFER: usize = 32 * 1024;
 /// Datagrams buffered per UDP socket in each direction.
-const UDP_SOCKET_PACKETS: usize = 32;
+pub const UDP_SOCKET_PACKETS: usize = 32;
 /// The stack refuses an MTU below this when IPv6 output is in use.
 const IPV6_MINIMUM_MTU: u16 = 1280;
 /// The lowest MTU the stack accepts at all.
@@ -192,8 +192,9 @@ impl phy::Device for ChannelPhy {
     }
 }
 
-/// What a [`PacketDevice`] queues in each direction.
-const PACKET_QUEUE_SIZE: usize = 256;
+/// What a [`PacketDevice`] queues in each direction, and how many events one socket's read side
+/// buffers before its drain stops and leaves the rest in the `smoltcp` receive buffer.
+pub const PACKET_QUEUE_SIZE: usize = 256;
 
 /// The packet device behind [`Stack::with_packet_handle`]: a stack whose packets the caller
 /// moves itself — both the socket surface and the packet device an OpenVPN or MASQUE outbound reads
@@ -664,9 +665,12 @@ struct Connect {
 struct Entry {
     handle: SocketHandle,
     is_tcp: bool,
-    events: mpsc::UnboundedSender<Event>,
+    events: mpsc::Sender<Event>,
     signal: Arc<Signal>,
     actions: mpsc::UnboundedReceiver<Action>,
+    /// A close the bounded event queue had no room for: `drain_events` sends it once the reader
+    /// makes room, and only after the socket's data, so a reader sees EOF last.
+    pending: Option<Event>,
     /// Outbound bytes `smoltcp` has not accepted yet; its own send buffer supplies the
     /// backpressure, so this only holds what one `poll_write` handed over.
     outbox: VecDeque<u8>,
@@ -676,6 +680,29 @@ struct Entry {
     closing: bool,
     connect: Option<Connect>,
     established: bool,
+}
+
+impl Entry {
+    /// Hand an event to the socket's task. A full queue holds a close back in `pending` rather
+    /// than dropping it; `drain_events` flushes it once the reader makes room. A closed queue
+    /// means the socket's task is gone, and the entry goes with it.
+    fn deliver(&mut self, event: Event) {
+        if let Err(mpsc::error::TrySendError::Full(event)) = self.events.try_send(event) {
+            self.pending = Some(event);
+        }
+    }
+
+    /// Send a close the full queue held back; a queue that is still full keeps holding it.
+    fn flush_pending(&mut self) {
+        let Some(event) = self.pending.take() else {
+            return;
+        };
+        match self.events.try_send(event) {
+            Ok(()) => self.signal.wake(),
+            Err(mpsc::error::TrySendError::Full(event)) => self.pending = Some(event),
+            Err(mpsc::error::TrySendError::Closed(_)) => {}
+        }
+    }
 }
 
 struct Driver<D: phy::Device> {
@@ -845,7 +872,7 @@ impl<D: phy::Device> Driver<D> {
     ) -> Option<TcpConn> {
         let id = self.take_id();
         let (action_tx, actions) = mpsc::unbounded_channel();
-        let (events, event_rx) = mpsc::unbounded_channel();
+        let (events, event_rx) = mpsc::channel(PACKET_QUEUE_SIZE);
         let signal = Arc::new(Signal::default());
         let queued = Arc::new(std::sync::atomic::AtomicU64::new(0));
         let local = Arc::new(Mutex::new(from_smoltcp_endpoint(local)));
@@ -870,6 +897,7 @@ impl<D: phy::Device> Driver<D> {
                 events,
                 signal,
                 actions,
+                pending: None,
                 outbox: VecDeque::new(),
                 datagrams: VecDeque::new(),
                 queued,
@@ -906,7 +934,7 @@ impl<D: phy::Device> Driver<D> {
         };
         let id = self.take_id();
         let (action_tx, actions) = mpsc::unbounded_channel();
-        let (events, event_rx) = mpsc::unbounded_channel();
+        let (events, event_rx) = mpsc::channel(PACKET_QUEUE_SIZE);
         let signal = Arc::new(Signal::default());
         let queued = Arc::new(std::sync::atomic::AtomicU64::new(0));
         let local_addr = from_smoltcp_endpoint(IpEndpoint::new(
@@ -931,6 +959,7 @@ impl<D: phy::Device> Driver<D> {
                 events,
                 signal,
                 actions,
+                pending: None,
                 outbox: VecDeque::new(),
                 datagrams: VecDeque::new(),
                 queued,
@@ -964,12 +993,22 @@ impl<D: phy::Device> Driver<D> {
         self.entries.values().any(|entry| entry.local.lock().map_or(true, |local| local.port() == port))
     }
 
-    /// the per-socket read side: hand whatever `smoltcp` buffered to the socket's task.
+    /// The per-socket read side: hand whatever `smoltcp` buffered to the socket's task, as far as
+    /// the bounded event queue has room for it. A full queue stops that socket's drain and leaves
+    /// the bytes in the `smoltcp` receive buffer, so the advertised window reflects the unread
+    /// backlog; a read is what re-arms it: `TcpConn::poll_read` and `UdpConn::recv_from` notify
+    /// the driver once they take an event out of the queue.
     fn drain_events(&mut self) {
         let mtu = self.mtu;
         let Self { sockets, entries, .. } = &mut *self;
         for entry in entries.values_mut() {
             loop {
+                // Only pull a socket's bytes while its queue can take them: with the queue full
+                // the bytes have to stay in the `smoltcp` receive buffer, which is what the
+                // advertised window reflects. A reader that makes room notifies the driver.
+                if entry.events.capacity() == 0 {
+                    break;
+                }
                 if entry.is_tcp {
                     let tcp: &mut tcp::Socket = sockets.get_mut(entry.handle);
                     if !tcp.may_recv() {
@@ -983,7 +1022,7 @@ impl<D: phy::Device> Driver<D> {
                         break;
                     }
                     chunk.truncate(size);
-                    if entry.events.send(Event::Data(chunk)).is_err() {
+                    if entry.events.try_send(Event::Data(chunk)).is_err() {
                         break;
                     }
                     entry.signal.wake();
@@ -996,7 +1035,7 @@ impl<D: phy::Device> Driver<D> {
                     match udp.recv_slice(&mut chunk) {
                         Ok((size, meta)) => {
                             chunk.truncate(size);
-                            if entry.events.send(Event::Datagram(chunk, meta.endpoint)).is_err() {
+                            if entry.events.try_send(Event::Datagram(chunk, meta.endpoint)).is_err() {
                                 break;
                             }
                             entry.signal.wake();
@@ -1005,6 +1044,7 @@ impl<D: phy::Device> Driver<D> {
                     }
                 }
             }
+            entry.flush_pending();
         }
     }
 
@@ -1065,7 +1105,7 @@ impl<D: phy::Device> Driver<D> {
                     let closed = matches!(tcp.state(), tcp::State::CloseWait | tcp::State::Closed);
                     if closed {
                         entry.established = false;
-                        let _ = entry.events.send(Event::Closed);
+                        entry.deliver(Event::Closed);
                         entry.signal.wake();
                     }
                 }
@@ -1127,7 +1167,7 @@ impl<D: phy::Device> Driver<D> {
 /// `AsyncRead`/`AsyncWrite` pair the rest of this crate speaks.
 pub struct TcpConn {
     actions: mpsc::UnboundedSender<Action>,
-    events: mpsc::UnboundedReceiver<Event>,
+    events: mpsc::Receiver<Event>,
     signal: Arc<Signal>,
     wake: Events,
     queued: Arc<std::sync::atomic::AtomicU64>,
@@ -1147,7 +1187,7 @@ impl core::fmt::Debug for TcpConn {
 impl TcpConn {
     fn new(
         actions: mpsc::UnboundedSender<Action>,
-        events: mpsc::UnboundedReceiver<Event>,
+        events: mpsc::Receiver<Event>,
         signal: Arc<Signal>,
         wake: Events,
         queued: Arc<std::sync::atomic::AtomicU64>,
@@ -1206,6 +1246,8 @@ impl tokio::io::AsyncRead for TcpConn {
         let take = buf.remaining().min(this.incoming.len());
         let chunk: Vec<u8> = this.incoming.drain(..take).collect();
         buf.put_slice(&chunk);
+        // The queue has room again: let the driver move the next `smoltcp` bytes into it.
+        this.wake.notify();
         Poll::Ready(Ok(()))
     }
 }
@@ -1266,7 +1308,7 @@ impl murmur_common::net::Stream for TcpConn {
 /// `dial_udp` and `listen_udp`.
 pub struct UdpConn {
     actions: mpsc::UnboundedSender<Action>,
-    events: Mutex<mpsc::UnboundedReceiver<Event>>,
+    events: Mutex<mpsc::Receiver<Event>>,
     signal: Arc<Signal>,
     wake: Events,
     queued: Arc<std::sync::atomic::AtomicU64>,
@@ -1283,7 +1325,7 @@ impl core::fmt::Debug for UdpConn {
 impl UdpConn {
     fn new(
         actions: mpsc::UnboundedSender<Action>,
-        events: mpsc::UnboundedReceiver<Event>,
+        events: mpsc::Receiver<Event>,
         signal: Arc<Signal>,
         wake: Events,
         queued: Arc<std::sync::atomic::AtomicU64>,
@@ -1324,6 +1366,8 @@ impl murmur_common::net::Datagram for UdpConn {
                     for (slot, byte) in buffer.iter_mut().zip(&data) {
                         *slot = *byte;
                     }
+                    // The queue has room again: let the driver move the next `smoltcp` datagram in.
+                    self.wake.notify();
                     return Ok((length, from_smoltcp_endpoint(source)));
                 }
                 Ok(Some(Event::Data(_))) => continue,
