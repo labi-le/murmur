@@ -454,6 +454,20 @@ struct RouterState {
     cors: Cors,
 }
 
+impl RouterState {
+    /// The state every listener serves from, built from the same `Config`: a listener that spelled
+    /// its own literal could drop an input the others carried, as the Unix and pipe listeners did
+    /// with `secret`.
+    fn from_config(cfg: &Config) -> Self {
+        Self {
+            is_debug: cfg.is_debug,
+            secret: cfg.secret.clone(),
+            doh_server: cfg.doh_server.clone(),
+            cors: cfg.cors.clone(),
+        }
+    }
+}
+
 async fn dispatch_inner(req: Req, cfg: &RouterState) -> Response<RespBody> {
     let path = req.uri().path().to_owned();
 
@@ -1184,12 +1198,7 @@ async fn start(cfg: Arc<Config>) {
     let listener: Arc<dyn NetListener> = Arc::from(l);
     let closed = Arc::new(AtomicBool::new(false));
 
-    let state = Arc::new(RouterState {
-        is_debug: cfg.is_debug,
-        secret: cfg.secret.clone(),
-        doh_server: cfg.doh_server.clone(),
-        cors: cfg.cors.clone(),
-    });
+    let state = Arc::new(RouterState::from_config(&cfg));
     let task = tokio::spawn(accept_loop(
         Arc::clone(&listener),
         Arc::clone(&closed),
@@ -1257,12 +1266,7 @@ async fn start_tls(cfg: Arc<Config>) {
         Arc::from(tls_new_listener(Arc::new(OldListenerAsAcceptor(l)), Arc::new(tls_config)));
     let closed = Arc::new(AtomicBool::new(false));
 
-    let state = Arc::new(RouterState {
-        is_debug: cfg.is_debug,
-        secret: cfg.secret.clone(),
-        doh_server: cfg.doh_server.clone(),
-        cors: cfg.cors.clone(),
-    });
+    let state = Arc::new(RouterState::from_config(&cfg));
     let task = tokio::spawn(tls_accept_loop(Arc::clone(&tls_listener), Arc::clone(&closed), state));
     *TLS_SERVER.lock() = Some(TlsRunningServer { listener: tls_listener, closed, task });
 }
@@ -1388,12 +1392,7 @@ async fn start_unix(cfg: Arc<Config>) {
     let listener: Arc<dyn NetListener> = Arc::from(l);
     let closed = Arc::new(AtomicBool::new(false));
 
-    let state = Arc::new(RouterState {
-        is_debug: cfg.is_debug,
-        secret: String::new(),
-        doh_server: cfg.doh_server.clone(),
-        cors: cfg.cors.clone(),
-    });
+    let state = Arc::new(RouterState::from_config(&cfg));
     let task = tokio::spawn(accept_loop(
         Arc::clone(&listener),
         Arc::clone(&closed),
@@ -1431,12 +1430,7 @@ async fn start_pipe(cfg: Arc<Config>) {
     let listener: Arc<dyn NetListener> = Arc::from(l);
     let closed = Arc::new(AtomicBool::new(false));
 
-    let state = Arc::new(RouterState {
-        is_debug: cfg.is_debug,
-        secret: String::new(),
-        doh_server: cfg.doh_server.clone(),
-        cors: cfg.cors.clone(),
-    });
+    let state = Arc::new(RouterState::from_config(&cfg));
     let task = tokio::spawn(accept_loop(
         Arc::clone(&listener),
         Arc::clone(&closed),
@@ -1808,7 +1802,7 @@ mod tests {
     }
 
     fn router_state(is_debug: bool) -> Arc<RouterState> {
-        Arc::new(RouterState { is_debug, secret: String::new(), doh_server: String::new(), cors: Cors::default() })
+        Arc::new(RouterState::from_config(&Config { is_debug, ..Config::default() }))
     }
 
     #[tokio::test]
@@ -1868,26 +1862,54 @@ mod tests {
         assert_eq!(get.status, StatusCode::METHOD_NOT_ALLOWED);
     }
 
-    /// Drives `/version` over a real socket against whatever `re_create_server` most recently
-    /// installed, waiting for the accept loop to bind.
-    async fn version_response(addr: &str, secret: Option<&str>) -> (u16, String) {
-        use std::time::Duration;
+    /// `re_create_server` keeps the listeners in process-wide statics, and the next call closes
+    /// whatever the previous one installed — including the transports the new config does not
+    /// name — so the tests that reload the controller may not interleave.
+    static CONTROLLER_LISTENERS: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+
+    /// One raw `GET` on an established connection: the status code and the whole response.
+    async fn get_on<S>(stream: &mut S, target: &str, secret: Option<&str>) -> (u16, String)
+    where
+        S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin,
+    {
         use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
 
         let auth = secret.map(|token| format!("Authorization: Bearer {token}\r\n")).unwrap_or_default();
-        let request = format!("GET /version HTTP/1.1\r\nHost: test\r\n{auth}Connection: close\r\n\r\n");
+        let request = format!("GET {target} HTTP/1.1\r\nHost: test\r\n{auth}Connection: close\r\n\r\n");
+        stream.write_all(request.as_bytes()).await.expect("write request");
+        let mut raw = Vec::new();
+        stream.read_to_end(&mut raw).await.expect("read response");
+        let head = String::from_utf8_lossy(&raw).into_owned();
+        let status = head.split_whitespace().nth(1).expect("status code").parse().expect("numeric status");
+        (status, head)
+    }
+
+    /// [`get_on`] against whatever `re_create_server` most recently installed on `addr`, waiting
+    /// for the accept loop to bind.
+    async fn controller_response(addr: &str, target: &str, secret: Option<&str>) -> (u16, String) {
+        use std::time::Duration;
+
         for _ in 0..500 {
             if let Ok(mut stream) = tokio::net::TcpStream::connect(addr).await {
-                stream.write_all(request.as_bytes()).await.expect("write request");
-                let mut raw = Vec::new();
-                stream.read_to_end(&mut raw).await.expect("read response");
-                let head = String::from_utf8_lossy(&raw).into_owned();
-                let status = head.split_whitespace().nth(1).expect("status code").parse().expect("numeric status");
-                return (status, head);
+                return get_on(&mut stream, target, secret).await;
             }
             tokio::time::sleep(Duration::from_millis(20)).await;
         }
-        panic!("no external controller answered GET /version on {addr}");
+        panic!("no external controller answered {target} on {addr}");
+    }
+
+    /// [`get_on`] against the Unix listener, which has no credential of its own.
+    #[cfg(unix)]
+    async fn unix_response(socket: &str, target: &str, secret: Option<&str>) -> (u16, String) {
+        use std::time::Duration;
+
+        for _ in 0..500 {
+            if let Ok(mut stream) = tokio::net::UnixStream::connect(socket).await {
+                return get_on(&mut stream, target, secret).await;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        panic!("no external controller answered {target} on the unix socket {socket}");
     }
 
     /// A reload (`SIGHUP` → `hub::parse`) runs `re_create_server` again on the same address: the
@@ -1895,22 +1917,67 @@ mod tests {
     /// must be the one answering.
     #[tokio::test]
     async fn re_create_server_rebinds_the_same_port_and_serves_the_reloaded_config() {
+        let _guard = CONTROLLER_LISTENERS.lock().await;
+
         let probe = tokio::net::TcpListener::bind("127.0.0.1:0").await.expect("probe a free loopback port");
         let addr = probe.local_addr().expect("probe local address").to_string();
         drop(probe);
 
         re_create_server(Arc::new(Config { addr: addr.clone(), ..Config::default() })).await;
-        let (status, body) = version_response(&addr, None).await;
+        let (status, body) = controller_response(&addr, "/version", None).await;
         assert_eq!(status, 200, "the first server did not answer: {body}");
         assert!(body.contains("\"version\""), "unexpected /version body: {body}");
 
         let cfg = Arc::new(Config { addr: addr.clone(), secret: "reload-secret".to_owned(), ..Config::default() });
         re_create_server(cfg).await;
 
-        let (status, body) = version_response(&addr, None).await;
+        let (status, body) = controller_response(&addr, "/version", None).await;
         assert_eq!(status, 401, "something other than the reloaded server is listening: {body}");
-        let (status, body) = version_response(&addr, Some("reload-secret")).await;
+        let (status, body) = controller_response(&addr, "/version", Some("reload-secret")).await;
         assert_eq!(status, 200, "the reloaded server did not answer: {body}");
+    }
+
+    /// The Unix socket carries no credential of its own, so the configured secret is the only
+    /// thing between a local user and the whole API there, and the Windows pipe listener serves
+    /// from the same state. The socket is bound here because `start_unix`'s `listen("unix", …)`
+    /// is refused by the component listen config ("unknown network unix").
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn unix_controller_requires_the_configured_secret() {
+        let socket = std::env::temp_dir().join(format!("murmur-ctl-secret-{}.sock", std::process::id()));
+        let _ = std::fs::remove_file(&socket);
+        let listener = tokio::net::UnixListener::bind(&socket).expect("bind the unix socket");
+        let socket_path = socket.to_str().expect("a utf-8 temp path").to_owned();
+
+        let state =
+            Arc::new(RouterState::from_config(&Config { secret: "unix-secret".to_owned(), ..Config::default() }));
+        tokio::spawn(async move {
+            while let Ok((stream, _)) = listener.accept().await {
+                let state = Arc::clone(&state);
+                tokio::spawn(async move { serve_connection(stream, state, false).await });
+            }
+        });
+
+        let (status, body) = unix_response(&socket_path, "/version", None).await;
+        assert_eq!(status, 401, "the unix controller served the API without a credential: {body}");
+
+        let (status, body) = unix_response(&socket_path, "/version", Some("wrong-secret")).await;
+        assert_eq!(status, 401, "the unix controller accepted a credential it was not given: {body}");
+
+        let (status, body) = unix_response(&socket_path, "/version", Some("unix-secret")).await;
+        assert_eq!(status, 200, "the unix controller rejected the configured secret: {body}");
+        assert!(body.contains("\"version\""), "unexpected /version body: {body}");
+
+        let _ = std::fs::remove_file(&socket);
+    }
+
+    /// Every listener builds its router state with [`RouterState::from_config`], including the
+    /// Windows pipe mount no test on this host can bind.
+    #[test]
+    fn the_controller_state_carries_the_configured_secret() {
+        let state = RouterState::from_config(&Config { secret: "state-secret".to_owned(), ..Config::default() });
+        assert_eq!(state.secret, "state-secret");
+        assert!(RouterState::from_config(&Config::default()).secret.is_empty());
     }
 }
 
@@ -1921,12 +1988,7 @@ mod wire_parity_tests {
     use super::*;
 
     async fn request(request_line: &str) -> RawResponse {
-        let state = Arc::new(RouterState {
-            is_debug: false,
-            secret: String::new(),
-            doh_server: String::new(),
-            cors: Cors::default(),
-        });
+        let state = Arc::new(RouterState::from_config(&Config::default()));
         exchange(
             move |req| {
                 let state = Arc::clone(&state);
