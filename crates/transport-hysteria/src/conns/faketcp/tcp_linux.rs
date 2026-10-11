@@ -765,7 +765,8 @@ impl IpConn {
             socket.bind(&SockAddr::from(SocketAddr::new(laddr, 0)))?;
         }
         socket.connect(&SockAddr::from(SocketAddr::new(raddr, 0)))?;
-        Ok(Self { socket, local_addr: raddr })
+        let local_addr = dialed_local_addr(laddr, || Ok(sock_addr_ip(&socket.local_addr()?)))?;
+        Ok(Self { socket, local_addr })
     }
 
     fn listen_ip(network: &str, laddr: IpAddr) -> io::Result<Self> {
@@ -852,6 +853,16 @@ fn sock_addr_ip(addr: &SockAddr) -> IpAddr {
     match addr.as_socket() {
         Some(addr) => addr.ip(),
         None => IpAddr::V4(std::net::Ipv4Addr::UNSPECIFIED),
+    }
+}
+
+/// The source the kernel writes into the IP header of a dialled raw socket, which is what the TCP
+/// pseudo-header and the DSCP option family are derived from: the bound address when the caller
+/// chose one, else the address the socket was assigned on connect.
+fn dialed_local_addr(bound: Option<IpAddr>, kernel_source: impl FnOnce() -> io::Result<IpAddr>) -> io::Result<IpAddr> {
+    match bound {
+        Some(bound) => Ok(bound),
+        None => kernel_source(),
     }
 }
 
@@ -1321,6 +1332,24 @@ mod tests {
         tokio::task::yield_now().await;
         tokio::time::advance(EXPIRE * 3 + Duration::from_secs(1)).await;
         tokio::task::yield_now().await;
+    }
+
+    /// A dialled conn records the bound address, which is the pseudo-header source and the family
+    /// `set_dscp` reads, never the destination it connected to.
+    #[test]
+    fn dialed_local_addr_records_the_bound_address_without_reading_the_socket() {
+        let bound: IpAddr = "192.0.2.10".parse().unwrap();
+        let unread = || -> io::Result<IpAddr> { Err(io::Error::other("the socket must not be read")) };
+        assert_eq!(dialed_local_addr(Some(bound), unread).unwrap(), bound);
+    }
+
+    /// Without a bound address the address the kernel assigned to the socket is recorded, and a
+    /// socket that cannot be read fails the dial instead of falling back to a guess.
+    #[test]
+    fn dialed_local_addr_without_a_bound_address_records_the_socket_source() {
+        let kernel_source: IpAddr = "198.51.100.7".parse().unwrap();
+        assert_eq!(dialed_local_addr(None, || Ok(kernel_source)).unwrap(), kernel_source);
+        assert!(dialed_local_addr(None, || Err(io::Error::other("denied"))).is_err());
     }
 
     /// The sweep runs on every elapsed period, so a flow that goes stale after an earlier sweep is
