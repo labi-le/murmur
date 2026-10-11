@@ -235,7 +235,7 @@ impl<K: Eq + Hash + Clone, V: Default> Inner<K, V> {
 
     #[expect(
         clippy::expect_used,
-        reason = "each branch is guarded by a list-length check that leaves its list non-empty"
+        reason = "the T1 arm is length-guarded; |T1| + |T2| <= c with the guards in `req` holds T2"
     )]
     fn replace(&mut self, index: usize) {
         let ll = self.lists.get(index).ll;
