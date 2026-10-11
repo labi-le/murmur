@@ -49,15 +49,9 @@ fn err_eof() -> io::Error {
     io::Error::new(io::ErrorKind::UnexpectedEof, "EOF")
 }
 
-fn err_no_progress() -> io::Error {
-    io::Error::other("multiple Read calls return no data or error")
-}
-
 pub const DEFAULT_BUF_SIZE: usize = 4096;
 
 const MIN_READ_BUFFER_SIZE: usize = 16;
-
-const MAX_CONSECUTIVE_EMPTY_READS: usize = 100;
 
 /// The buffer state of a buffered reader. The conn holds the reader and reads through the conn
 /// it is given, so the reader carries no reader of its own.
@@ -207,24 +201,19 @@ impl BufioReader {
 pub(crate) async fn fill<R: AsyncRead + Unpin + ?Sized>(reader: &mut BufioReader, rd: &mut R) {
     reader.slide();
     assert!(reader.w < reader.buf.len(), "bufio: tried to fill full buffer");
-    if (0..MAX_CONSECUTIVE_EMPTY_READS).next().is_some() {
-        match rd.read(reader.free_space()).await {
-            // A zero-length read is the end of stream here.
-            Ok(0) => {
-                reader.err = Some(err_eof());
-                return;
-            }
-            Ok(n) => {
-                reader.commit(n);
-                return;
-            }
-            Err(err) => {
-                reader.err = Some(err);
-                return;
-            }
+    match rd.read(reader.free_space()).await {
+        // `AsyncRead` reports the end of stream as a zero-length read, with no separate
+        // no-progress signal to retry against the way the reference's `(0, nil)` has.
+        Ok(0) => {
+            reader.err = Some(err_eof());
+        }
+        Ok(n) => {
+            reader.commit(n);
+        }
+        Err(err) => {
+            reader.err = Some(err);
         }
     }
-    reader.err = Some(err_no_progress());
 }
 
 pub struct BufferedConn {

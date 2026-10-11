@@ -123,7 +123,7 @@ mod tests {
     use async_trait::async_trait;
     use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, ReadBuf};
 
-    use crate::bufconn::{is_bufio_error, new_buffered_conn, BufioError};
+    use crate::bufconn::{fill, is_bufio_error, new_buffered_conn, BufioError, BufioReader};
     use crate::sing::{ExtendedConn, UpstreamNode};
     use murmur_compat::sing_buf::Buffer;
     use murmur_std_compat::net::{Addr, Conn, ExtendedConn as NetExtendedConn, TcpAddr};
@@ -272,6 +272,36 @@ mod tests {
         let (n, err) = conn.discard(5).await;
         assert_eq!(3, n);
         assert_eq!(io::ErrorKind::UnexpectedEof, err.expect_err("the discard is short").kind());
+    }
+
+    /// `fill` reads a zero-length read as the end of stream rather than as the reference's
+    /// retryable `(0, nil)`: exactly one poll, and the error is `UnexpectedEof`.
+    #[tokio::test]
+    async fn fill_reports_eof_for_a_zero_length_read_without_retrying() {
+        struct EmptyThenData {
+            polls: usize,
+        }
+
+        impl AsyncRead for EmptyThenData {
+            fn poll_read(self: Pin<&mut Self>, _cx: &mut Context<'_>, buf: &mut ReadBuf<'_>) -> Poll<io::Result<()>> {
+                let this = self.get_mut();
+                this.polls += 1;
+                if this.polls > 1 {
+                    buf.put_slice(b"hello");
+                }
+                Poll::Ready(Ok(()))
+            }
+        }
+
+        let mut reader = BufioReader::new();
+        let mut rd = EmptyThenData { polls: 0 };
+        fill(&mut reader, &mut rd).await;
+
+        assert_eq!(1, rd.polls, "a zero-length read must end the fill instead of starting a retry budget");
+        assert_eq!(
+            io::ErrorKind::UnexpectedEof,
+            reader.read_err().expect_err("a zero-length read is the end of stream").kind()
+        );
     }
 
     #[tokio::test]
