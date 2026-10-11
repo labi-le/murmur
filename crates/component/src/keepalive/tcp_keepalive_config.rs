@@ -85,11 +85,8 @@ pub fn keep_alive_config() -> KeepAliveConfig {
 }
 
 pub fn tcp_keep_alive<C: TcpConn + ?Sized>(tcp: &C) {
-    let result = if disable_keep_alive() {
-        tcp.set_keep_alive(false)
-    } else {
-        tcp.set_keep_alive_config(keep_alive_config())
-    };
+    let result =
+        if disable_keep_alive() { tcp.set_keep_alive(false) } else { tcp.set_keep_alive_config(keep_alive_config()) };
     if let Err(err) = result {
         warnln!("keep-alive settings were not applied to the connection: {err}");
     }
