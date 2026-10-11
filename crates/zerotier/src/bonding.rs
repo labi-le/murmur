@@ -885,7 +885,7 @@ impl Node {
                         continue;
                     }
                     let mut inherited = self.bond_path_score_of(address, source) - 10;
-                    if !bonding_link_prefers_address(&target_link, target.endpoint.ip()) {
+                    if !bonding_link_prefers_address(target_link, target.endpoint.ip()) {
                         inherited -= 1;
                     }
                     if self.bond_path_score_of(address, target) < inherited {
@@ -908,10 +908,10 @@ impl Node {
         active: PathKey,
         now: SystemTime,
     ) -> bool {
-        let active_primary =
-            bonding_link_for_socket(options, active.local_socket).is_none_or(|link| link.mode == BondingLinkMode::Primary);
-        let best_primary =
-            bonding_link_for_socket(options, best.local_socket).is_none_or(|link| link.mode == BondingLinkMode::Primary);
+        let active_primary = bonding_link_for_socket(options, active.local_socket)
+            .is_none_or(|link| link.mode == BondingLinkMode::Primary);
+        let best_primary = bonding_link_for_socket(options, best.local_socket)
+            .is_none_or(|link| link.mode == BondingLinkMode::Primary);
         match options.link_select_method {
             BondingLinkSelectMethod::Always => !active_primary && best_primary,
             BondingLinkSelectMethod::Better => {
@@ -1392,9 +1392,9 @@ pub fn select_bonded_link_paths(paths: &[PathKey], options: &BondingOptions) -> 
     if paths.is_empty() {
         return Vec::new();
     }
-    let have_primary = paths
-        .iter()
-        .any(|key| bonding_link_for_socket(options, key.local_socket).is_none_or(|link| link.mode == BondingLinkMode::Primary));
+    let have_primary = paths.iter().any(|key| {
+        bonding_link_for_socket(options, key.local_socket).is_none_or(|link| link.mode == BondingLinkMode::Primary)
+    });
     let mut by_link: Vec<(String, Vec<PathKey>)> = Vec::new();
     for key in paths {
         let link = bonding_link_for_socket(options, key.local_socket);

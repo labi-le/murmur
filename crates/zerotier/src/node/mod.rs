@@ -2645,8 +2645,12 @@ mod tests {
     fn config_with_credentials(network_id: u64, member: Address, capability: Option<&Capability>) -> Vec<u8> {
         let mut config = append_test_network_config(network_id, member);
         if let Some(capability) = capability {
-            config = append_dictionary_entry(config, "CAP", &capability.append_binary(Vec::new()).expect("the capability encodes"))
-                .expect("valid dictionary entry");
+            config = append_dictionary_entry(
+                config,
+                "CAP",
+                &capability.append_binary(Vec::new()).expect("the capability encodes"),
+            )
+            .expect("valid dictionary entry");
         }
         config
     }
