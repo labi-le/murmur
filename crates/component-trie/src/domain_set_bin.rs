@@ -102,7 +102,7 @@ mod tests {
     async fn an_empty_set_is_refused_instead_of_written_as_a_stream_the_reader_rejects() {
         let mut stream: Vec<u8> = Vec::new();
 
-        let err = DomainSet::default().write_bin(&mut stream).await.err().expect("empty set");
+        let err = DomainSet::default().write_bin(&mut stream).await.expect_err("empty set");
 
         assert!(stream.is_empty(), "the writer must not emit a partial stream");
         assert!(err.to_string().contains("empty domainSet"), "{err}");
