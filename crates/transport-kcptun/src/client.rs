@@ -10,6 +10,7 @@
 
 use std::fmt;
 use std::future::Future;
+use std::num::NonZeroU16;
 use std::pin::Pin;
 use std::sync::atomic::{AtomicU16, Ordering};
 use std::sync::{Arc, Once, OnceLock};
@@ -146,8 +147,10 @@ impl Client {
     )]
     pub async fn open_stream(&self, ctx: &CancellationToken, dial: &DialFn) -> Result<Box<dyn NetConn>> {
         let numconn = u16::try_from(self.config.conn)
-            .map_err(|_| anyhow::anyhow!("kcptun: conn must be between 1 and 65535, got {}", self.config.conn))?;
-        let slots = usize::from(numconn);
+            .ok()
+            .and_then(NonZeroU16::new)
+            .ok_or_else(|| anyhow::anyhow!("kcptun: conn must be between 1 and 65535, got {}", self.config.conn))?;
+        let slots = usize::from(numconn.get());
         self.once.call_once(|| {
             let (tx, rx) = mpsc::channel(128);
             if self.config.auto_expire > 0 {
@@ -285,14 +288,18 @@ mod tests {
         }
     }
 
+    /// `conn: 0` is the omitted-key default, which `fill_defaults` rewrites to 1 before the divisor
+    /// is chosen, so it dials; the divisor itself is a `NonZeroU16`, so no `conn` can divide by 0.
     #[tokio::test]
     async fn open_stream_dials_when_conn_is_within_the_u16_range() {
-        let config = Config { conn: 2, ..Config::default() };
-        let client = Client::new(config);
-        let ctx = CancellationToken::new();
+        for conn in [0, 2] {
+            let config = Config { conn, ..Config::default() };
+            let client = Client::new(config);
+            let ctx = CancellationToken::new();
 
-        let err = client.open_stream(&ctx, &unreachable_dial()).await.err().expect("the stubbed dial fails");
+            let err = client.open_stream(&ctx, &unreachable_dial()).await.err().expect("the stubbed dial fails");
 
-        assert!(err.to_string().contains("the test dial must not be reached"), "{err}");
+            assert!(err.to_string().contains("the test dial must not be reached"), "conn {conn}: {err}");
+        }
     }
 }
