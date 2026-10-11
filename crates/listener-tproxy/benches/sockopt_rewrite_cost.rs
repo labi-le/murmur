@@ -68,7 +68,8 @@ fn reuseaddr_over_borrowed_socket() {
 /// The transparent pair, set on the socket value the dial path holds before it binds. The kernel
 /// refuses these without CAP_NET_ADMIN, which an unprivileged bench host lacks; the failed call
 /// still costs the syscall, which is what this measures, so the denial is recorded rather than
-/// treated as a failure.
+/// treated as a failure. socket2 only names the pair on Linux.
+#[cfg(target_os = "linux")]
 fn transparent_on_owned_socket() {
     let socket = datagram_socket();
     let v4 = socket.set_ip_transparent_v4(true);
@@ -103,13 +104,15 @@ fn socket_open_only() {
 }
 
 fn cases() -> Vec<(&'static str, fn())> {
-    vec![
+    let mut cases: Vec<(&'static str, fn())> = vec![
         ("socket_open_only", socket_open_only),
         ("reuseaddr_over_borrowed_socket", reuseaddr_over_borrowed_socket),
-        ("transparent_on_owned_socket", transparent_on_owned_socket),
-        ("ttl_and_tos_on_owned_socket", ttl_and_tos_on_owned_socket),
-        ("nonblocking_on_owned_socket", nonblocking_on_owned_socket),
-    ]
+    ];
+    #[cfg(target_os = "linux")]
+    cases.push(("transparent_on_owned_socket", transparent_on_owned_socket));
+    cases.push(("ttl_and_tos_on_owned_socket", ttl_and_tos_on_owned_socket));
+    cases.push(("nonblocking_on_owned_socket", nonblocking_on_owned_socket));
+    cases
 }
 
 fn run_case(name: &str, f: fn()) -> f64 {
