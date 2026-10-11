@@ -66,7 +66,7 @@ impl Default for StdDialer {
             control: None,
             control_context: None,
             keep_alive: 0,
-            keep_alive_config: KeepAliveConfig { enable: false, idle: 0, interval: 0, count: 0 },
+            keep_alive_config: KeepAliveConfig { enable: false, idle: 0, interval: 0 },
             multipath_tcp: false,
         }
     }
@@ -118,7 +118,7 @@ impl Default for StdListenConfig {
             control: None,
             disable_tfo: true,
             keep_alive: 0,
-            keep_alive_config: KeepAliveConfig { enable: false, idle: 0, interval: 0, count: 0 },
+            keep_alive_config: KeepAliveConfig { enable: false, idle: 0, interval: 0 },
             multipath_tcp: false,
         }
     }

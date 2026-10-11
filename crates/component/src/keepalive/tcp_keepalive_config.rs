@@ -8,18 +8,14 @@ use murmur_log::warnln;
 use murmur_std_compat::net::Conn;
 
 use super::tcp_keepalive::{disable_keep_alive, keep_alive_idle, keep_alive_interval};
-#[cfg(unix)]
-use super::tcp_keepalive_config_unix::support_tcp_keep_alive_count;
-#[cfg(target_os = "windows")]
-use super::tcp_keepalive_config_windows::support_tcp_keep_alive_count;
 
 /// The keep-alive settings; the durations are this project's signed nanosecond `TimeDuration`.
+/// A non-positive `idle`/`interval` means "not configured": the OS default stays in force.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct KeepAliveConfig {
     pub enable: bool,
     pub idle: TimeDuration,
     pub interval: TimeDuration,
-    pub count: i32,
 }
 
 /// A conn that carries keep-alive settings.
@@ -46,8 +42,9 @@ pub fn set_socket_keep_alive(socket: &SockRef<'_>, config: KeepAliveConfig) -> i
     if !config.enable {
         return Ok(());
     }
+
     let mut keepalive = TcpKeepalive::new();
-    if config.idle >= 0 {
+    if config.idle > 0 {
         keepalive = keepalive.with_time(duration_from_nanos(config.idle));
     }
     #[cfg(any(
@@ -65,7 +62,7 @@ pub fn set_socket_keep_alive(socket: &SockRef<'_>, config: KeepAliveConfig) -> i
         target_os = "windows",
         target_os = "cygwin",
     ))]
-    if config.interval >= 0 {
+    if config.interval > 0 {
         keepalive = keepalive.with_interval(duration_from_nanos(config.interval));
     }
     socket.set_tcp_keepalive(&keepalive)
@@ -84,21 +81,17 @@ pub fn tcp_keep_alive_stream(stream: &dyn Stream, config: KeepAliveConfig) {
 
 #[must_use]
 pub fn keep_alive_config() -> KeepAliveConfig {
-    let mut config =
-        KeepAliveConfig { enable: true, idle: keep_alive_idle(), interval: keep_alive_interval(), count: 0 };
-    if !support_tcp_keep_alive_count() {
-        // it's recommended to set both Idle and Interval to non-negative values in conjunction with a -1
-        // for Count on those old Windows if you intend to customize the TCP keep-alive settings.
-        config.count = -1;
-    }
-    config
+    KeepAliveConfig { enable: true, idle: keep_alive_idle(), interval: keep_alive_interval() }
 }
 
 pub fn tcp_keep_alive<C: TcpConn + ?Sized>(tcp: &C) {
-    if disable_keep_alive() {
-        let _ = tcp.set_keep_alive(false);
+    let result = if disable_keep_alive() {
+        tcp.set_keep_alive(false)
     } else {
-        let _ = tcp.set_keep_alive_config(keep_alive_config());
+        tcp.set_keep_alive_config(keep_alive_config())
+    };
+    if let Err(err) = result {
+        warnln!("keep-alive settings were not applied to the connection: {err}");
     }
 }
 
@@ -129,5 +122,92 @@ pub fn set_net_listen_config<L: KeepAliveFields + ?Sized>(lc: &mut L) {
         lc.keep_alive_config_mut().enable = false;
     } else {
         lc.set_keep_alive_config(keep_alive_config());
+    }
+}
+
+#[cfg(all(test, any(target_os = "linux", target_os = "android")))]
+mod keep_alive_socket_tests {
+    use std::os::fd::AsRawFd;
+
+    use socket2::{Domain, Protocol, SockRef, Socket, Type};
+
+    use super::{set_socket_keep_alive, KeepAliveConfig};
+
+    const SECOND: i64 = 1_000_000_000;
+
+    /// The configuration a keep-alive-enabled dialer and listener carry by default (unset idle and
+    /// interval) must not become a request the kernel refuses: a zero idle used to go to
+    /// `TCP_KEEPIDLE`, Linux answered `EINVAL`, and the call's result was discarded.
+    #[test]
+    fn the_default_configuration_is_accepted() {
+        let socket = socket();
+        let config = KeepAliveConfig { enable: true, idle: 0, interval: 0 };
+        let result = set_socket_keep_alive(&SockRef::from(&socket), config);
+        assert!(result.is_ok(), "the default configuration must be accepted: {:?}", result.unwrap_err());
+        assert!(socket.keepalive().unwrap());
+    }
+
+    #[expect(
+        unsafe_code,
+        reason = "`getsockopt` is a raw FFI call; the SAFETY comment below states the descriptor and pointer invariants"
+    )]
+    fn keep_alive_int(fd: libc::c_int, option: libc::c_int) -> libc::c_int {
+        let mut actual: libc::c_int = -1;
+        let mut length = size_of::<libc::c_int>() as libc::socklen_t;
+        // SAFETY: the caller keeps `fd` open and both output pointers are valid.
+        let result = unsafe {
+            libc::getsockopt(fd, libc::IPPROTO_TCP, option, std::ptr::addr_of_mut!(actual).cast(), &raw mut length)
+        };
+        assert_eq!(result, 0, "getsockopt({option}): {}", std::io::Error::last_os_error());
+        actual
+    }
+
+    fn socket() -> Socket {
+        Socket::new(Domain::IPV4, Type::STREAM, Some(Protocol::TCP)).unwrap()
+    }
+
+    #[test]
+    fn a_configured_idle_and_interval_reach_the_socket() {
+        let socket = socket();
+        let config = KeepAliveConfig { enable: true, idle: 30 * SECOND, interval: 5 * SECOND };
+        set_socket_keep_alive(&SockRef::from(&socket), config).unwrap();
+
+        assert!(socket.keepalive().unwrap());
+        let fd = socket.as_raw_fd();
+        assert_eq!(keep_alive_int(fd, libc::TCP_KEEPIDLE), 30);
+        assert_eq!(keep_alive_int(fd, libc::TCP_KEEPINTVL), 5);
+    }
+
+    /// A zero idle means "not configured": passing it on makes the kernel reject the whole call
+    /// with `EINVAL`, which also drops the interval requested in the same call.
+    #[test]
+    fn an_unset_idle_leaves_the_os_default_and_still_applies_the_interval() {
+        let socket = socket();
+        let config = KeepAliveConfig { enable: true, idle: 0, interval: 5 * SECOND };
+        set_socket_keep_alive(&SockRef::from(&socket), config).unwrap();
+
+        assert!(socket.keepalive().unwrap());
+        assert_eq!(keep_alive_int(socket.as_raw_fd(), libc::TCP_KEEPINTVL), 5);
+    }
+
+    #[test]
+    fn a_disabled_config_turns_keep_alive_off() {
+        let socket = socket();
+        socket.set_keepalive(true).unwrap();
+        set_socket_keep_alive(&SockRef::from(&socket), KeepAliveConfig { enable: false, idle: 30, interval: 5 })
+            .unwrap();
+
+        assert!(!socket.keepalive().unwrap());
+    }
+
+    /// Linux rejects a `TCP_KEEPIDLE` above 32767; the refusal must come back as an error for the
+    /// caller to report instead of being discarded.
+    #[test]
+    fn a_refused_idle_surfaces_as_an_error() {
+        let socket = socket();
+        let config = KeepAliveConfig { enable: true, idle: 40_000 * SECOND, interval: 0 };
+
+        let err = set_socket_keep_alive(&SockRef::from(&socket), config).unwrap_err();
+        assert_eq!(err.raw_os_error(), Some(libc::EINVAL), "{err}");
     }
 }
