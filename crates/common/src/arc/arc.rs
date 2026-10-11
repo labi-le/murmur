@@ -378,10 +378,7 @@ mod tests {
                 }
 
                 let len = cache.len();
-                assert!(
-                    (0..=CAPACITY).contains(&len),
-                    "seed {seed} step {step}: len()={len} leaves 0..={CAPACITY}"
-                );
+                assert!((0..=CAPACITY).contains(&len), "seed {seed} step {step}: len()={len} leaves 0..={CAPACITY}");
                 assert_eq!(cache.is_empty(), len == 0, "seed {seed} step {step}: is_empty disagrees with len");
             }
         }
