@@ -117,6 +117,8 @@ async fn get_group_delay(req: &Req, proxy: &Arc<dyn CProxy>) -> Response<RespBod
     let Some(timeout_str) = query_param(query, "timeout") else {
         return json_response(StatusCode::BAD_REQUEST, &err_bad_request());
     };
+    // The same millisecond value and the same width `proxies.rs` parses this parameter with, so
+    // one timeout works on both delay routes.
     let Ok(timeout_ms) = timeout_str.parse::<i32>() else {
         return json_response(StatusCode::BAD_REQUEST, &err_bad_request());
     };
@@ -370,5 +372,21 @@ mod tests {
             assert_eq!(status, StatusCode::NOT_FOUND, "{method} leftover path");
             assert_eq!(body, PLAIN_NOT_FOUND, "{method} leftover path");
         }
+    }
+
+    /// The group route accepts a millisecond timeout past the `i16` range, which is the width
+    /// `/proxies/{name}/delay` and a provider's `/healthcheck` now read the same value with.
+    #[tokio::test]
+    async fn group_delay_endpoint_accepts_a_timeout_above_the_i16_range() {
+        let proxies = vec![("PROXY".to_owned(), selector_wrapper())];
+
+        let target = "/group/PROXY/delay?url=http://127.0.0.1:1/&timeout=60000&expected=";
+        let (status, body) = request("GET", target, &["PROXY", "delay"], proxies).await;
+        assert_eq!(
+            status,
+            StatusCode::GATEWAY_TIMEOUT,
+            "the probe ran and failed on a closed port; body {}",
+            String::from_utf8_lossy(&body)
+        );
     }
 }

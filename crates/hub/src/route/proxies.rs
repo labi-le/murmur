@@ -147,7 +147,9 @@ pub(crate) async fn get_proxy_delay_for(
     let Some(timeout_str) = query_param(query, "timeout") else {
         return json_response(StatusCode::BAD_REQUEST, &err_bad_request());
     };
-    let Ok(timeout_ms) = timeout_str.parse::<i16>() else {
+    // The parameter is a millisecond timeout, and `groups.rs` parses this same value as an `i32`;
+    // an `i16` capped this route (and the provider healthcheck that delegates to it) at 32.767 s.
+    let Ok(timeout_ms) = timeout_str.parse::<i32>() else {
         return json_response(StatusCode::BAD_REQUEST, &err_bad_request());
     };
 
@@ -510,6 +512,23 @@ mod tests {
         let (status, body) = request("GET", target, &["DIRECT", "delay"], proxies).await;
         assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
         assert_eq!(body, b"{\"message\":\"An error occurred in the delay test\"}\n".to_vec());
+    }
+
+    /// The timeout is milliseconds, so a value above the `i16` range must reach the probe like it
+    /// does on `/group/{name}/delay`; this route used to answer 400 for anything past 32.767 s.
+    #[tokio::test]
+    async fn delay_endpoint_accepts_a_timeout_above_the_i16_range() {
+        let direct: Arc<dyn CProxy> = ConcreteProxy::new(new_direct());
+        let proxies = vec![("DIRECT".to_owned(), direct)];
+
+        let target = "/proxies/DIRECT/delay?url=http://127.0.0.1:1/&timeout=60000&expected=";
+        let (status, body) = request("GET", target, &["DIRECT", "delay"], proxies).await;
+        assert_eq!(
+            status,
+            StatusCode::SERVICE_UNAVAILABLE,
+            "the probe ran and failed on a closed port; body {}",
+            String::from_utf8_lossy(&body)
+        );
     }
 
     /// The URL query parameter is percent-decoded, and a dashboard encodes the value it sends: the
