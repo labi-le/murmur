@@ -490,7 +490,7 @@ fn sysctl_backlog(name: &str) -> i32 {
         return 128;
     };
     let mut value: u32 = 0;
-    let mut length = std::mem::size_of::<u32>();
+    let mut length = size_of::<u32>();
     // SAFETY: `value` is sized for a `u32` and `length` reports that size, so the kernel writes
     // at most `size_of::<u32>()` bytes into it.
     let ret = unsafe {
@@ -515,7 +515,7 @@ fn sysctl_backlog(name: &str) -> i32 {
 fn sysctl_kern_somaxconn() -> i32 {
     let mib = [libc::CTL_KERN, libc::KERN_SOMAXCONN];
     let mut value: u32 = 0;
-    let mut length = std::mem::size_of::<u32>();
+    let mut length = size_of::<u32>();
     // SAFETY: `value` is sized for a `u32` and `length` reports that size, so the kernel writes
     // at most `size_of::<u32>()` bytes into it.
     let ret = unsafe {
