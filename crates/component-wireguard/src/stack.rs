@@ -686,13 +686,20 @@ impl Entry {
     /// the driver, which delivers it then.
     fn queue_closed(&mut self) {
         self.pending = Some(Event::Closed);
-        self.deliver_pending();
     }
 
-    fn deliver_pending(&mut self) {
+    /// Hand the queued event to the reader's queue, unless it is the close and the socket still
+    /// holds bytes the driver has not taken out of it. The drain stops at a full queue and leaves
+    /// those bytes behind, and the reader can free a queue slot between that drain and this call,
+    /// so handing the close over first would put EOF ahead of the stream and truncate it.
+    fn deliver_pending(&mut self, socket_drained: bool) {
         let Some(event) = self.pending.take() else {
             return;
         };
+        if !socket_drained && matches!(event, Event::Closed) {
+            self.pending = Some(event);
+            return;
+        }
         match self.events.try_send(event) {
             Ok(()) => self.signal.wake(),
             Err(mpsc::error::TrySendError::Full(event)) => self.pending = Some(event),
@@ -1039,7 +1046,8 @@ impl<D: phy::Device> Driver<D> {
         // After the data, so a reader that sees the close has already been handed everything the
         // socket held.
         for entry in entries.values_mut() {
-            entry.deliver_pending();
+            let socket_drained = !entry.is_tcp || sockets.get::<tcp::Socket>(entry.handle).recv_queue() == 0;
+            entry.deliver_pending(socket_drained);
         }
     }
 
@@ -1106,6 +1114,10 @@ impl<D: phy::Device> Driver<D> {
                     if closed {
                         entry.established = false;
                         entry.queue_closed();
+                        // The bytes this close follows may still sit in the socket: the drain above
+                        // stops at a full queue, and the reader can free a slot at any moment, so
+                        // the close is handed over only once the socket has given them all up.
+                        entry.deliver_pending(tcp.recv_queue() == 0);
                     }
                 }
                 continue;
@@ -1526,4 +1538,105 @@ fn bind(socket: &mut udp::Socket, requested: IpListenEndpoint) -> Result<IpListe
         }
     }
     Err(anyhow!("{last:?}"))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// How many bytes the socket still holds once the driver has run out of queue.
+    const LEFTOVER: usize = 8;
+
+    /// The socket bytes the driver copies out of `smoltcp` are the ones at risk: a socket whose
+    /// receive buffer is filled before it is handed to the driver reports them through
+    /// `recv_queue` without any packet ever crossing a wire.
+    fn socket_holding(bytes: usize) -> tcp::Socket<'static> {
+        let mut rx = tcp::SocketBuffer::new(vec![0u8; 64]);
+        assert_eq!(rx.enqueue_slice(&vec![7u8; bytes]), bytes, "the socket starts holding {bytes} bytes");
+        tcp::Socket::new(rx, tcp::SocketBuffer::new(vec![0u8; 64]))
+    }
+
+    fn entry(handle: SocketHandle, events: mpsc::Sender<Event>) -> Entry {
+        let (action_tx, actions) = mpsc::unbounded_channel();
+        let _ = action_tx;
+        Entry {
+            handle,
+            is_tcp: true,
+            events,
+            signal: Arc::new(Signal::default()),
+            actions,
+            outbox: VecDeque::new(),
+            datagrams: VecDeque::new(),
+            queued: Arc::new(std::sync::atomic::AtomicU64::new(0)),
+            local: Arc::new(Mutex::new(SocketAddr::new(IpAddr::V4(Ipv4Addr::UNSPECIFIED), 0))),
+            closing: false,
+            pending: None,
+            connect: None,
+            established: true,
+        }
+    }
+
+    /// A driver over the two structures `drain_events` and `resolve_connects` read, the socket set
+    /// and the entries. The interface is never polled, so an idle loopback device is enough.
+    fn driver(handle: SocketHandle, sockets: SocketSet<'static>, events: mpsc::Sender<Event>) -> Driver<phy::Loopback> {
+        let mut device = phy::Loopback::new(Medium::Ip);
+        let iface = Interface::new(IfaceConfig::new(HardwareAddress::Ip), &mut device, now());
+        let (_commands, commands) = mpsc::unbounded_channel();
+        let (accepts, _accepted) = mpsc::unbounded_channel();
+        let mut entries = HashMap::new();
+        entries.insert(1_u64, entry(handle, events));
+        Driver {
+            iface,
+            device,
+            sockets,
+            entries,
+            armed: Vec::new(),
+            accepts,
+            next_id: 2,
+            mtu: usize::from(DEFAULT_MTU),
+            commands,
+            closed: CancellationToken::new(),
+            events: Events::default(),
+        }
+    }
+
+    /// `drain_events` stops before taking anything out of a socket whose queue is full, leaving
+    /// the socket's bytes where `smoltcp` holds them; the close that follows has to wait for them
+    /// even when the reader frees a queue slot in between. This replays that interleaving with the
+    /// test standing in for the concurrent reader: without the gate, the close takes the freed
+    /// slot and the bytes that follow it are behind EOF, which `read_to_end` reports as a
+    /// truncated stream.
+    #[test]
+    fn a_close_waits_for_the_bytes_a_full_queue_left_in_the_socket() {
+        let mut sockets = SocketSet::new(Vec::new());
+        let handle = sockets.add(socket_holding(LEFTOVER));
+
+        // A queue the reader has not caught up with: one slot, taken.
+        let (events, mut queue) = mpsc::channel(1);
+        events.try_send(Event::Data(vec![0])).expect("an empty queue takes one event");
+        assert_eq!(events.capacity(), 0, "the queue starts full");
+
+        let mut driver = driver(handle, sockets, events);
+
+        // The drain stops at the full queue, leaving the socket's bytes where they are.
+        driver.drain_events();
+        // The reader frees a slot between that drain and the close the driver is about to queue.
+        assert!(matches!(queue.try_recv(), Ok(Event::Data(_))));
+        driver.resolve_connects();
+
+        // The close must not have overtaken the bytes still in the socket.
+        assert!(
+            matches!(queue.try_recv(), Err(mpsc::error::TryRecvError::Empty)),
+            "the close was queued before the bytes the socket still held"
+        );
+
+        // Once the socket has surrendered its bytes the close follows them.
+        driver.drain_events();
+        assert!(
+            matches!(queue.try_recv(), Ok(Event::Data(data)) if data.len() == LEFTOVER),
+            "the socket's bytes must be queued before the close"
+        );
+        driver.drain_events();
+        assert!(matches!(queue.try_recv(), Ok(Event::Closed)), "the close must follow the bytes the socket held");
+    }
 }
