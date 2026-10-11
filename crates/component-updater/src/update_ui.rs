@@ -9,6 +9,7 @@
 
 use std::io::Read as _;
 use std::path::Path;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 
 use anyhow::{anyhow, Result};
@@ -135,8 +136,19 @@ impl UIUpdater {
     }
 }
 
+/// Distinguishes the extraction trees of two installs in the same process.
+static UI_INSTALL_SEQ: AtomicU64 = AtomicU64::new(0);
+
+/// The extraction target of one install. Cancelling a `download_ui` releases its mutex while the
+/// install keeps running on the blocking pool, so a second install must not be able to name — and
+/// therefore delete — the first one's tree.
+fn install_tmp_dir() -> String {
+    let seq = UI_INSTALL_SEQ.fetch_add(1, Ordering::SeqCst);
+    PATH.resolve(&format!("downloadUI.tmp.{}.{seq}", std::process::id()))
+}
+
 fn install_ui(data: &[u8], ui_path: &str) -> Result<()> {
-    let tmp_dir = PATH.resolve("downloadUI.tmp");
+    let tmp_dir = install_tmp_dir();
     let _ = std::fs::remove_dir_all(&tmp_dir);
 
     debugln!("extractedFolder: {tmp_dir}");
@@ -398,8 +410,9 @@ fn write_file_mode(path: &Path, data: &[u8], mode: u32) -> std::io::Result<()> {
 #[cfg(test)]
 mod tests {
     use std::io::{Read as _, Write as _};
+    use std::sync::{Arc, Barrier, Mutex};
 
-    use super::{install_ui_updater, new_ui_updater, ui_updater, untgz, unzip};
+    use super::{install_tmp_dir, install_ui, install_ui_updater, new_ui_updater, ui_updater, untgz, unzip};
     use murmur_constant::path::PATH;
 
     fn build_zip(entries: &[(&str, &[u8])]) -> Vec<u8> {
@@ -487,7 +500,7 @@ mod tests {
         assert_eq!(installed.external_ui_url, "https://example.com/ui.zip");
 
         let current = ui_updater();
-        assert!(std::sync::Arc::ptr_eq(&current, &installed));
+        assert!(Arc::ptr_eq(&current, &installed));
         assert_eq!(current.external_ui_url, "https://example.com/ui.zip");
     }
 
@@ -585,5 +598,80 @@ mod tests {
         assert!(!dest.join("index.html").exists(), "a rejected entry must not be written");
 
         let _ = std::fs::remove_dir_all(&dest);
+    }
+
+    /// A cancelled `download_ui` releases its mutex while the install still runs on the blocking
+    /// pool, so two installs really can be in flight at once and must not name the same tree.
+    #[test]
+    fn concurrent_ui_installs_never_share_a_temporary_directory() {
+        const CALLERS: usize = 8;
+
+        let barrier = Arc::new(Barrier::new(CALLERS));
+        let seen = Arc::new(Mutex::new(Vec::new()));
+        let callers: Vec<_> = (0..CALLERS)
+            .map(|_| {
+                let barrier = Arc::clone(&barrier);
+                let seen = Arc::clone(&seen);
+                std::thread::spawn(move || {
+                    barrier.wait();
+                    seen.lock().expect("lock").push(install_tmp_dir());
+                })
+            })
+            .collect();
+        for caller in callers {
+            caller.join().expect("join");
+        }
+
+        let seen = seen.lock().expect("lock");
+        let unique: std::collections::HashSet<&String> = seen.iter().collect();
+        assert_eq!(CALLERS, unique.len(), "installs share a temporary directory: {seen:?}");
+    }
+
+    /// The second install's first act is to delete the tree it is about to extract into; before
+    /// the fix both installs named `downloadUI.tmp`, so it deleted the first install's tree
+    /// mid-extraction and the first install failed instead of completing.
+    #[test]
+    fn a_concurrent_ui_install_does_not_destroy_an_in_flight_install() {
+        const PAYLOAD: usize = 32 * 1024 * 1024;
+
+        let marker = format!("murmur-ui-marker-{}.html", std::process::id());
+        // The install moves its tree out of the temporary directory with a rename, so the live
+        // directory has to sit beside it rather than under the system temporary directory.
+        let ui_path = std::path::PathBuf::from(PATH.resolve(&format!("murmur-ui-race-{}", std::process::id())));
+        let _ = std::fs::remove_dir_all(&ui_path);
+        std::fs::create_dir_all(&ui_path).expect("create ui dir");
+
+        let slow = build_zip(&[(marker.as_str(), b"slow"), ("index.html", &vec![0u8; PAYLOAD])]);
+        let fast = build_zip(&[("index.html", b"fast"), ("app.js", b"fast")]);
+
+        let slow_path = ui_path.to_string_lossy().into_owned();
+        let slow_install = std::thread::spawn(move || install_ui(&slow, &slow_path));
+
+        let root = PATH.home_dir();
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(60);
+        let mut in_flight = None;
+        while in_flight.is_none() && std::time::Instant::now() < deadline {
+            in_flight = std::fs::read_dir(&root).ok().and_then(|entries| {
+                entries
+                    .flatten()
+                    .find(|entry| {
+                        entry.file_name().to_string_lossy().starts_with("downloadUI.tmp")
+                            && entry.path().join(&marker).exists()
+                    })
+                    .map(|entry| entry.path())
+            });
+            std::thread::sleep(std::time::Duration::from_millis(1));
+        }
+        assert!(in_flight.is_some(), "the in-flight install must have its own temporary tree");
+
+        let fast_path = ui_path.to_string_lossy().into_owned();
+        install_ui(&fast, &fast_path).expect("the second install runs");
+
+        slow_install.join().expect("join").expect("the in-flight install still completes");
+
+        let index = std::fs::read(ui_path.join("index.html")).expect("live index.html");
+        assert!(index.len() == 4 || index.len() == PAYLOAD, "the live tree is {} bytes", index.len());
+
+        let _ = std::fs::remove_dir_all(&ui_path);
     }
 }
