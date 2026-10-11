@@ -41,6 +41,10 @@ const WRITE_QUEUE_CAPACITY: usize = 8;
 /// Channel depth of the server-side accept queue.
 const ACCEPT_QUEUE_CAPACITY: usize = 256;
 
+/// Caps the live stream table: the demux loop never waits on the accept queue, so without a
+/// cardinality bound one `FRAME_OPEN` per peer frame adds an entry, a stream and a blocked task.
+const MAX_STREAMS: usize = 1024;
+
 fn err_mux_receive_queue_full() -> anyhow::Error {
     anyhow!("mux receive queue full")
 }
@@ -497,6 +501,11 @@ impl Session {
                 }
                 if session.get_stream(stream_id).is_some() {
                     session.send_reset(stream_id, "stream already exists").await;
+                    return true;
+                }
+                let live_streams = session.streams.lock().streams.len();
+                if live_streams >= MAX_STREAMS {
+                    session.send_reset(stream_id, "too many streams").await;
                     return true;
                 }
                 let st = Stream::new(session, stream_id);
@@ -1024,6 +1033,47 @@ mod tests {
         fast_write.await.expect("write fast stream").expect("write fast stream");
 
         client_session.close();
+        server_session.close();
+    }
+
+    #[tokio::test]
+    async fn open_frames_past_the_stream_cap_are_reset_and_leave_the_table_bounded() {
+        let (mut peer_conn, server_conn) = pipe_pair();
+        let server_session = Session::server(server_conn);
+
+        let opens = MAX_STREAMS as u32 + 8;
+        for stream_id in 1..=opens {
+            assert!(
+                Session::handle_frame(&server_session, FRAME_OPEN, stream_id, vec![0u8; 8]).await,
+                "an open past the cap must not stop the session"
+            );
+        }
+
+        assert_eq!(
+            server_session.streams.lock().streams.len(),
+            MAX_STREAMS,
+            "live streams after {opens} opens with a cap of {MAX_STREAMS}"
+        );
+
+        let rejected = opens as usize - MAX_STREAMS;
+        let mut resets = 0usize;
+        while resets < rejected {
+            let mut header = [0u8; HEADER_SIZE];
+            tokio::time::timeout(Duration::from_secs(1), peer_conn.read_exact(&mut header))
+                .await
+                .expect("reset frame header")
+                .expect("read reset frame header");
+            let len = u32::from_be_bytes([header[5], header[6], header[7], header[8]]) as usize;
+            let mut payload = vec![0u8; len];
+            if len > 0 {
+                peer_conn.read_exact(&mut payload).await.expect("read reset payload");
+            }
+            if header[0] == FRAME_RESET {
+                resets += 1;
+                assert_eq!(payload, b"too many streams".to_vec(), "reset reason");
+            }
+        }
+
         server_session.close();
     }
 
