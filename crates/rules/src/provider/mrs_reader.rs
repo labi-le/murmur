@@ -69,15 +69,19 @@ mod tests {
 
     /// `MRSv1 | behavior | count | extra_len | extra | body`; `extra_len` may disagree with `extra`,
     /// which is how a malformed payload declares a field it does not carry.
-    fn mrs_payload(count: i64, extra_len: i64, extra: &[u8]) -> Vec<u8> {
+    fn mrs_payload_with_body(count: i64, extra_len: i64, extra: &[u8], body: &[u8]) -> Vec<u8> {
         let mut raw: Vec<u8> = Vec::new();
         raw.extend_from_slice(&MRS_MAGIC_BYTES);
         raw.push(RuleBehavior::IPCIDR.byte());
         raw.extend_from_slice(&count.to_be_bytes());
         raw.extend_from_slice(&extra_len.to_be_bytes());
         raw.extend_from_slice(extra);
-        raw.extend_from_slice(&ipcidr_body());
+        raw.extend_from_slice(body);
         zstd::encode_all(raw.as_slice(), 0).expect("zstd encode")
+    }
+
+    fn mrs_payload(count: i64, extra_len: i64, extra: &[u8]) -> Vec<u8> {
+        mrs_payload_with_body(count, extra_len, extra, &ipcidr_body())
     }
 
     fn parse(payload: &[u8]) -> Result<Box<dyn RuleStrategy>> {
@@ -117,5 +121,16 @@ mod tests {
         let err = parse(&payload).err().expect("rule count past the i32 range");
 
         assert!(err.to_string().contains("count is invalid"), "{err}");
+    }
+
+    #[test]
+    fn a_payload_whose_rule_set_declares_no_range_is_rejected() {
+        let mut body: Vec<u8> = Vec::new();
+        body.push(1);
+        body.extend_from_slice(&0i64.to_be_bytes());
+
+        let err = parse(&mrs_payload_with_body(1, 0, &[], &body)).err().expect("empty range set");
+
+        assert!(err.to_string().contains("length is invalid"), "{err}");
     }
 }
