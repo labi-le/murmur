@@ -638,11 +638,9 @@ impl ZeroTier {
     async fn start_runtime(&self) -> Result<()> {
         // NOT cancel-safe: the runtime thread it spawns is only reachable through the handle stored
         // on success, so a drop leaves that thread running with no way to cancel it.
-        // The state directory is created owner-only (0700); `FileStore` creates object directories
-        // itself.
-        tokio::fs::create_dir_all(&self.state_dir)
-            .await
-            .map_err(|err| anyhow!("create ZeroTier state directory {}: {err}", self.state_dir))?;
+        // The state directory holds the node identity and membership data, so it is created
+        // owner-only as the reference does.
+        create_state_dir(&self.state_dir).await?;
         let shared = Arc::clone(&self.shared);
         let runtime_shared = Arc::new(RuntimeShared::new(self.base.name()));
         let host = ZeroTierHost { shared: Arc::clone(&runtime_shared) };
@@ -1701,6 +1699,31 @@ fn validate_tcp_fallback_relay(relay: &str) -> Result<()> {
     Ok(())
 }
 
+/// Creates the state directory owner-only (0700), as the reference's `os.MkdirAll(z.option.StateDir,
+/// 0700)` does. `DirBuilder`'s mode reaches only the directories it creates, so an existing one is
+/// tightened after the fact.
+async fn create_state_dir(state_dir: &str) -> Result<()> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+
+        let mut builder = tokio::fs::DirBuilder::new();
+        builder.recursive(true).mode(0o700);
+        builder
+            .create(state_dir)
+            .await
+            .map_err(|err| anyhow!("create ZeroTier state directory {state_dir}: {err}"))?;
+        tokio::fs::set_permissions(state_dir, std::fs::Permissions::from_mode(0o700))
+            .await
+            .map_err(|err| anyhow!("set ZeroTier state directory {state_dir} to 0700: {err}"))?;
+    }
+    #[cfg(not(unix))]
+    tokio::fs::create_dir_all(state_dir)
+        .await
+        .map_err(|err| anyhow!("create ZeroTier state directory {state_dir}: {err}"))?;
+    Ok(())
+}
+
 /// Warns about the options the engine's wire cannot carry, as the other L3 outbounds do.
 fn warn_about_wire_options(option: &ZeroTierOption) {
     let name = &option.name;
@@ -2091,6 +2114,30 @@ mod tests {
 
         outbound.close().expect("close");
         let _ = std::fs::remove_dir_all(PATH.resolve(&state_dir));
+    }
+
+    /// The state directory holds the node's identity and membership data.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn the_state_directory_is_owner_only() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let state_dir = format!("zerotier-test-mode-{}", std::process::id());
+        let resolved = PathBuf::from(PATH.resolve(&state_dir));
+        let _ = std::fs::remove_dir_all(&resolved);
+        // Starting from a world-readable directory keeps the assertion independent of the umask.
+        std::fs::create_dir_all(&resolved).expect("create the state directory");
+        std::fs::set_permissions(&resolved, std::fs::Permissions::from_mode(0o777)).expect("widen the mode");
+
+        let outbound = ad_hoc_outbound("zt-mode", &state_dir);
+        let ctx = CancellationToken::new();
+        outbound.ensure_started(&ctx).await.expect("the ad-hoc configuration applies");
+
+        let mode = std::fs::metadata(&resolved).expect("state directory metadata").permissions().mode() & 0o777;
+        assert_eq!(mode, 0o700, "the state directory is owner-only");
+
+        outbound.close().expect("close");
+        let _ = std::fs::remove_dir_all(&resolved);
     }
 
     /// Only a host that is not already an address is resolved.
