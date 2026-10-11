@@ -28,9 +28,9 @@ use murmur_std_compat::net::Conn;
 
 const H2_DATAGRAM_CAPSULE_TYPE: u64 = 0;
 
-/// The largest DATAGRAM capsule payload accepted: the capsules carry proxied IP packets, and 64 KiB
-/// is the largest IP datagram one can hold. The length comes from the peer, so it is checked before
-/// anything is allocated for it.
+/// The largest DATAGRAM capsule payload accepted: 64 KiB, the largest IP datagram one can carry.
+///
+/// The length comes from the peer, so it is checked before anything is allocated for it.
 const MAX_DATAGRAM_CAPSULE_LEN: u64 = 64 * 1024;
 
 /// Bytes skipped at a time when dropping a capsule this client does not act on.

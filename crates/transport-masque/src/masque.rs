@@ -2374,9 +2374,10 @@ pub mod h3 {
         valid_header_field_name(value)
     }
 
-    /// The receive half of a request stream's datagrams. It owns the connection's routing entry for
-    /// the stream, so dropping it removes that entry and the table stays bounded by the streams
-    /// that are still alive.
+    /// The receive half of a request stream's datagrams, owning the connection's routing entry.
+    ///
+    /// Dropping it removes that entry, so the table stays bounded by the streams that are still
+    /// alive.
     pub struct DatagramReceiver {
         conn: Arc<ClientConn>,
         stream_id: u64,
@@ -3287,13 +3288,11 @@ pub mod h3 {
             let closed = timeout(FRAME_TIMEOUT, pair.server.closed())
                 .await
                 .expect("the client fails closed on a SETTINGS frame past the cap");
-            match closed {
-                ConnectionError::ApplicationClosed(app) => {
-                    assert_eq!(app.error_code, VarInt::from_u32(H3_EXCESSIVE_LOAD));
-                    assert_eq!(String::from_utf8_lossy(&app.reason), "SETTINGS frame too large");
-                }
-                err => panic!("expected an application close, got {err}"),
-            }
+            let ConnectionError::ApplicationClosed(app) = closed else {
+                panic!("expected an application close, got {closed}");
+            };
+            assert_eq!(app.error_code, VarInt::from_u32(H3_EXCESSIVE_LOAD));
+            assert_eq!(String::from_utf8_lossy(&app.reason), "SETTINGS frame too large");
         }
 
         #[tokio::test]
