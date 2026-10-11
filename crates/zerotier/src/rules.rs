@@ -86,7 +86,7 @@ pub const RULE_MATCH_TAGS_BITWISE_AND: u8 = 45;
 pub const RULE_MATCH_TAGS_BITWISE_OR: u8 = 46;
 /// Compares the bitwise XOR of tag values.
 pub const RULE_MATCH_TAGS_BITWISE_XOR: u8 = 47;
-/// Compares sender and receiver tag values for equality.
+/// Matches when both the sender's and the receiver's tag values equal the rule's value.
 pub const RULE_MATCH_TAGS_EQUAL: u8 = 48;
 /// Compares the sender's tag value with a fixed value.
 pub const RULE_MATCH_TAG_SENDER: u8 = 49;
@@ -854,7 +854,10 @@ impl NetworkConfigData {
             RULE_MATCH_TAGS_BITWISE_AND => local_tag & remote_tag == expected,
             RULE_MATCH_TAGS_BITWISE_OR => local_tag | remote_tag == expected,
             RULE_MATCH_TAGS_BITWISE_XOR => local_tag ^ remote_tag == expected,
-            _ => local_tag == expected && remote_tag == expected,
+            RULE_MATCH_TAGS_EQUAL => local_tag == expected && remote_tag == expected,
+            // The caller dispatches only the five tag-pair types; the reference's own fallback for
+            // anything else is `hardNo`, i.e. the NOT flag's value.
+            _ => not_applicable,
         }
     }
 
@@ -1338,6 +1341,36 @@ mod tests {
         let mut outbound = context();
         outbound.local_tags = vec![local];
         assert!(config.allows_frame(&frame(ETHER_TYPE_IPV4, 20), outbound));
+    }
+
+    /// The reference requires both tag values to equal the operand, so tags that agree with each
+    /// other but not with the operand do not match.
+    #[test]
+    fn tags_equal_requires_both_tag_values_to_equal_the_operand() {
+        let config = NetworkConfigData {
+            rules: vec![
+                NetworkRule { rule_type: RULE_MATCH_TAGS_EQUAL, value: vec![0, 0, 0, 7, 0, 0, 0, 42] },
+                NetworkRule { rule_type: RULE_ACTION_ACCEPT, value: Vec::new() },
+                NetworkRule { rule_type: RULE_ACTION_DROP, value: Vec::new() },
+            ],
+            ..Default::default()
+        };
+        let agreeing = FrameRuleContext {
+            local_tags: vec![tag(7, 7, 0)],
+            remote_tags: vec![tag(7, 7, 0)],
+            ..context()
+        };
+        assert!(
+            !config.allows_frame(&frame(ETHER_TYPE_IPV4, 20), agreeing),
+            "the operand is part of the comparison, so agreeing tags that differ from it do not match"
+        );
+
+        let matching = FrameRuleContext {
+            local_tags: vec![tag(7, 42, 0)],
+            remote_tags: vec![tag(7, 42, 0)],
+            ..context()
+        };
+        assert!(config.allows_frame(&frame(ETHER_TYPE_IPV4, 20), matching));
     }
 
     /// A NOT-flagged tag rule does not apply to a tag the network never issued.
