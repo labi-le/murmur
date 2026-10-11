@@ -324,10 +324,7 @@ fn congestion_window(bps: ByteCount, rtt_secs: f64, ack_rate: f64) -> ByteCount 
 }
 
 /// The acked share of the sampled packets.
-#[expect(
-    clippy::cast_precision_loss,
-    reason = "the ack rate is a f64 ratio of integer packet counters"
-)]
+#[expect(clippy::cast_precision_loss, reason = "the ack rate is a f64 ratio of integer packet counters")]
 fn ack_rate_ratio(acked: u64, sampled: u64) -> f64 {
     acked as f64 / sampled as f64
 }
