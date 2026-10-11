@@ -50,5 +50,9 @@ murmur-std-compat = { path = "../std-compat" }
 murmur-log = { path = "../log" }
 
 
+[dev-dependencies]
+tokio = { workspace = true, features = ["test-util"] }
+
+
 [lints]
 workspace = true

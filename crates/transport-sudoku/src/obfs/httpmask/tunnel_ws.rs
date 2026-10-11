@@ -27,6 +27,7 @@ use super::masker::{random_choice, trim_port_for_host, ACCEPTS, ACCEPT_ENCODINGS
 use super::pathroot::join_path_root;
 use super::tunnel_api::{TunnelDialOptions, TunnelMode};
 use super::tunnel_dial::{canonical_header_host, set_early_data_query, TUNNEL_EARLY_DATA_HEADER};
+use super::tunnel_preconnect::{with_timeout, TUNNEL_TLS_HANDSHAKE_LIMIT};
 use super::tunnel_server::new_pre_buffered_conn;
 use super::ws_auth::{TunnelAuth, TUNNEL_AUTH_QUERY_KEY};
 use super::ws_stream_conn::new_ws_stream_conn;
@@ -159,6 +160,16 @@ fn find_response_header(headers: &[(String, String)], name: &str) -> Option<Stri
     headers.iter().find(|(k, _)| k.eq_ignore_ascii_case(name)).map(|(_, v)| v.clone())
 }
 
+/// The dial deadline and the caller's own cancellation both arrive as a cancelled child token;
+/// this names which one it was, so a stalled peer fails with its deadline rather than a bare
+/// cancellation.
+fn dial_timeout_error(ctx: &CancellationToken) -> anyhow::Error {
+    if ctx.is_cancelled() {
+        return anyhow!("context canceled");
+    }
+    anyhow!("httpmask: websocket dial timed out after {TUNNEL_TLS_HANDSHAKE_LIMIT:?}")
+}
+
 // cancel-safe: a cancelled dial drops the connection it had just opened, so no state survives.
 pub(crate) async fn dial_ws(
     ctx: &CancellationToken,
@@ -195,10 +206,20 @@ pub(crate) async fn dial_ws(
 
     let request = build_ws_request(&u, &header_host, &ws_key, &header);
 
-    let dialed = dial_context.dial_context(ctx, "tcp", &dial_addr).await?;
+    // One deadline for the whole handshake: TCP dial, TLS, request write and response header.
+    let dial_ctx = with_timeout(ctx, TUNNEL_TLS_HANDSHAKE_LIMIT);
+    let deadline_err = |err: anyhow::Error| {
+        if dial_ctx.is_cancelled() {
+            dial_timeout_error(ctx)
+        } else {
+            err
+        }
+    };
+
+    let dialed = dial_context.dial_context(&dial_ctx, "tcp", &dial_addr).await.map_err(deadline_err)?;
     let mut conn: Box<dyn Stream> = if scheme == "wss" {
         let tls_conn = tls_client(dialed, Arc::new(ws_tls_config(&server_name)));
-        tls_conn.handshake_context(ctx).await?;
+        tls_conn.handshake_context(&dial_ctx).await.map_err(deadline_err)?;
         Box::new(tls_conn)
     } else {
         dialed
@@ -206,16 +227,16 @@ pub(crate) async fn dial_ws(
 
     tokio::select! {
         result = conn.write_all(&request) => result?,
-        () = ctx.cancelled() => return Err(anyhow!("context canceled")),
+        () = dial_ctx.cancelled() => return Err(dial_timeout_error(ctx)),
     }
     tokio::select! {
         result = conn.flush() => result?,
-        () = ctx.cancelled() => return Err(anyhow!("context canceled")),
+        () = dial_ctx.cancelled() => return Err(dial_timeout_error(ctx)),
     }
 
     let (header_bytes, leftover) = tokio::select! {
         result = read_ws_response_header(&mut conn) => result?,
-        () = ctx.cancelled() => return Err(anyhow!("context canceled")),
+        () = dial_ctx.cancelled() => return Err(dial_timeout_error(ctx)),
     };
 
     let mut parsed = [httparse::EMPTY_HEADER; 64];
@@ -388,5 +409,51 @@ fn join_host_port(host: &str, port: &str) -> String {
         format!("[{host}]:{port}")
     } else {
         format!("{host}:{port}")
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use tokio::io::AsyncReadExt as _;
+    use tokio::net::{TcpListener, TcpStream};
+
+    use murmur_component::dialer::options::{NetDialer, NetDialerFunc};
+
+    use super::*;
+
+    fn direct_dialer() -> Arc<dyn NetDialer> {
+        Arc::new(NetDialerFunc::new(move |_ctx, _network, address| {
+            Box::pin(async move {
+                let stream = TcpStream::connect(&address).await?;
+                let stream: Box<dyn Stream> = Box::new(stream);
+                Ok(stream)
+            })
+        }))
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn dial_ws_fails_on_its_own_deadline_when_the_peer_never_answers_the_handshake() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.expect("listen");
+        let addr = listener.local_addr().expect("listener addr").to_string();
+
+        let stalling_peer = tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.expect("accept");
+            let mut request = [0u8; 512];
+            let _ = stream.read(&mut request).await;
+            std::future::pending::<()>().await;
+        });
+
+        let ctx = CancellationToken::new();
+        let opts =
+            TunnelDialOptions { mode: "ws".to_owned(), dial_context: Some(direct_dialer()), ..Default::default() };
+
+        let Err(err) = tokio::time::timeout(Duration::from_secs(60), dial_ws(&ctx, &addr, opts))
+            .await
+            .expect("the ws dial must fail on its own deadline instead of parking")
+        else {
+            panic!("a peer that never answers the handshake must fail the dial");
+        };
+        assert!(err.to_string().contains("websocket dial timed out after"), "unexpected ws dial error: {err}");
+        stalling_peer.abort();
     }
 }
