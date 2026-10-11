@@ -42,8 +42,11 @@ const INIT_MAX_DATAGRAM_SIZE: u64 = 1252;
 /// The QUIC configuration, restricted to the fields the protocol sets.
 #[derive(Clone, Debug, Default)]
 pub struct QuicConfig {
+    /// Dropped by [`transport_config`]: quinn advertises the configured stream receive window as
+    /// the initial stream limit from the first packet, so the initial window has no knob of its own.
     pub initial_stream_receive_window: u64,
     pub max_stream_receive_window: u64,
+    /// Dropped by [`transport_config`] for the same reason as [`Self::initial_stream_receive_window`].
     pub initial_connection_receive_window: u64,
     pub max_connection_receive_window: u64,
     pub max_idle_timeout: Duration,
@@ -110,6 +113,11 @@ fn congestion_factory(option: &CongestionOption) -> Arc<dyn quinn::congestion::C
 }
 
 /// The config fields this session maps onto quinn's `TransportConfig`.
+///
+/// `initial_stream_receive_window` and `initial_connection_receive_window` are dropped: quinn sends
+/// the configured maximums as the connection's initial limits (quinn-proto's `TransportParameters`
+/// fills `initial_max_stream_data_*` and `initial_max_data` from `stream_receive_window` and
+/// `receive_window`), so the two initial windows have no separate knob to land on.
 #[must_use]
 pub fn transport_config(config: &QuicConfig, congestion: &CongestionOption) -> quinn::TransportConfig {
     let mut transport = quinn::TransportConfig::default();
