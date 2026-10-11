@@ -292,7 +292,8 @@ pub fn rule_forward_payload(frame: &Frame, flags: u8, payload_length: usize) -> 
 /// Evaluates one binary integer operand against the frame payload.
 ///
 /// The format byte carries the bit width in its low six bits and the byte order
-/// in its top bit; the index is slot-relative for the little-endian form.
+/// in its top bit; the big-endian form (bit 7 clear) is slot-relative, so its
+/// window ends at the given offset, while the little-endian form starts there.
 #[must_use]
 pub fn match_integer_range(value: &[u8], payload: &[u8]) -> bool {
     if value.len() != 19 {
