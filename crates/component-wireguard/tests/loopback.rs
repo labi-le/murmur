@@ -32,7 +32,7 @@ use murmur_component_wireguard::cookie::{address_bytes, CookieChecker, CookieGen
 use murmur_component_wireguard::device::{Device, DeviceConfig, PeerConfig, QUEUE_HANDSHAKE_SIZE};
 use murmur_component_wireguard::handshake::Initiator;
 use murmur_component_wireguard::keys::{PresharedKey, StaticKey};
-use murmur_component_wireguard::stack::{Events, Stack, StackConfig};
+use murmur_component_wireguard::stack::{Events, Stack, StackConfig, PACKET_QUEUE_SIZE, UDP_SOCKET_PACKETS};
 use smoltcp::phy::{self, DeviceCapabilities, Medium};
 use smoltcp::time::Instant as SmolInstant;
 
@@ -628,4 +628,56 @@ async fn a_dropped_tun_stops_the_device() {
     tokio::time::timeout(Duration::from_secs(5), closed.notified())
         .await
         .expect("the device task must stop when its tun handle is dropped");
+}
+
+/// A socket whose reader stops reading has to bound what the stack keeps for it: the driver
+/// stops draining at a full event queue and lets the socket's own receive buffer fill, instead
+/// of buffering the sender's whole stream in this process.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_non_reading_socket_bounds_the_backlog_the_stack_keeps() {
+    let (a, b, a_events, b_events) = linked();
+    let client = Stack::with_device(
+        StackConfig { local_addresses: vec![prefix("10.0.0.2/32")], mtu: 1500 },
+        loopback(&a, 1500),
+        a_events,
+    )
+    .expect("client stack");
+    let server = Stack::with_device(
+        StackConfig { local_addresses: vec![prefix("10.0.0.1/32")], mtu: 1500 },
+        loopback(&b, 1500),
+        b_events,
+    )
+    .expect("server stack");
+
+    let listener = with_timeout("listen_udp", server.listen_udp(None)).await.expect("bind");
+    let destination = SocketAddr::new(IpAddr::V4(Ipv4Addr::new(10, 0, 0, 1)), listener.local_endpoint().port());
+    let sender = with_timeout("dial_udp", client.dial_udp(None, destination)).await.expect("dial");
+
+    const SENT: usize = 4096;
+    for sequence in 0..SENT {
+        Datagram::send_to(&sender, &(sequence as u32).to_be_bytes(), destination).await.expect("send");
+        // Paced, so the sender is not the reason the stack stops taking datagrams.
+        if sequence % 128 == 127 {
+            tokio::time::sleep(Duration::from_millis(1)).await;
+        }
+    }
+    // Let the wire settle: what the queue and the socket's own buffer could not take is dropped
+    // by then, so what the reader sees is the backlog the stack chose to keep.
+    tokio::time::sleep(Duration::from_millis(250)).await;
+
+    let mut buffer = [0u8; 64];
+    let mut received = 0usize;
+    while let Ok(Ok(_)) = tokio::time::timeout(Duration::from_secs(2), listener.recv_from(&mut buffer)).await {
+        received += 1;
+    }
+
+    assert!(
+        received > PACKET_QUEUE_SIZE,
+        "a full event queue must not starve the reader of what the socket still holds: {received} datagrams"
+    );
+    assert!(
+        received <= PACKET_QUEUE_SIZE + 2 * UDP_SOCKET_PACKETS,
+        "the backlog must be bounded by the queue and the socket's own buffer, not by the \
+         sender's stream: {received} of {SENT} datagrams"
+    );
 }
