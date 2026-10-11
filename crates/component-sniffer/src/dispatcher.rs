@@ -126,7 +126,7 @@ impl Dispatcher {
         self.force_domain.iter().any(|matcher| matcher.match_domain(&metadata.host))
     }
 
-/// The UDP sniff entry point. `packet` only exposes a read-only `Metadata()`, so the caller
+    /// The UDP sniff entry point. `packet` only exposes a read-only `Metadata()`, so the caller
     /// passes the mutable `Metadata` it shares with `packet` separately, the same convention
     /// `QuicPacketSender::do_sniff` already uses.
     pub fn udp_sniff(
@@ -274,33 +274,38 @@ impl Dispatcher {
             }
 
             let buffered = conn.buffered();
-            let (data, _) = conn.peek(buffered).await;
-            let data = data.to_vec();
+            let (remaining, next_want) = {
+                // The candidate loop borrows the connection's buffer for the round: copying it
+                // first would memcpy the whole prefix once per delivered byte.
+                let (data, _) = conn.peek(buffered).await;
 
-            let mut remaining = Vec::with_capacity(candidates.len());
-            let mut next_want = 0usize;
-            for mut current in candidates {
-                if current.want <= data.len() {
-                    match current.configured.sniffer.sniff_data(&data) {
-                        Ok(host) => {
-                            if is_valid_sniff_host(&host) {
-                                return Ok((host, current.configured.config.clone()));
+                let mut remaining = Vec::with_capacity(candidates.len());
+                let mut next_want = 0usize;
+                for mut current in candidates {
+                    if current.want <= data.len() {
+                        match current.configured.sniffer.sniff_data(data) {
+                            Ok(host) => {
+                                if is_valid_sniff_host(&host) {
+                                    return Ok((host, current.configured.config.clone()));
+                                }
+                                continue;
                             }
-                            continue;
+                            Err(err) => match need_more_data(&err) {
+                                Some(length) if length > data.len() => current.want = length,
+                                _ => continue,
+                            },
                         }
-                        Err(err) => match need_more_data(&err) {
-                            Some(length) if length > data.len() => current.want = length,
-                            _ => continue,
-                        },
+                    }
+
+                    let want = current.want;
+                    remaining.push(current);
+                    if next_want == 0 || want < next_want {
+                        next_want = want;
                     }
                 }
 
-                let want = current.want;
-                remaining.push(current);
-                if next_want == 0 || want < next_want {
-                    next_want = want;
-                }
-            }
+                (remaining, next_want)
+            };
 
             candidates = remaining;
             want = next_want;
@@ -873,6 +878,33 @@ mod tests {
                 assert_eq!(*deadline, deadlines[1], "{}: all retries must reuse the shared deadline", case.name);
             }
             assert!(!raw.would_block(), "{}: read would block with no read deadline set", case.name);
+        }
+    }
+
+    /// Each retry round must hand the sniffer a borrow of the connection's buffer: copying the
+    /// whole prefix once per delivered byte is quadratic in the sniff buffer size (#38).
+    #[tokio::test]
+    async fn sniff_retry_rounds_borrow_the_connection_buffer() {
+        let pointers = StdArc::new(SyncMutex::new(Vec::new()));
+        let recorder = StdArc::clone(&pointers);
+        let sniffer = StubSniffer::new(move |data: &[u8]| {
+            recorder.lock().push(data.as_ptr() as usize);
+            Err(need_at_least(data.len() + 1))
+        });
+        let (configured_sniffer, _seen) = configured(sniffer);
+        let dispatcher = new_test_dispatcher(vec![configured_sniffer]);
+        let (_raw, mut conn) = buffered_conn(ChunkedConn::new(vec![vec![b'a']; 4]));
+        let metadata = Metadata { network: NetWork::TCP, dst_port: 80, ..Default::default() };
+
+        assert!(dispatcher.sniff_domain(&mut conn, &metadata).await.is_err());
+
+        let seen = pointers.lock().clone();
+        assert_eq!(seen.len(), 4, "one retry round per delivered byte");
+        let reader = conn.reader().expect("reader present");
+        let start = reader.buf.as_ptr() as usize;
+        let end = start + reader.buf.len();
+        for pointer in seen {
+            assert!((start..end).contains(&pointer), "a retry round copied the connection buffer");
         }
     }
 
