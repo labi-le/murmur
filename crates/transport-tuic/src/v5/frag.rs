@@ -54,11 +54,18 @@ pub(crate) async fn frag_write_native(
     Ok(())
 }
 
+/// Concurrent incomplete messages held per association. An age window alone bounds nothing when
+/// the peer picks `frag_total`, and a peer relaying datagrams has only a few messages in flight.
+const FRAGMENT_BAG_LIMIT: usize = 1024;
+
 /// The bag's fields, held under one lock.
 #[derive(Default)]
 struct PacketBagState {
-    frags: Vec<Option<Packet>>,
-    count: u8,
+    /// The fragments received so far, at most one per `frag_id`, so a bag is sized by what the
+    /// peer actually sent rather than by the `frag_total` it declared.
+    frags: Vec<Packet>,
+    /// The `frag_total` the message in flight declared; a different one starts a new message.
+    frag_total: u8,
 }
 
 #[derive(Default)]
@@ -75,46 +82,45 @@ pub(crate) struct DeFragger {
 impl DeFragger {
     /// The lazily initialized LRU cache.
     fn lru(&self) -> &LruCache<u16, Arc<PacketBag>> {
-        self.lru.get_or_init(|| lru::new(vec![lru::with_age(10), lru::with_update_age_on_get()]))
+        self.lru.get_or_init(|| {
+            lru::new(vec![lru::with_age(10), lru::with_size(FRAGMENT_BAG_LIMIT), lru::with_update_age_on_get()])
+        })
     }
 
     pub(crate) fn feed(&self, m: Packet) -> Option<Packet> {
         if m.frag_total <= 1 {
             return Some(m);
         }
-        if m.frag_id >= m.frag_total {
+        let frag_id = m.frag_id;
+        if frag_id >= m.frag_total {
             // wtf is this?
             return None;
         }
-        let lru = self.lru();
-        let (bag, _) = lru.get_or_store(m.pkt_id, || Arc::new(PacketBag::default()));
-        let mut state = bag.state.lock();
-        let frag_id = m.frag_id as usize;
-        if usize::from(m.frag_total) != state.frags.len() {
-            // new message, clear previous state
-            state.frags = vec![None; m.frag_total as usize];
-            state.count = 1;
-            let slot = state.frags.get_mut(frag_id)?;
-            *slot = Some(m);
-            return None;
-        }
         let pkt_id = m.pkt_id;
-        let slot = state.frags.get_mut(frag_id)?;
-        if slot.is_some() {
+        let lru = self.lru();
+        let (bag, _) = lru.get_or_store(pkt_id, || Arc::new(PacketBag::default()));
+        let mut state = bag.state.lock();
+        if state.frag_total != m.frag_total {
+            state.frags.clear();
+            state.frag_total = m.frag_total;
+        }
+        if state.frags.iter().any(|frag| frag.frag_id == frag_id) {
             return None;
         }
-        *slot = Some(m);
-        state.count += 1;
-        if usize::from(state.count) != state.frags.len() {
+        state.frags.push(m);
+        if state.frags.len() != usize::from(state.frag_total) {
             return None;
         }
 
         // all fragments received, assemble
+        let mut frags = std::mem::take(&mut state.frags);
+        drop(state);
+        frags.sort_unstable_by_key(|frag| frag.frag_id);
         let mut data = Vec::new();
-        for frag in state.frags.iter().flatten() {
+        for frag in &frags {
             data.extend_from_slice(&frag.data);
         }
-        let mut p = state.frags.first().cloned().flatten()?;
+        let mut p = frags.into_iter().next()?;
         #[expect(
             clippy::cast_possible_truncation,
             reason = "the reassembled payload is bounded by the original udp datagram size, which fits the 16-bit wire field"
@@ -124,9 +130,79 @@ impl DeFragger {
         p.data = bytes::Bytes::from(data);
         p.frag_id = 0;
         p.frag_total = 1;
-        state.frags = Vec::new();
-        drop(state);
         lru.delete(pkt_id);
         Some(p)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::net::SocketAddr;
+
+    use super::*;
+    use crate::v5::protocol;
+
+    fn packet(pkt_id: u16, frag_total: u8, frag_id: u8, data: &'static [u8]) -> Packet {
+        let addr = protocol::new_address_addr_port(SocketAddr::from(([192, 0, 2, 1], 9)));
+        let size = u16::try_from(data.len()).expect("the test payloads fit the wire field");
+        protocol::new_packet(1, pkt_id, frag_total, frag_id, size, addr, bytes::Bytes::from_static(data))
+    }
+
+    fn held_fragments(defragger: &DeFragger, pkt_id: u16) -> usize {
+        let (bag, _) = defragger.lru().get_or_store(pkt_id, || Arc::new(PacketBag::default()));
+        let held = bag.state.lock().frags.len();
+        held
+    }
+
+    #[test]
+    fn a_fragment_bag_holds_only_the_fragments_that_arrived() {
+        let defragger = DeFragger::default();
+        assert!(defragger.feed(packet(7, 255, 0, b"")).is_none());
+        assert_eq!(held_fragments(&defragger, 7), 1, "a 13 byte fragment must not hold a slot per declared fragment");
+    }
+
+    #[test]
+    fn fragment_bags_are_evicted_once_the_cache_limit_is_reached() {
+        let defragger = DeFragger::default();
+        for pkt_id in 0..10_000u16 {
+            assert!(defragger.feed(packet(pkt_id, 255, 0, b"")).is_none());
+        }
+        let lru = defragger.lru();
+        let held = (0..10_000u16).filter(|pkt_id| lru.exist(*pkt_id)).count();
+        assert_eq!(held, FRAGMENT_BAG_LIMIT, "10 000 pkt_ids must not outgrow the cache's size limit");
+    }
+
+    #[test]
+    fn fragments_arriving_out_of_order_are_joined_in_order_under_the_first_fragments_address() {
+        let defragger = DeFragger::default();
+        let addr = protocol::new_address_addr_port(SocketAddr::from(([192, 0, 2, 1], 9)));
+        let none = Address { type_: ATYP_NONE, addr: Vec::new(), port: 0 };
+        let first = protocol::new_packet(1, 9, 2, 0, 2, addr.clone(), bytes::Bytes::from_static(b"ab"));
+        let second = protocol::new_packet(1, 9, 2, 1, 2, none, bytes::Bytes::from_static(b"cd"));
+
+        assert!(defragger.feed(second).is_none());
+        let assembled = defragger.feed(first).expect("the second fragment completes the message");
+        assert_eq!(&assembled.data[..], b"abcd");
+        assert_eq!(assembled.size, 4);
+        assert_eq!(assembled.frag_id, 0);
+        assert_eq!(assembled.frag_total, 1);
+        assert_eq!(assembled.addr.string(), addr.string());
+    }
+
+    #[test]
+    fn a_repeated_fragment_does_not_complete_the_message() {
+        let defragger = DeFragger::default();
+        assert!(defragger.feed(packet(3, 2, 1, b"cd")).is_none());
+        assert!(defragger.feed(packet(3, 2, 1, b"cd")).is_none());
+        assert!(defragger.feed(packet(3, 2, 0, b"ab")).is_some());
+    }
+
+    #[test]
+    fn a_different_frag_total_starts_a_new_message_on_the_same_packet_id() {
+        let defragger = DeFragger::default();
+        assert!(defragger.feed(packet(5, 2, 0, b"ab")).is_none());
+        assert!(defragger.feed(packet(5, 4, 0, b"ab")).is_none());
+        assert_eq!(held_fragments(&defragger, 5), 1);
+        assert!(defragger.feed(packet(5, 2, 1, b"cd")).is_none());
     }
 }
