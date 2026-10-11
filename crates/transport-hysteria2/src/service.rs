@@ -834,8 +834,8 @@ mod tests {
         .expect("bind the server endpoint");
         let addr = endpoint.local_addr().expect("the endpoint has a local address");
 
-        let client_endpoint =
-            quinn::Endpoint::client("127.0.0.1:0".parse().expect("loopback address")).expect("bind the client endpoint");
+        let client_endpoint = quinn::Endpoint::client("127.0.0.1:0".parse().expect("loopback address"))
+            .expect("bind the client endpoint");
         let crypto = quinn::crypto::rustls::QuicClientConfig::try_from((*client_tls()).clone())
             .expect("quinn accepts the rustls client config");
         let connecting = client_endpoint
@@ -856,10 +856,8 @@ mod tests {
         // The sniff runs before authentication, so a bare QUIC connection reaches it.
         let (mut dispatch, mut proxy_streams) = DispatchConnection::new(server_connection);
         tokio::spawn(async move {
-            let _ = futures::future::poll_fn(|cx| {
-                h3::quic::Connection::<Bytes>::poll_accept_bidi(&mut dispatch, cx)
-            })
-            .await;
+            let _ =
+                futures::future::poll_fn(|cx| h3::quic::Connection::<Bytes>::poll_accept_bidi(&mut dispatch, cx)).await;
         });
 
         let (mut send, _recv) = client_connection.open_bi().await.expect("open a proxy stream");
