@@ -593,7 +593,7 @@ mod tests {
         let flag = FlagConn { inner: server_side, closes };
         let mut obfs = new_tls_obfs(Box::new(flag), "example.com".to_owned());
 
-        peer.write_all(&vec![0u8; 105]).await.expect("write discard filler");
+        peer.write_all(&[0u8; 105]).await.expect("write discard filler");
         peer.write_all(&[0x00, 0x04]).await.expect("write record length");
 
         let mut big = [0u8; 4096];
