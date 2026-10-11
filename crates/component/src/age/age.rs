@@ -287,9 +287,10 @@ pub(crate) enum AeadDecryptError {
 }
 
 /// A closed enum, not a trait object: this crate implements exactly the two identity kinds age v1
-/// defines (`X25519Identity`, `HybridIdentity`), so the downcast-by-concrete-type
-/// becomes an exhaustive match instead of a runtime type test with an "unexpected identity type"
-/// fallback that could never actually be reached.
+/// defines (`X25519Identity`, `HybridIdentity`).
+///
+/// The downcast-by-concrete-type therefore becomes an exhaustive match instead of a runtime type
+/// test with an "unexpected identity type" fallback that could never actually be reached.
 pub enum Identity {
     X25519(X25519Identity),
     Hybrid(HybridIdentity),
