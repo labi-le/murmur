@@ -16,7 +16,7 @@ use std::time::Duration;
 use anyhow::{anyhow, Result};
 use base64::engine::general_purpose::URL_SAFE_NO_PAD;
 use base64::Engine as _;
-use bytes::Bytes;
+use bytes::{Bytes, BytesMut};
 use http_body_util::{BodyExt, Full};
 use hyper::body::Incoming;
 use hyper_util::rt::TokioIo;
@@ -401,7 +401,7 @@ pub(crate) async fn dial_session_with_client(
         return Err(anyhow!("httpmask: authorization returned no response"));
     };
     let status = resp.status();
-    let body = limited_body(resp, 4 * 1024).await?;
+    let body = read_body_limited(resp.into_body(), 4 * 1024).await?;
     if status != http::StatusCode::OK {
         return Err(anyhow!(
             "{} authorize bad status: {status} ({})",
@@ -457,14 +457,32 @@ fn build_url(scheme: &str, host: &str, path: &str, query: &str) -> String {
     }
 }
 
-async fn limited_body(resp: http::Response<Incoming>, limit: usize) -> Result<Bytes> {
-    let collected = resp.collect().await?;
-    let bytes = collected.to_bytes();
-    if bytes.len() > limit {
-        Ok(bytes.slice(0..limit))
-    } else {
-        Ok(bytes)
+/// Reads at most `limit` bytes and stops polling there, so an unbounded or `Content-Length`-less
+/// body cannot make this side allocate more than `limit`; the rest is discarded when the
+/// per-request connection drops. `BodyExt::collect` would materialise the whole body first.
+pub(crate) async fn read_body_limited<B, E>(mut body: B, limit: usize) -> Result<Bytes>
+where
+    B: BodyExt<Data = Bytes, Error = E> + Unpin,
+    E: std::fmt::Display,
+{
+    let mut buf = BytesMut::with_capacity(limit.min(8 * 1024));
+    while buf.len() < limit {
+        let Some(frame) = body.frame().await else {
+            break;
+        };
+        let Ok(data) = frame.map_err(|err| anyhow!("{err}"))?.into_data() else {
+            continue;
+        };
+        let room = limit - buf.len();
+        if data.len() > room {
+            let mut head = data;
+            head.truncate(room);
+            buf.extend_from_slice(&head);
+            break;
+        }
+        buf.extend_from_slice(&data);
     }
+    Ok(buf.freeze())
 }
 
 pub(crate) async fn send_session_control(
@@ -514,7 +532,7 @@ pub(crate) async fn send_session_control(
             }
             Ok(resp) => {
                 let status = resp.status();
-                let _ = limited_body(resp, 4 * 1024).await;
+                let _ = read_body_limited(resp.into_body(), 4 * 1024).await;
                 if status != http::StatusCode::OK {
                     if status == http::StatusCode::FORBIDDEN
                         || status == http::StatusCode::NOT_FOUND
@@ -692,5 +710,125 @@ mod tests {
             .await
             .expect("send session control");
         assert_eq!(calls.load(Ordering::SeqCst), 2, "control calls");
+    }
+
+    #[tokio::test]
+    async fn read_body_limited_stops_polling_a_body_that_outgrows_the_limit() {
+        use std::collections::VecDeque;
+        use std::pin::Pin;
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        use std::task::{Context, Poll};
+
+        use hyper::body::{Body, Frame};
+
+        struct CountingBody {
+            chunks: VecDeque<Bytes>,
+            delivered: Arc<AtomicUsize>,
+        }
+
+        impl Body for CountingBody {
+            type Data = Bytes;
+            type Error = std::io::Error;
+
+            fn poll_frame(
+                mut self: Pin<&mut Self>,
+                _cx: &mut Context<'_>,
+            ) -> Poll<Option<Result<Frame<Bytes>, std::io::Error>>> {
+                let Some(chunk) = self.chunks.pop_front() else {
+                    return Poll::Ready(None);
+                };
+                self.delivered.fetch_add(chunk.len(), Ordering::SeqCst);
+                Poll::Ready(Some(Ok(Frame::data(chunk))))
+            }
+        }
+
+        let delivered = Arc::new(AtomicUsize::new(0));
+        let body = CountingBody {
+            chunks: (0..4096).map(|_| Bytes::from_static(&[0u8; 1024])).collect(),
+            delivered: Arc::clone(&delivered),
+        };
+
+        let read = read_body_limited(body, 4 * 1024).await.expect("bounded read");
+
+        assert_eq!(read.len(), 4 * 1024, "returned bytes");
+        assert_eq!(delivered.load(Ordering::SeqCst), 4 * 1024, "bytes polled out of a 4 MiB body, with a 4 KiB limit");
+    }
+
+    #[tokio::test]
+    async fn read_body_limited_returns_a_body_under_the_limit_whole() {
+        let body = Bytes::from_static(b"token=abc123\ncap=upload-seq\n");
+        let read = read_body_limited(Full::new(body.clone()), 4 * 1024).await.expect("bounded read");
+        assert_eq!(read, body, "short body passes through unchanged");
+    }
+
+    #[tokio::test]
+    async fn session_control_stops_reading_a_body_the_peer_never_ends() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        use tokio::net::{TcpListener, TcpStream};
+
+        use murmur_component::dialer::options::NetDialerFunc;
+
+        const BODY_CAP: usize = 64 * 1024 * 1024;
+        const CHUNK: usize = 4 * 1024;
+
+        let listener = TcpListener::bind("127.0.0.1:0").await.expect("listen");
+        let addr = listener.local_addr().expect("listener addr");
+
+        let written = Arc::new(AtomicUsize::new(0));
+        let server_written = Arc::clone(&written);
+        tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.expect("accept");
+
+            let mut request = Vec::new();
+            let mut head_buf = [0u8; 512];
+            loop {
+                let n = stream.read(&mut head_buf).await.expect("read control request");
+                if n == 0 {
+                    break;
+                }
+                request.extend_from_slice(&head_buf[..n]);
+                if request.windows(4).any(|w| w == b"\r\n\r\n") {
+                    break;
+                }
+            }
+
+            let head = "HTTP/1.1 200 OK\r\nContent-Type: application/octet-stream\r\nConnection: close\r\n\r\n";
+            if stream.write_all(head.as_bytes()).await.is_err() {
+                return;
+            }
+            let payload = [0u8; CHUNK];
+            while server_written.load(Ordering::SeqCst) < BODY_CAP {
+                if stream.write_all(&payload).await.is_err() {
+                    return;
+                }
+                server_written.fetch_add(payload.len(), Ordering::SeqCst);
+            }
+        });
+
+        let dial = Arc::new(NetDialerFunc::new(move |_ctx, _network, _address| {
+            Box::pin(async move {
+                let stream = TcpStream::connect(addr).await?;
+                let stream: Box<dyn Stream> = Box::new(stream);
+                Ok(stream)
+            })
+        }));
+
+        let dialer = new_preconnect_dialer(addr.to_string(), addr.to_string(), String::new(), None, dial);
+        let transport = TunnelHttpTransport { dialer, scheme: "http".to_owned() };
+
+        let control_url = format!("http://{addr}/api/v1/upload?token=session&close=1");
+        send_session_control(&transport, &control_url, "example", TunnelMode::Stream)
+            .await
+            .expect("send session control");
+
+        tokio::time::sleep(Duration::from_secs(1)).await;
+        let buffered = written.load(Ordering::SeqCst);
+        assert!(buffered >= CHUNK, "the peer never got to stream a body: {buffered} bytes written");
+        assert!(
+            buffered < BODY_CAP,
+            "the client kept reading past its 4 KiB limit: {buffered} of {BODY_CAP} bytes written"
+        );
     }
 }

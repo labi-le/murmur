@@ -20,8 +20,8 @@ use super::early_handshake::apply_early_handshake_or_upgrade;
 use super::tunnel_api::{apply_tunnel_headers, TunnelDialOptions, TunnelMode};
 use super::tunnel_conn_queue::QueuedConn;
 use super::tunnel_dial::{
-    best_effort_close_session, dial_session, dial_session_with_client, session_preconnect_count, upload_url,
-    HttpClientTarget, SessionDialInfo, TunnelHttpTransport, TUNNEL_STREAM_EOF_HEADER,
+    best_effort_close_session, dial_session, dial_session_with_client, read_body_limited, session_preconnect_count,
+    upload_url, HttpClientTarget, SessionDialInfo, TunnelHttpTransport, TUNNEL_STREAM_EOF_HEADER,
 };
 use super::tunnel_retry::{
     close_idle_connections, is_retryable_http_transport_error, is_retryable_status_code, next_backoff, status_error,
@@ -202,7 +202,7 @@ async fn pull_loop(c: StreamSplitConn) {
         backoff = PULL_MIN_BACKOFF;
         if resp.status() != http::StatusCode::OK {
             let retryable = is_retryable_status_code(resp.status());
-            let _ = resp.body_mut().collect().await;
+            let _ = read_body_limited(resp.into_body(), 4 * 1024).await;
             if retryable {
                 if pull_wait_retry(&c, backoff).await {
                     return;
@@ -339,7 +339,7 @@ async fn push_flush(buf: &mut BytesMut, c: &StreamSplitConn) -> Result<()> {
                     }
                 };
                 let status = resp.status();
-                let _ = resp.collect().await;
+                let _ = read_body_limited(resp.into_body(), 4 * 1024).await;
                 if status != http::StatusCode::OK {
                     let err = status_error(status, status.canonical_reason().unwrap_or(""));
                     if is_retryable_http_transport_error(&err) {
