@@ -218,13 +218,10 @@ impl<T: AsyncRead + Unpin> AsyncRead for FallbackThrottle<T> {
         if let Err(err) = result {
             return Poll::Ready(Err(err));
         }
-        if this.free > 0 {
-            this.free = this.free.saturating_sub(u64::try_from(read).unwrap_or(u64::MAX));
-            return Poll::Ready(Ok(()));
-        }
-        if let Some(delay) =
-            this.bucket.as_mut().and_then(|bucket| bucket.charge(u64::try_from(read).unwrap_or(u64::MAX)))
-        {
+        let read = u64::try_from(read).unwrap_or(u64::MAX);
+        let from_free = read.min(this.free);
+        this.free -= from_free;
+        if let Some(delay) = this.bucket.as_mut().and_then(|bucket| bucket.charge(read - from_free)) {
             this.delay = Some(Box::pin(tokio::time::sleep(delay)));
         }
         Poll::Ready(Ok(()))

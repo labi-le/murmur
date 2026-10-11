@@ -499,6 +499,30 @@ async fn the_fallback_throttle_relays_the_bytes_it_meters() {
     assert_eq!(relay.await.expect("relay task must not panic"), 10);
 }
 
+/// `after-bytes` is a byte allowance, not a read allowance: nine of these ten bytes are past the
+/// one-byte allowance, so the bucket owes the relay eight seconds at 1 B/s.
+#[tokio::test(start_paused = true)]
+async fn the_free_allowance_charges_the_overflow_of_a_straddling_read() {
+    let (source, mut sink) = tokio::io::duplex(64);
+    tokio::spawn(async move {
+        let _ = sink.write_all(b"0123456789").await;
+        let _ = sink.shutdown().await;
+    });
+    let limit = FallbackLimit { after_bytes: 1, bytes_per_sec: 1, burst_bytes_per_sec: 1 };
+    let mut throttled = FallbackThrottle::new(source, limit);
+    let (mut relayed, mut collected) = tokio::io::duplex(64);
+    let started = tokio::time::Instant::now();
+    let copied = tokio::io::copy(&mut throttled, &mut relayed).await.expect("relay the fallback bytes");
+    let owed = tokio::time::Instant::now().duration_since(started);
+    let _ = relayed.shutdown().await;
+
+    let mut bytes = Vec::new();
+    collected.read_to_end(&mut bytes).await.expect("read the relayed stream");
+    assert_eq!(bytes, b"0123456789");
+    assert_eq!(copied, 10);
+    assert_eq!(owed, Duration::from_secs(8), "nine charged bytes at 1 B/s");
+}
+
 /// The record framing a REALITY server puts on the wire: a plaintext `ServerHello`, a dummy
 /// plaintext `ChangeCipherSpec`, then the server flight under the handshake keys -- one record when
 /// `dest` sent one, one per message when it sent several -- each zero-padded to the length `dest`'s
