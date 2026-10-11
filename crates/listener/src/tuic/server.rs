@@ -13,7 +13,7 @@
 //! The 0-RTT allowance, the path manager and the initial (as opposed to maximum) receive windows
 //! have no quinn knob and are documented in `murmur_transport_tuic::quic::transport_config`.
 
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use std::net::SocketAddr;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
@@ -225,13 +225,7 @@ pub async fn new(
     if !config.token.is_empty() {
         option.tokens = config.token.iter().map(|token| gen_tkn(token)).collect();
     }
-    if !config.users.is_empty() {
-        option.users = config
-            .users
-            .iter()
-            .map(|(uuid, password)| parse_user_uuid(uuid).map(|uuid| (uuid, password.clone())))
-            .collect::<Result<HashMap<_, _>>>()?;
-    }
+    option.users = users_from_config(&config.users)?;
 
     let option = Arc::new(option);
 
@@ -274,6 +268,14 @@ async fn bind_servers(
     }
 
     Ok((udp_listeners, servers))
+}
+
+/// The credential table the handshake looks a presented uuid up in.
+///
+/// A key that does not name a uuid, or names the nil one, fails the config instead of being
+/// registered as a credential any client can present.
+fn users_from_config(users: &BTreeMap<String, String>) -> Result<HashMap<[u8; 16], String>> {
+    users.iter().map(|(uuid, password)| parse_user_uuid(uuid).map(|uuid| (uuid, password.clone()))).collect()
 }
 
 /// A user's uuid is the identity its credential is looked up by, so an unparseable key, or the nil
