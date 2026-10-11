@@ -142,3 +142,38 @@ async fn drop_with_open_halves_resets_the_peer() {
         .expect_err("aborted stream must not report a clean EOF");
     assert!(err.to_string().contains("reset"), "expected a reset error, got: {err}");
 }
+
+/// A peer cannot lift flow control by crediting the send window past `max_stream_window_size`:
+/// the update is refused and the stream is reset, rather than the window being inflated to the
+/// peer's number. The peer is driven by hand here, so the local reader has nothing else on the
+/// wire; the frame layout is the one in `src/frame.rs`.
+#[tokio::test(flavor = "multi_thread")]
+async fn an_oversized_window_update_resets_the_stream() {
+    const TYPE_WINDOW_UPDATE: u8 = 1;
+    const FLAG_RST: u16 = 8;
+
+    let (client_conn, mut peer) = tokio::io::duplex(64 * 1024);
+    let session = client(client_conn, default_config()).await.expect("client session");
+    let mut stream = session.open_stream().await.expect("open stream");
+
+    let mut syn = [0u8; 12];
+    peer.read_exact(&mut syn).await.expect("the open announces its window");
+    assert_eq!(syn[1], TYPE_WINDOW_UPDATE, "the open frame is a window update");
+    let id = u32::from_be_bytes(syn[4..8].try_into().expect("four stream id bytes"));
+
+    peer.write_all(&[0, TYPE_WINDOW_UPDATE, 0, 0, 0, 0, 0, 1, 0xFF, 0xFF, 0xFF, 0xFF])
+        .await
+        .expect("send an unbounded window update");
+
+    let mut reset = [0u8; 12];
+    tokio::time::timeout(Duration::from_secs(5), peer.read_exact(&mut reset))
+        .await
+        .expect("a window update past the ceiling must reset the stream")
+        .expect("read the reset");
+    assert_eq!(reset[1], TYPE_WINDOW_UPDATE, "the reset is a window update frame");
+    assert_eq!(u16::from_be_bytes(reset[2..4].try_into().expect("two flag bytes")), FLAG_RST);
+    assert_eq!(u32::from_be_bytes(reset[4..8].try_into().expect("four stream id bytes")), id);
+
+    let err = stream.write_all(&vec![0u8; 1 << 20]).await.expect_err("a reset stream refuses writes");
+    assert!(err.to_string().contains("stream reset"), "expected a reset error, got: {err}");
+}

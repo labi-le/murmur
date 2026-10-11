@@ -85,6 +85,7 @@ pub struct StreamShared {
     pub id: u32,
     core: Arc<SessionCore>,
     max_message_size: u32,
+    max_stream_window_size: u32,
     state: Mutex<StateInner>,
     recv: Mutex<RecvState>,
     send_window: AtomicU32,
@@ -110,10 +111,12 @@ impl StreamShared {
     ) -> Arc<Self> {
         let target = core.config.initial_stream_window_size;
         let max_message_size = core.config.max_message_size;
+        let max_stream_window_size = core.config.max_stream_window_size;
         Arc::new(Self {
             id,
             core,
             max_message_size,
+            max_stream_window_size,
             state: Mutex::new(StateInner {
                 lifecycle,
                 read_state: HalfState::Open,
@@ -241,8 +244,29 @@ impl StreamShared {
 
     pub fn incr_send_window(&self, hdr: &Header, flags: u16) {
         self.process_flags(hdr, flags);
-        self.send_window.fetch_add(hdr.length, Ordering::AcqRel);
+        if !self.credit_send_window(hdr.length) {
+            self.reset_with_error(crate::frame::GO_AWAY_PROTO_ERR);
+            return;
+        }
         self.wake_send();
+    }
+
+    /// Credits a peer's window update, refusing one that would take the stream past
+    /// `config.max_stream_window_size` or wrap the counter; the caller resets the stream.
+    fn credit_send_window(&self, delta: u32) -> bool {
+        let mut window = self.send_window.load(Ordering::Acquire);
+        loop {
+            let Some(credited) = window.checked_add(delta) else {
+                return false;
+            };
+            if credited > self.max_stream_window_size {
+                return false;
+            }
+            match self.send_window.compare_exchange_weak(window, credited, Ordering::AcqRel, Ordering::Acquire) {
+                Ok(_) => return true,
+                Err(current) => window = current,
+            }
+        }
     }
 
     /// The flag processing and overflow check that precede a data read, split out so the
