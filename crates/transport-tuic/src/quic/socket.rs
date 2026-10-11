@@ -86,9 +86,9 @@ impl quinn::AsyncUdpSocket for PacketConnSocket {
         }
     }
 
-    /// A datagram that does not fit the buffer quinn offered is dropped rather than truncated: a
-    /// QUIC packet is never larger than the path MTU, so an oversized one is not a packet this
-    /// connection could have parsed, and handing quinn a prefix would be a corrupt frame.
+    /// Drops a datagram too large for the buffer quinn offered instead of truncating it, and keeps
+    /// serving the datagrams behind it: quinn parks its driver on `Pending`, which the channel's
+    /// per-send wakeup no longer covers once an item has been consumed.
     fn poll_recv(
         &self,
         cx: &mut Context<'_>,
@@ -96,26 +96,35 @@ impl quinn::AsyncUdpSocket for PacketConnSocket {
         meta: &mut [RecvMeta],
     ) -> Poll<io::Result<usize>> {
         let mut rx = self.recv.lock();
-        match rx.poll_recv(cx) {
-            Poll::Ready(Some((data, addr))) => {
-                let (Some(buf), Some(meta_slot)) = (bufs.first_mut(), meta.first_mut()) else {
-                    debugln!("tuic dropped a {} byte datagram: no receive buffer was offered", data.len());
-                    return Poll::Pending;
-                };
-                let len = data.len();
-                if len > buf.len() {
-                    debugln!(
-                        "tuic dropped a {len} byte datagram that does not fit a {} byte receive buffer",
-                        buf.len()
-                    );
-                    return Poll::Pending;
+        let mut filled = 0;
+        while let (Some(buf), Some(meta_slot)) = (bufs.get_mut(filled), meta.get_mut(filled)) {
+            match rx.poll_recv(cx) {
+                Poll::Ready(Some((data, addr))) => {
+                    let len = data.len();
+                    if len > buf.len() {
+                        debugln!(
+                            "tuic dropped a {len} byte datagram that does not fit a {} byte receive buffer",
+                            buf.len()
+                        );
+                        continue;
+                    }
+                    ReadBuf::new(buf).put_slice(&data);
+                    *meta_slot = RecvMeta { addr, len, stride: len, ecn: None, dst_ip: None };
+                    filled += 1;
                 }
-                ReadBuf::new(buf).put_slice(&data);
-                *meta_slot = RecvMeta { addr, len, stride: len, ecn: None, dst_ip: None };
-                Poll::Ready(Ok(1))
+                Poll::Ready(None) => {
+                    if filled > 0 {
+                        break;
+                    }
+                    return Poll::Ready(Err(closed()));
+                }
+                Poll::Pending => break,
             }
-            Poll::Ready(None) => Poll::Ready(Err(closed())),
-            Poll::Pending => Poll::Pending,
+        }
+        if filled > 0 {
+            Poll::Ready(Ok(filled))
+        } else {
+            Poll::Pending
         }
     }
 
@@ -139,19 +148,21 @@ mod tests {
 
     use super::*;
 
-    fn socket_with(datagram: Vec<u8>) -> (mpsc::Sender<(Vec<u8>, SocketAddr)>, PacketConnSocket) {
+    fn socket_with(datagrams: Vec<Vec<u8>>) -> (mpsc::Sender<(Vec<u8>, SocketAddr)>, PacketConnSocket) {
         let peer: SocketAddr = "198.51.100.7:9".parse().expect("a test address");
-        let (tx, rx) = mpsc::channel::<(Vec<u8>, SocketAddr)>(1);
+        let (tx, rx) = mpsc::channel::<(Vec<u8>, SocketAddr)>(4);
         let (send_tx, _send_rx) = mpsc::channel::<(Vec<u8>, SocketAddr)>(1);
         let socket =
             PacketConnSocket { local_addr: peer, send: Mutex::new(PollSender::new(send_tx)), recv: Mutex::new(rx) };
-        tx.try_send((datagram, peer)).expect("the datagram is queued");
+        for datagram in datagrams {
+            tx.try_send((datagram, peer)).expect("the datagram is queued");
+        }
         (tx, socket)
     }
 
     #[tokio::test]
     async fn a_datagram_that_fits_is_handed_to_quinn_whole() {
-        let (_tx, socket) = socket_with(vec![0xa5; 500]);
+        let (_tx, socket) = socket_with(vec![vec![0xa5; 500]]);
         let mut buf = [0u8; 1200];
         let mut bufs = [io::IoSliceMut::new(&mut buf)];
         let mut meta = [RecvMeta::default()];
@@ -164,9 +175,31 @@ mod tests {
         assert!(buf[..500].iter().all(|byte| *byte == 0xa5), "the datagram must be copied into the offered buffer");
     }
 
+    /// The dropped datagram must not stall the receive path: the next queued datagram is served by
+    /// the same poll, which is what quinn's parked driver relies on.
     #[tokio::test]
-    async fn a_datagram_larger_than_the_offered_buffer_is_dropped_not_truncated() {
-        let (_tx, socket) = socket_with(vec![0xa5; 5000]);
+    async fn an_oversized_datagram_is_dropped_and_the_next_one_is_served() {
+        let (_tx, socket) = socket_with(vec![vec![0xa5; 5000], vec![0x5a; 500]]);
+        let mut buf = [0u8; 1200];
+        let mut bufs = [io::IoSliceMut::new(&mut buf)];
+        let mut meta = [RecvMeta::default()];
+        let waker = futures::task::noop_waker();
+        let mut cx = Context::from_waker(&waker);
+
+        assert!(
+            matches!(socket.poll_recv(&mut cx, &mut bufs, &mut meta), Poll::Ready(Ok(1))),
+            "the fitting datagram behind the oversized one must be served by the same poll"
+        );
+        assert_eq!(meta[0].len, 500, "the oversized datagram must not be reported to quinn");
+        assert_eq!(meta[0].stride, 500);
+        assert!(buf[..500].iter().all(|byte| *byte == 0x5a), "the fitting datagram must be copied whole");
+        assert!(buf[500..].iter().all(|byte| *byte == 0), "no prefix of the oversized datagram may reach the buffer");
+    }
+
+    /// A datagram that cannot fit is dropped, not truncated, so nothing is delivered for it.
+    #[tokio::test]
+    async fn an_oversized_datagram_alone_delivers_nothing() {
+        let (_tx, socket) = socket_with(vec![vec![0xa5; 5000]]);
         let mut buf = [0u8; 1200];
         let mut bufs = [io::IoSliceMut::new(&mut buf)];
         let mut meta = [RecvMeta::default()];
