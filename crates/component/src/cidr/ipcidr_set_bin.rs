@@ -3,6 +3,10 @@ use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 
 use super::ipcidr_set::{addr_as16, addr_from16_unmap, ip_range_from, IpCidrSet};
 
+/// The largest range count a serialized set may declare; far past any real IP-CIDR rule set, so a
+/// larger count is a malformed payload rather than work to do.
+const MAX_RANGES: usize = 1 << 24;
+
 impl IpCidrSet {
     /// The wire format is unchanged.
     pub async fn write_bin<W: AsyncWrite + Unpin>(&self, w: &mut W) -> Result<()> {
@@ -33,9 +37,12 @@ pub async fn read_ip_cidr_set<R: AsyncRead + Unpin>(r: &mut R) -> Result<IpCidrS
     if length < 1 {
         return Err(anyhow!("length is invalid"));
     }
-    ss.rr = Vec::with_capacity(usize::try_from(length).map_err(|_| anyhow!("length is invalid"))?);
+    let count = usize::try_from(length).map_err(|_| anyhow!("length is invalid"))?;
+    if count > MAX_RANGES {
+        return Err(anyhow!("range count {count} exceeds the maximum of {MAX_RANGES}"));
+    }
     let mut a16 = [0u8; 16];
-    for _ in 0..length {
+    for _ in 0..count {
         r.read_exact(&mut a16).await?;
         let from = addr_from16_unmap(a16);
         r.read_exact(&mut a16).await?;
@@ -91,5 +98,16 @@ mod tests {
         let err = read_ip_cidr_set(&mut stream.as_slice()).await.expect_err("inverted range");
 
         assert!(err.to_string().contains("10.0.0.1-10.0.0.0"), "{err}");
+    }
+
+    #[tokio::test]
+    async fn a_stream_declaring_a_range_count_past_the_bound_is_rejected() {
+        let mut stream = Vec::new();
+        stream.write_all(&[1]).await.expect("version byte");
+        stream.write_all(&(1i64 << 40).to_be_bytes()).await.expect("count");
+
+        let err = read_ip_cidr_set(&mut stream.as_slice()).await.expect_err("implausible count");
+
+        assert!(err.to_string().contains("exceeds the maximum"), "{err}");
     }
 }
