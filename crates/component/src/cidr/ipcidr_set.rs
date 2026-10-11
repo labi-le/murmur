@@ -172,6 +172,15 @@ fn prefix_from_128_and_bits(is_v4: bool, a: u128, bits: u8) -> IpNet {
     }
 }
 
+/// Whether two ranges, one ending at `a_to` and the next starting at `b_from`, overlap or are
+/// adjacent, and therefore cover one contiguous range.
+fn ranges_touch(a_to: IpAddr, b_from: IpAddr) -> bool {
+    match addr_next(a_to) {
+        Some(next) => b_from <= next,
+        None => b_from <= a_to,
+    }
+}
+
 /// Sorts `rr` in place and yields the minimal sorted set of ranges, or
 /// `None` when an invalid range is met.
 pub(crate) fn merge_ip_ranges(rr: &mut [IpRange]) -> Option<Vec<IpRange>> {
@@ -234,11 +243,44 @@ impl IpCidrSet {
     pub fn add_ip_cidr(&mut self, ip_cidr: IpNet) -> Result<()> {
         let r = range_of_prefix(&ip_cidr);
         if r.is_valid() {
-            self.rr.push(r);
+            self.insert_range(r);
             Ok(())
         } else {
             Err(anyhow!("not valid ipcidr range: {ip_cidr}"))
         }
+    }
+
+    /// Inserts `r` in sorted position, absorbing every range it touches, so `rr` keeps the shape
+    /// `contains` binary-searches.
+    fn insert_range(&mut self, r: IpRange) {
+        let mut from = r.from;
+        let mut to = r.to;
+        let pos = self.rr.partition_point(|existing| existing.from < r.from);
+        let mut start = pos;
+        while start > 0 {
+            let Some(prev) = self.rr.get(start - 1) else {
+                break;
+            };
+            if !ranges_touch(prev.to, from) {
+                break;
+            }
+            from = prev.from;
+            to = to.max(prev.to);
+            start -= 1;
+        }
+        let mut end = pos;
+        while end < self.rr.len() {
+            let Some(next) = self.rr.get(end) else {
+                break;
+            };
+            if !ranges_touch(to, next.from) {
+                break;
+            }
+            to = to.max(next.to);
+            end += 1;
+        }
+        self.rr.drain(start..end);
+        self.rr.insert(start, ip_range_from(from, to));
     }
 
     #[must_use]
@@ -414,5 +456,48 @@ mod tests {
 
             assert_eq!(set.rr.len(), expected_len, "{name}");
         }
+    }
+
+    #[test]
+    fn ranges_added_in_descending_order_still_contain_their_addresses() {
+        let mut set = IpCidrSet::new_ip_cidr_set();
+        set.add_ip_cidr_for_string("192.168.0.0/16").expect("valid cidr");
+        set.add_ip_cidr_for_string("10.0.0.0/8").expect("valid cidr");
+
+        assert!(set.is_contain_for_string("192.168.1.1"));
+        assert!(set.is_contain_for_string("10.1.2.3"));
+        assert!(!set.is_contain_for_string("172.16.0.1"));
+    }
+
+    #[test]
+    fn a_contained_prefix_leaves_the_whole_of_the_larger_range_matching() {
+        let mut set = IpCidrSet::new_ip_cidr_set();
+        set.add_ip_cidr_for_string("10.0.0.0/23").expect("valid cidr");
+        set.add_ip_cidr_for_string("10.0.0.128/25").expect("valid cidr");
+
+        assert!(set.is_contain_for_string("10.0.1.0"));
+        assert!(set.is_contain_for_string("10.0.0.200"));
+        assert!(!set.is_contain_for_string("10.0.2.0"));
+    }
+
+    #[test]
+    fn ranges_stay_sorted_and_disjoint_across_families_and_addresses() {
+        let mut set = IpCidrSet::new_ip_cidr_set();
+        set.add_ip_cidr_for_string("2001:db8::/32").expect("valid cidr");
+        set.add_ip_cidr_for_string("10.0.0.0/8").expect("valid cidr");
+        set.add_ip_cidr_for_string("2409:8000::/20").expect("valid cidr");
+        set.add_ip_cidr_for_string("192.168.0.0/16").expect("valid cidr");
+        set.add_ip_cidr_for_string("10.128.0.0/9").expect("valid cidr");
+
+        assert!(set.is_contain_for_string("10.1.2.3"));
+        assert!(set.is_contain_for_string("10.200.0.1"));
+        assert!(set.is_contain_for_string("192.168.255.255"));
+        assert!(set.is_contain_for_string("2001:db8::1"));
+        assert!(set.is_contain_for_string("2409:8087:1e03:21::27"));
+        assert!(!set.is_contain_for_string("11.0.0.1"));
+        assert!(!set.is_contain_for_string("2001:db9::1"));
+
+        assert!(set.rr.iter().all(IpRange::is_valid));
+        assert!(set.rr.windows(2).all(|w| w[0].to < w[1].from));
     }
 }
