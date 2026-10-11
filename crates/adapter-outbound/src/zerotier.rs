@@ -845,6 +845,10 @@ impl ProxyAdapter for ZeroTier {
     clippy::future_not_send,
     reason = "run_runtime is driven by block_on on the dedicated current-thread runtime, and Node is deliberately not Send"
 )]
+#[expect(
+    clippy::cognitive_complexity,
+    reason = "the runtime's single event loop: one branch per event source, and every phase reads the wire, node, link and stack state the loop owns"
+)]
 async fn run_runtime(
     shared: Arc<ZeroTierShared>,
     host: ZeroTierHost,
