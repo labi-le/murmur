@@ -14,6 +14,7 @@ use tokio_util::sync::CancellationToken;
 use murmur_common::sockopt::reuse_common::raw_conn_reuseaddr;
 use murmur_common_net::io::{close_stream, Acceptor, Datagram, Stream};
 use murmur_common_net::split_host_port;
+use murmur_common_pool as pool;
 use murmur_component::resolver::relay::{request_udp_size, set_rcode, truncate};
 use murmur_component::resolver::service::SharedService;
 use murmur_constant::listener::InboundListenConfig;
@@ -87,26 +88,29 @@ async fn serve(server: &Server, is_udp: bool, r: &Message) -> Message {
 }
 
 async fn run_udp(server: Arc<Server>, conn: Arc<dyn Datagram>) {
-    loop {
-        let mut buf = vec![0u8; MAX_UDP_MESSAGE_SIZE];
-        match conn.recv_from(&mut buf).await {
-            Ok((n, addr)) => {
-                let server = Arc::clone(&server);
-                let conn = Arc::clone(&conn);
-                buf.truncate(n);
-                tokio::spawn(async move {
-                    let Ok(request) = Message::from_vec(&buf) else {
-                        return;
-                    };
-                    let response = serve(&server, true, &request).await;
-                    if let Ok(bytes) = response.to_vec() {
-                        let _ = conn.send_to(&bytes, addr).await;
-                    }
-                });
+    // `recv_from` fills only the front of the buffer, and each datagram is copied out below, so one
+    // buffer serves the whole connection: the per-packet 64 KiB allocate-and-zero of the moved-in
+    // buffer is gone, and the block returns to the pool when the loop ends.
+    let mut scratch = pool::get(MAX_UDP_MESSAGE_SIZE);
+    while let Ok((n, addr)) = conn.recv_from(&mut scratch).await {
+        let Some(payload) = scratch.get(..n) else {
+            errorln!("DNS server(UDP) received {n} bytes into a {MAX_UDP_MESSAGE_SIZE}-byte buffer");
+            break;
+        };
+        let request = payload.to_vec();
+        let server = Arc::clone(&server);
+        let conn = Arc::clone(&conn);
+        tokio::spawn(async move {
+            let Ok(request) = Message::from_vec(&request) else {
+                return;
+            };
+            let response = serve(&server, true, &request).await;
+            if let Ok(bytes) = response.to_vec() {
+                let _ = conn.send_to(&bytes, addr).await;
             }
-            Err(_) => break,
-        }
+        });
     }
+    let _ = pool::put(scratch);
 }
 
 // cancel-safe: the connection is owned by the caller's task, and the read timeout only ends this loop.
@@ -461,5 +465,69 @@ mod tests {
         assert_eq!(response.metadata.response_code, ResponseCode::NoError);
 
         re_create_server("", None, None);
+    }
+
+    /// A datagram socket that serves a fixed list of payloads and then fails, counting the receive
+    /// buffers that arrive freshly zeroed.
+    struct ReuseProbeDatagram {
+        pending: Mutex<std::collections::VecDeque<Vec<u8>>>,
+        fresh_buffers: Arc<AtomicUsize>,
+    }
+
+    const RECEIVE_MARKER: u8 = 0xa5;
+
+    #[async_trait::async_trait]
+    impl Datagram for ReuseProbeDatagram {
+        async fn recv_from(&self, buf: &mut [u8]) -> io::Result<(usize, SocketAddr)> {
+            let Some(datagram) = self.pending.lock().pop_front() else {
+                return Err(io::Error::new(io::ErrorKind::WouldBlock, "no datagrams left"));
+            };
+            let Some(tail) = buf.last_mut() else {
+                return Err(io::Error::new(io::ErrorKind::InvalidInput, "empty receive buffer"));
+            };
+            if *tail != RECEIVE_MARKER {
+                self.fresh_buffers.fetch_add(1, Ordering::SeqCst);
+            }
+            *tail = RECEIVE_MARKER;
+            let Some(target) = buf.get_mut(..datagram.len()) else {
+                return Err(io::Error::new(io::ErrorKind::InvalidInput, "datagram larger than the receive buffer"));
+            };
+            target.copy_from_slice(&datagram);
+
+            Ok((datagram.len(), SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 53)))
+        }
+
+        async fn send_to(&self, buf: &[u8], _addr: SocketAddr) -> io::Result<usize> {
+            Ok(buf.len())
+        }
+
+        fn local_addr(&self) -> io::Result<SocketAddr> {
+            Ok(SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 53))
+        }
+    }
+
+    /// The pre-fix loop built its receive buffer inside the loop and moved it into the per-packet
+    /// task, so every datagram paid a 64 KiB allocate-and-zero for a response under 100 bytes.
+    #[tokio::test]
+    async fn run_udp_reuses_one_receive_buffer_instead_of_allocating_per_datagram() {
+        let mut query = Message::new(7, MessageType::Query, OpCode::Query);
+        query.queries.push(hickory_proto::op::Query::query(
+            hickory_proto::rr::Name::from_utf8("example.com.").expect("name"),
+            hickory_proto::rr::RecordType::A,
+        ));
+        let datagram = query.to_vec().expect("encode query");
+        let fresh_buffers = Arc::new(AtomicUsize::new(0));
+        let conn: Arc<dyn Datagram> = Arc::new(ReuseProbeDatagram {
+            pending: Mutex::new(std::collections::VecDeque::from([datagram.clone(), datagram.clone(), datagram])),
+            fresh_buffers: Arc::clone(&fresh_buffers),
+        });
+
+        run_udp(Server::new(None), conn).await;
+
+        assert_eq!(
+            fresh_buffers.load(Ordering::SeqCst),
+            1,
+            "the receive loop allocated and zeroed a fresh buffer per datagram instead of reusing one"
+        );
     }
 }
