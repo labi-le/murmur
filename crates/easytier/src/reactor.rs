@@ -48,6 +48,9 @@ use murmur_std_compat::net::{Addr as NetAddr, Conn, Listener, PacketConn, UdpAdd
 /// guest-chosen operation ids, purely for debug-trace distinguishability.
 const FIRST_HANDLE: u64 = 1u64 << 48;
 const UDP_RECEIVE_BUFFER_LEN: usize = 65_535;
+/// The largest buffer a single guest read may ask the host to allocate, matching the one-megabyte
+/// ceilings the host ABI puts on the other guest-supplied lengths.
+pub const MAX_READ_CAPACITY: usize = 1024 * 1024;
 
 /// A resolved network address: every socket/DNS/environment result the guest can see crosses the
 /// ABI as one of these.
@@ -96,6 +99,8 @@ pub enum ReactorError {
     WouldBlock,
     #[error("no management handler is configured")]
     ManagementHandlerNotConfigured,
+    #[error("read capacity {capacity} exceeds the {max}-byte ceiling")]
+    ReadCapacityTooLarge { capacity: usize, max: usize },
     #[error(transparent)]
     Io(#[from] std::io::Error),
     #[error(transparent)]
@@ -145,6 +150,29 @@ pub struct StreamResult {
 pub struct BoundResult {
     pub handle: u64,
     pub local: Addr,
+}
+
+/// A guest-supplied read capacity that has already been checked against [`MAX_READ_CAPACITY`], so
+/// the allocation in [`Reactor::start_read`] can never be driven by a raw guest integer.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct ReadCapacity(usize);
+
+impl ReadCapacity {
+    #[must_use]
+    pub const fn get(self) -> usize {
+        self.0
+    }
+}
+
+impl TryFrom<usize> for ReadCapacity {
+    type Error = ReactorError;
+
+    fn try_from(capacity: usize) -> Result<Self, Self::Error> {
+        if capacity > MAX_READ_CAPACITY {
+            return Err(ReactorError::ReadCapacityTooLarge { capacity, max: MAX_READ_CAPACITY });
+        }
+        Ok(Self(capacity))
+    }
 }
 
 #[derive(Debug)]
@@ -497,11 +525,11 @@ impl Reactor {
 
     // ---- stream read/write (§9) ----
 
-    pub fn start_read(&self, operation: u64, handle: u64, capacity: usize) -> Result<(), ReactorError> {
+    pub fn start_read(&self, operation: u64, handle: u64, capacity: ReadCapacity) -> Result<(), ReactorError> {
         let conn = self.streams.lock().get(&handle).cloned().ok_or(ReactorError::UnknownHandle(handle))?;
         self.claim_operation(operation, OperationKind::Read, move |_cancel| async move {
             use tokio::io::AsyncReadExt;
-            let mut buf = vec![0u8; capacity];
+            let mut buf = vec![0u8; capacity.get()];
             let mut guard = conn.read.lock().await;
             let Some(half) = guard.as_mut() else { return Err(closed_stream_error()) };
             let n = half.read(&mut buf).await?;
@@ -737,6 +765,7 @@ mod tests {
     use std::time::Duration;
 
     use async_trait::async_trait;
+    use tokio::io::AsyncWriteExt;
 
     use super::*;
 
@@ -905,5 +934,86 @@ mod tests {
         assert!(matches!(reactor.emit_event(handle, "k".into(), "m".into()), Err(ReactorError::WouldBlock)));
         let (kind, message) = rx.recv().await.unwrap();
         assert_eq!((kind.as_str(), message.as_str()), ("k", "m"));
+    }
+
+    /// A `Conn` over a duplex pipe, so a test can hand the reactor a stream handle without a
+    /// socket. The addresses are dummies: nothing here dials or accepts.
+    struct FakeConn(tokio::io::DuplexStream);
+
+    impl tokio::io::AsyncRead for FakeConn {
+        fn poll_read(
+            mut self: Pin<&mut Self>,
+            cx: &mut std::task::Context<'_>,
+            buf: &mut tokio::io::ReadBuf<'_>,
+        ) -> std::task::Poll<std::io::Result<()>> {
+            Pin::new(&mut self.0).poll_read(cx, buf)
+        }
+    }
+
+    impl tokio::io::AsyncWrite for FakeConn {
+        fn poll_write(
+            mut self: Pin<&mut Self>,
+            cx: &mut std::task::Context<'_>,
+            buf: &[u8],
+        ) -> std::task::Poll<std::io::Result<usize>> {
+            Pin::new(&mut self.0).poll_write(cx, buf)
+        }
+
+        fn poll_flush(
+            mut self: Pin<&mut Self>,
+            cx: &mut std::task::Context<'_>,
+        ) -> std::task::Poll<std::io::Result<()>> {
+            Pin::new(&mut self.0).poll_flush(cx)
+        }
+
+        fn poll_shutdown(
+            mut self: Pin<&mut Self>,
+            cx: &mut std::task::Context<'_>,
+        ) -> std::task::Poll<std::io::Result<()>> {
+            Pin::new(&mut self.0).poll_shutdown(cx)
+        }
+    }
+
+    impl Conn for FakeConn {
+        fn local_addr(&self) -> std::io::Result<Box<dyn NetAddr>> {
+            Ok(Box::new(UdpAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 0)))
+        }
+
+        fn remote_addr(&self) -> std::io::Result<Box<dyn NetAddr>> {
+            Ok(Box::new(UdpAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 1)))
+        }
+
+        fn close(&self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    #[test]
+    fn a_read_capacity_past_the_ceiling_is_refused() {
+        for over in [MAX_READ_CAPACITY + 1, 1 << 30, usize::MAX] {
+            let err = ReadCapacity::try_from(over).expect_err("a read capacity past the ceiling must be refused");
+            assert!(err.to_string().contains("read capacity"), "the refusal must name the limit, got: {err}");
+        }
+        let within = ReadCapacity::try_from(MAX_READ_CAPACITY).expect("the ceiling itself is allowed");
+        assert_eq!(within.get(), MAX_READ_CAPACITY);
+    }
+
+    #[tokio::test]
+    async fn a_read_within_the_ceiling_delivers_the_bytes() {
+        let reactor = test_reactor();
+        let (stream, mut peer) = tokio::io::duplex(64);
+        peer.write_all(b"hello").await.unwrap();
+        reactor.streams.lock().insert(7, Arc::new(StreamHandle::new(Box::new(FakeConn(stream)))));
+
+        reactor.start_read(1, 7, ReadCapacity::try_from(1024).expect("within the ceiling")).unwrap();
+        tokio::time::timeout(Duration::from_secs(1), reactor.doorbell().notified()).await.expect("the read completes");
+
+        match reactor.take_read(1, 1024) {
+            Ok(TakeOutcome::Ready(read)) => {
+                assert_eq!(read.data, b"hello");
+                assert!(!read.eof);
+            }
+            other => panic!("expected Ready, got {other:?}"),
+        }
     }
 }

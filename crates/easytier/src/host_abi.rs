@@ -21,7 +21,7 @@ use wasmtime::{AsContext, AsContextMut, Caller, Extern, Linker, Memory};
 use murmur_std_compat::net::{Addr, UdpAddr};
 
 use crate::crypto::{aead_open, aead_seal, CryptoStatus};
-use crate::reactor::{Reactor, ReactorError, TakeOutcome};
+use crate::reactor::{Reactor, ReactorError, ReadCapacity, TakeOutcome};
 use crate::store::HostState;
 use crate::wire;
 
@@ -66,6 +66,7 @@ fn operation_status(error: &ReactorError) -> i32 {
         | ReactorError::UnknownOperation(_)
         | ReactorError::WrongOperationKind(..)
         | ReactorError::UnknownHandle(_)
+        | ReactorError::ReadCapacityTooLarge { .. }
         | ReactorError::ManagementHandlerNotConfigured => STATUS_INVALID,
         ReactorError::Cancelled(_) => STATUS_PENDING,
         ReactorError::WouldBlock => STATUS_WOULD_BLOCK,
@@ -81,6 +82,7 @@ fn connect_status(error: &ReactorError) -> i32 {
         | ReactorError::UnknownOperation(_)
         | ReactorError::WrongOperationKind(..)
         | ReactorError::UnknownHandle(_)
+        | ReactorError::ReadCapacityTooLarge { .. }
         | ReactorError::ManagementHandlerNotConfigured => STATUS_INVALID,
         ReactorError::Cancelled(_) => STATUS_PENDING,
         // `ErrorKind` is `#[non_exhaustive]`, so the four connect errnos are tested in order and
@@ -716,12 +718,11 @@ fn register_management_imports(linker: &mut Linker<HostState>) -> anyhow::Result
 /// The stream `read`/`write` imports.
 fn register_stream_imports(linker: &mut Linker<HostState>) -> anyhow::Result<()> {
     host_import!(linker, "start_read", |caller: Caller<'_, HostState>, handle: i64, operation: i64, capacity: i32| {
+        let Ok(capacity) = ReadCapacity::try_from(capacity.cast_unsigned() as usize) else {
+            return STATUS_INVALID;
+        };
         in_runtime(&caller.data().runtime, || {
-            caller.data().reactor.start_read(
-                operation.cast_unsigned(),
-                handle.cast_unsigned(),
-                capacity.cast_unsigned() as usize,
-            )
+            caller.data().reactor.start_read(operation.cast_unsigned(), handle.cast_unsigned(), capacity)
         })
     });
 
@@ -1092,6 +1093,7 @@ mod tests {
             STATUS_INVALID
         );
         assert_eq!(operation_status(&ReactorError::UnknownHandle(1)), STATUS_INVALID);
+        assert_eq!(operation_status(&ReactorError::ReadCapacityTooLarge { capacity: 2, max: 1 }), STATUS_INVALID);
         assert_eq!(operation_status(&ReactorError::ManagementHandlerNotConfigured), STATUS_INVALID);
         assert_eq!(operation_status(&ReactorError::Cancelled(1)), STATUS_PENDING);
         assert_eq!(operation_status(&ReactorError::WouldBlock), STATUS_WOULD_BLOCK);
