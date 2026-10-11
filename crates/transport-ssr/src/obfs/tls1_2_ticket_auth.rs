@@ -379,6 +379,8 @@ impl AsyncRead for Tls12TicketConn {
 
             let head_mac = scratch.get(33..43).unwrap_or_default();
             let head_data = scratch.get(11..33).unwrap_or_default();
+            // The peer record is its server hello, which appends a MAC over the whole record; the
+            // client hello this side writes carries only the auth MAC.
             let tail_mac = scratch.get(n - 10..n).unwrap_or_default();
             let body = scratch.get(..n - 10).unwrap_or_default();
             // The peer signed with the id it put on the wire, so verification must use that id and
@@ -466,7 +468,7 @@ fn pack_sni_data(buf: &mut BytesMut, u: &str) {
 
 #[cfg(test)]
 mod tests {
-    use std::future::{Future as _, poll_fn};
+    use std::future::{poll_fn, Future as _};
     use std::net::{IpAddr, Ipv4Addr, SocketAddr};
     use std::task::Waker;
 
