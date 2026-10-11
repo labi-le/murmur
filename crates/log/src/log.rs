@@ -1,6 +1,6 @@
 use std::fmt::Write as _;
 use std::io::{IsTerminal, Write};
-use std::sync::atomic::{AtomicI32, Ordering};
+use std::sync::atomic::{AtomicI32, AtomicUsize, Ordering};
 use std::sync::{Arc, LazyLock, OnceLock};
 
 use chrono::{Local, SecondsFormat};
@@ -54,6 +54,7 @@ pub fn fatal_line(payload: String) {
 }
 
 pub async fn subscribe() -> anyhow::Result<Subscription<Event>> {
+    SUBSCRIBERS.fetch_add(1, Ordering::SeqCst);
     let mut source = SOURCE.lock().await;
     if source.is_none() {
         let (sender, receiver) = mpsc::channel(LOG_CHANNEL_CAPACITY);
@@ -61,10 +62,18 @@ pub async fn subscribe() -> anyhow::Result<Subscription<Event>> {
         *source = Some(new_observable(receiver));
     }
     let Some(observable) = source.as_ref().cloned() else {
+        drop(source);
+        release_subscriber();
         return Err(anyhow::anyhow!("log source is not initialized"));
     };
     drop(source);
-    observable.subscribe().await
+    match observable.subscribe().await {
+        Ok(subscription) => Ok(subscription),
+        Err(err) => {
+            release_subscriber();
+            Err(err)
+        }
+    }
 }
 
 pub async fn un_subscribe(sub: Subscription<Event>) {
@@ -72,6 +81,7 @@ pub async fn un_subscribe(sub: Subscription<Event>) {
     if let Some(observable) = observable {
         observable.unsubscribe(sub).await;
     }
+    release_subscriber();
 }
 
 pub fn level() -> LogLevel {
@@ -80,6 +90,21 @@ pub fn level() -> LogLevel {
 
 pub fn set_level(new_level: LogLevel) {
     LEVEL.store(new_level.0, Ordering::SeqCst);
+}
+
+/// Whether a record at `log_level` is worth building: it passes the stdout gate, or a subscriber
+/// may still receive it through `emit`, which the `/logs` route thresholds per request.
+#[must_use]
+pub fn enabled(log_level: LogLevel) -> bool {
+    log_level >= level() || SUBSCRIBERS.load(Ordering::SeqCst) > 0
+}
+
+/// The live subscriptions. It may over-count, which only costs formatting work; it must never
+/// under-count, since a record that was never built cannot be recovered for a subscriber.
+static SUBSCRIBERS: AtomicUsize = AtomicUsize::new(0);
+
+fn release_subscriber() {
+    let _ = SUBSCRIBERS.fetch_update(Ordering::SeqCst, Ordering::SeqCst, |count| Some(count.saturating_sub(1)));
 }
 
 /// The payload has already been formatted by the caller's macro.
@@ -232,7 +257,9 @@ fn append_value(out: &mut String, value: &str) {
 #[macro_export]
 macro_rules! infoln {
     ($($arg:tt)*) => {
-        $crate::log::log_line($crate::level::LogLevel::INFO, format!($($arg)*))
+        if $crate::log::enabled($crate::level::LogLevel::INFO) {
+            $crate::log::log_line($crate::level::LogLevel::INFO, format!($($arg)*))
+        }
     };
 }
 
@@ -240,7 +267,9 @@ macro_rules! infoln {
 #[macro_export]
 macro_rules! warnln {
     ($($arg:tt)*) => {
-        $crate::log::log_line($crate::level::LogLevel::WARNING, format!($($arg)*))
+        if $crate::log::enabled($crate::level::LogLevel::WARNING) {
+            $crate::log::log_line($crate::level::LogLevel::WARNING, format!($($arg)*))
+        }
     };
 }
 
@@ -248,7 +277,9 @@ macro_rules! warnln {
 #[macro_export]
 macro_rules! errorln {
     ($($arg:tt)*) => {
-        $crate::log::log_line($crate::level::LogLevel::ERROR, format!($($arg)*))
+        if $crate::log::enabled($crate::level::LogLevel::ERROR) {
+            $crate::log::log_line($crate::level::LogLevel::ERROR, format!($($arg)*))
+        }
     };
 }
 
@@ -256,7 +287,9 @@ macro_rules! errorln {
 #[macro_export]
 macro_rules! debugln {
     ($($arg:tt)*) => {
-        $crate::log::log_line($crate::level::LogLevel::DEBUG, format!($($arg)*))
+        if $crate::log::enabled($crate::level::LogLevel::DEBUG) {
+            $crate::log::log_line($crate::level::LogLevel::DEBUG, format!($($arg)*))
+        }
     };
 }
 

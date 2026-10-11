@@ -26,4 +26,4 @@ pub mod sing;
 
 pub use self::level::{LogLevel, LOG_LEVEL_MAPPING};
 
-pub use self::log::{level, set_level, subscribe, un_subscribe, Event};
+pub use self::log::{enabled, level, set_level, subscribe, un_subscribe, Event};
