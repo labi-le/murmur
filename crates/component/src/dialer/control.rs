@@ -389,6 +389,8 @@ fn listen_family(network: &str, local: Option<IpAddr>) -> (Domain, bool) {
 /// read a kernel sysctl by name; `openbsd` reads one by numeric MIB, since it has no
 /// `sysctlbyname`. All of them fall back to the 128 that `SOMAXCONN` is on every platform this
 /// binary targets when the read fails or reports zero.
+///
+/// This is blocking I/O, so `listen_proto` reaches it through `spawn_blocking`.
 fn listener_backlog() -> i32 {
     #[cfg(any(target_os = "linux", target_os = "android"))]
     {
@@ -796,13 +798,17 @@ impl StdListenConfig {
         if let Some(control) = &self.control {
             control(ctrl_network(network, bind_addr), address.to_owned(), socket_fd(&socket)).await?;
         }
+
+        // The backlog read is file I/O and the kernel-version half is a syscall, so it stays off
+        // the reactor thread, and the one value feeds both the TFO queue and `listen`.
+        let backlog = tokio::task::spawn_blocking(listener_backlog).await?;
         #[cfg(any(target_os = "linux", target_os = "android"))]
         if !self.disable_tfo {
-            set_tfo_listener(&socket).map_err(|err| anyhow::anyhow!("setsockopt(TCP_FASTOPEN): {err}"))?;
+            set_tfo_listener(&socket, backlog).map_err(|err| anyhow::anyhow!("setsockopt(TCP_FASTOPEN): {err}"))?;
         }
 
         socket.bind(&SockAddr::from(bind_addr))?;
-        socket.listen(listener_backlog())?;
+        socket.listen(backlog)?;
 
         let listener = TcpListener::from_std(std::net::TcpListener::from(socket))?;
         Ok(Box::new(KeepAliveAcceptor::new(Box::new(TcpAcceptor::new(listener)), self.keep_alive_config)))
@@ -861,8 +867,7 @@ impl StdListenConfig {
     unsafe_code,
     reason = "`setsockopt` is a raw FFI call; the SAFETY comment below states the descriptor and buffer invariants"
 )]
-fn set_tfo_listener(socket: &Socket) -> io::Result<()> {
-    let backlog = listener_backlog();
+fn set_tfo_listener(socket: &Socket, backlog: i32) -> io::Result<()> {
     let fd = libc::c_int::try_from(socket_fd(socket))
         .map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "socket descriptor does not fit an int"))?;
     #[expect(
@@ -1246,7 +1251,7 @@ mod listener_tfo_tests {
         Arc,
     };
 
-    use super::{listener_backlog, StdListenConfig};
+    use super::{listener_backlog, set_tfo_listener, StdListenConfig};
     use socket2::{Domain, Protocol, SockAddr, Socket, Type};
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
     use tokio::time::{timeout, Duration};
@@ -1311,6 +1316,22 @@ mod listener_tfo_tests {
             timeout(Duration::from_secs(5), accepted.read_exact(&mut payload)).await.unwrap().unwrap();
             assert_eq!(&payload, b"x");
             drop(listener);
+        }
+    }
+
+    /// The TFO queue is the backlog the listen path computed once and handed over; the kernel
+    /// caps the option at `somaxconn`, which is what the process-wide read reports.
+    #[test]
+    fn set_tfo_listener_applies_the_backlog_it_is_given() {
+        let somaxconn: i32 =
+            std::fs::read_to_string("/proc/sys/net/core/somaxconn").unwrap().trim().parse().unwrap();
+
+        for backlog in [1, 7] {
+            let socket = Socket::new(Domain::IPV4, Type::STREAM, Some(Protocol::TCP)).unwrap();
+            set_tfo_listener(&socket, backlog).unwrap();
+            socket.bind(&SockAddr::from(std::net::SocketAddr::from(([127, 0, 0, 1], 0)))).unwrap();
+            socket.listen(backlog).unwrap();
+            assert_eq!(tcp_fastopen(socket.as_raw_fd()), backlog.min(somaxconn), "backlog {backlog}");
         }
     }
 }
