@@ -93,7 +93,6 @@ use murmur_constant::path::PATH;
 use murmur_dns::resolver::PARSE_NAME_SERVER;
 use murmur_log::{debugln, errorln, infoln, warnln};
 use murmur_zerotier::address::{is_ad_hoc_network_id, parse_network_id, Address};
-use murmur_zerotier::frame::Frame;
 use murmur_zerotier::identity::Identity;
 use murmur_zerotier::network_config::{NetworkConfigData, DEFAULT_NETWORK_MTU, MAX_NETWORK_MTU, MIN_NETWORK_MTU};
 use murmur_zerotier::node::{
@@ -911,11 +910,14 @@ async fn run_runtime(
         if let Some(installed) = stack.as_ref() {
             pump_stack_packets(&link, &mut node, installed, &shared);
         }
-        // What the node delivered becomes packets
-        // for the stack, in delivery order.
-        let frames = node.take_delivered_frames();
-        if let Some(installed) = stack.as_ref() {
-            pump_delivered_frames(&link, &mut node, installed, &frames, &shared);
+        // What the node delivered becomes packets for the stack, in delivery order. The take is
+        // destructive, so a tick with no stack installed reports what it could not deliver.
+        let undelivered = pump_delivered_frames(&link, &mut node, stack.as_ref(), &shared);
+        if undelivered != 0 {
+            debugln!(
+                "[ZeroTier]({}) dropping {undelivered} delivered frame(s): no IP stack is installed yet",
+                shared.outbound
+            );
         }
         // The runtime's background-task ticker.
         let maintenance = link.lock().process_background_tasks(&mut node, now);
@@ -968,16 +970,19 @@ fn pump_stack_packets(link: &Mutex<Link>, node: &mut Node, stack: &NetworkStack,
     }
 }
 
-/// What the node delivered becomes packets for the
-/// stack, in delivery order.
+/// What the node delivered becomes packets for the stack, in delivery order. Returns the frames
+/// that could not be delivered because no stack is installed.
 fn pump_delivered_frames(
     link: &Mutex<Link>,
     node: &mut Node,
-    stack: &NetworkStack,
-    frames: &[Frame],
+    stack: Option<&NetworkStack>,
     shared: &Arc<ZeroTierShared>,
-) {
-    for frame in frames {
+) -> usize {
+    let frames = node.take_delivered_frames();
+    let Some(stack) = stack else {
+        return frames.len();
+    };
+    for frame in &frames {
         let outcome = link.lock().handle_frame(node, frame, SystemTime::now());
         match outcome {
             Ok(Some(packet)) => {
@@ -990,6 +995,7 @@ fn pump_delivered_frames(
             Err(err) => debugln!("[ZeroTier]({}) process inbound frame: {err}", shared.outbound),
         }
     }
+    0
 }
 
 /// Waits no longer than [`LOOP_TICK`] past the node's next useful maintenance time.
@@ -2603,6 +2609,39 @@ mod tests {
         assert_eq!(delivered[0].source, mac_for_address(a.node.address(), SEAM_NETWORK));
         assert_eq!(delivered[0].destination, destination);
         assert_eq!(delivered[0].payload, PAYLOAD, "the payload crossed the wire intact");
+
+        let _ = std::fs::remove_dir_all(&a.state_dir);
+        let _ = std::fs::remove_dir_all(&b.state_dir);
+    }
+
+    /// Frames the node delivered while no stack is installed are real packet loss, so a tick has to
+    /// report them rather than take them out of the node and forget.
+    #[tokio::test]
+    async fn delivered_frames_without_a_stack_are_reported_instead_of_dropped_silently() {
+        const PAYLOAD: &[u8] = b"zerotier-nostack";
+        let mut a = SeamNode::new("zt-nostack-a", SEAM_NETWORK).await;
+        let mut b = SeamNode::new("zt-nostack-b", SEAM_NETWORK).await;
+        introduce(&a, &b);
+        a.node
+            .send_hello_locked(b.node.address(), b.endpoint, SystemTime::now())
+            .expect("A queues a HELLO for B's socket");
+        settle(&mut a, &mut b).await;
+
+        let destination = mac_for_address(b.node.address(), SEAM_NETWORK);
+        a.node
+            .send_frame(SEAM_NETWORK, destination, ETHER_TYPE_IPV4, PAYLOAD, SystemTime::now())
+            .expect("A's node accepts the frame for the joined network");
+        a.flush().await;
+        let (wire, source) = b.receive().await;
+        b.feed(source, &wire).expect("B accepts the datagram");
+        assert_eq!(b.node.delivered_frames().len(), 1, "B's node delivered one frame");
+
+        // The link exists with the runtime; no configuration has installed a stack device yet.
+        let link = Arc::new(Mutex::new(Link::new(SEAM_NETWORK, b.node.address()).expect("a valid network ID")));
+        let undelivered = pump_delivered_frames(&link, &mut b.node, None, &b.state);
+
+        assert_eq!(undelivered, 1, "the undelivered frame is reported so the loop can name the drop");
+        assert!(b.node.delivered_frames().is_empty(), "the drain is destructive either way");
 
         let _ = std::fs::remove_dir_all(&a.state_dir);
         let _ = std::fs::remove_dir_all(&b.state_dir);
