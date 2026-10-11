@@ -167,7 +167,9 @@ impl CertificateOfOwnership {
             && !self.issued_to.is_zero()
             && self.signed_by == controller(self.network_id)
             && controller_identity.address() == self.signed_by
-            && controller_identity.verify(&self.signed_data(), &self.signature)
+            && self
+                .signed_data()
+                .is_ok_and(|data| controller_identity.verify(&data, &self.signature))
     }
 
     /// Whether this certificate claims `mac`.
@@ -196,15 +198,18 @@ impl CertificateOfOwnership {
     }
 
     /// The fields authenticated by the controller signature.
-    #[expect(clippy::cast_possible_truncation, reason = "the claim count is a 16-bit wire field by definition")]
-    fn signed_data(&self) -> Vec<u8> {
+    fn signed_data(&self) -> Result<Vec<u8>, InvalidOwnership> {
+        if self.things.len() > MAX_OWNERSHIP_THINGS {
+            return Err(InvalidOwnership);
+        }
+        let count = u16::try_from(self.things.len()).map_err(|_| InvalidOwnership)?;
         let mut data = Vec::with_capacity(8 + 30 + self.things.len() * 17 + ADDRESS_SIZE * 2 + 2 + 8);
         data.extend_from_slice(&0x7f7f_7f7f_7f7f_7f7fu64.to_be_bytes());
         data.extend_from_slice(&self.network_id.to_be_bytes());
         data.extend_from_slice(&self.timestamp.to_be_bytes());
         data.extend_from_slice(&self.flags.to_be_bytes());
         data.extend_from_slice(&self.id.to_be_bytes());
-        data.extend_from_slice(&(self.things.len() as u16).to_be_bytes());
+        data.extend_from_slice(&count.to_be_bytes());
         for thing in &self.things {
             data.push(thing.thing_type.bits());
             data.extend_from_slice(&thing.value);
@@ -213,25 +218,25 @@ impl CertificateOfOwnership {
         data.extend_from_slice(&self.signed_by.bytes());
         data.extend_from_slice(&0u16.to_be_bytes());
         data.extend_from_slice(&0x7f7f_7f7f_7f7f_7f7fu64.to_be_bytes());
-        data
+        Ok(data)
     }
 
     /// The complete wire encoding, re-serialized from the decoded fields.
-    #[must_use]
-    #[expect(
-        clippy::cast_possible_truncation,
-        reason = "the claim count is a 16-bit wire field and the signature length field holds SIGNATURE_SIZE (96)"
-    )]
-    pub fn append_binary(&self, mut data: Vec<u8>) -> Vec<u8> {
+    pub fn append_binary(&self, mut data: Vec<u8>) -> Result<Vec<u8>, InvalidOwnership> {
         if !self.raw.is_empty() {
             data.extend_from_slice(&self.raw);
-            return data;
+            return Ok(data);
         }
+        if self.things.len() > MAX_OWNERSHIP_THINGS {
+            return Err(InvalidOwnership);
+        }
+        let count = u16::try_from(self.things.len()).map_err(|_| InvalidOwnership)?;
+        let signature_length = u16::try_from(SIGNATURE_SIZE).map_err(|_| InvalidOwnership)?;
         data.extend_from_slice(&self.network_id.to_be_bytes());
         data.extend_from_slice(&self.timestamp.to_be_bytes());
         data.extend_from_slice(&self.flags.to_be_bytes());
         data.extend_from_slice(&self.id.to_be_bytes());
-        data.extend_from_slice(&(self.things.len() as u16).to_be_bytes());
+        data.extend_from_slice(&count.to_be_bytes());
         for thing in &self.things {
             data.push(thing.thing_type.bits());
             data.extend_from_slice(&thing.value);
@@ -239,10 +244,10 @@ impl CertificateOfOwnership {
         data.extend_from_slice(&self.issued_to.bytes());
         data.extend_from_slice(&self.signed_by.bytes());
         data.push(1);
-        data.extend_from_slice(&(SIGNATURE_SIZE as u16).to_be_bytes());
+        data.extend_from_slice(&signature_length.to_be_bytes());
         data.extend_from_slice(&self.signature);
         data.extend_from_slice(&0u16.to_be_bytes());
-        data
+        Ok(data)
     }
 }
 
@@ -283,7 +288,7 @@ mod tests {
             signature: [0u8; SIGNATURE_SIZE],
             raw: Vec::new(),
         };
-        certificate.signature = controller_identity.sign(&certificate.signed_data()).expect("signs");
+        certificate.signature = controller_identity.sign(&certificate.signed_data().expect("the certificate encodes")).expect("signs");
 
         let mut raw = Vec::new();
         raw.extend_from_slice(&network_id.to_be_bytes());
@@ -357,7 +362,10 @@ mod tests {
     fn re_serialization_is_byte_stable() {
         let controller_identity = Identity::generate();
         let certificate = issue(&controller_identity, Identity::generate().address());
-        assert_eq!(certificate.append_binary(Vec::new()), certificate.bytes());
+        assert_eq!(
+            certificate.append_binary(Vec::new()).expect("the certificate encodes"),
+            certificate.bytes()
+        );
     }
 
     #[test]
@@ -372,6 +380,27 @@ mod tests {
         let mut bad_type = vec![0u8; 30 + 17 + 10 + 3 + 96 + 2];
         bad_type[30] = 0;
         assert_eq!(CertificateOfOwnership::parse(&bad_type), Err(InvalidOwnership));
+    }
+
+    /// A claim count beyond the protocol's limit must be refused, not written.
+    #[test]
+    fn more_claims_than_the_protocol_allows_are_refused_by_the_encoder() {
+        let certificate = CertificateOfOwnership {
+            network_id: 0,
+            timestamp: 0,
+            flags: 0,
+            id: 0,
+            things: vec![
+                OwnershipThing { thing_type: OwnershipThingType::Mac, value: [0u8; OWNERSHIP_VALUE_SIZE] };
+                MAX_OWNERSHIP_THINGS + 1
+            ],
+            issued_to: Address::new(1),
+            signed_by: Address::new(2),
+            signature: [0u8; SIGNATURE_SIZE],
+            raw: Vec::new(),
+        };
+
+        assert_eq!(certificate.append_binary(Vec::new()), Err(InvalidOwnership));
     }
 
     #[test]

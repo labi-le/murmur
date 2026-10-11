@@ -334,11 +334,17 @@ impl Node {
             return Ok(());
         }
         let com = config.com.as_ref().map(|certificate| certificate.bytes().to_vec());
-        let capabilities: Vec<Vec<u8>> =
-            config.capabilities.iter().map(|capability| capability.append_binary(Vec::new())).collect();
+        let capabilities = config
+            .capabilities
+            .iter()
+            .map(|capability| capability.append_binary(Vec::new()).map_err(|_| NodeError::InvalidPacket))
+            .collect::<Result<Vec<_>, _>>()?;
         let tags: Vec<Vec<u8>> = config.tags.iter().map(|tag| tag.bytes().to_vec()).collect();
-        let ownership: Vec<Vec<u8>> =
-            config.ownership.iter().map(|certificate| certificate.append_binary(Vec::new())).collect();
+        let ownership = config
+            .ownership
+            .iter()
+            .map(|certificate| certificate.append_binary(Vec::new()).map_err(|_| NodeError::InvalidPacket))
+            .collect::<Result<Vec<_>, _>>()?;
         let capacity = MAX_PACKET_SIZE - MIN_PACKET_SIZE;
         let mut send_com = com.is_some();
         let (mut capability_at, mut tag_at, mut ownership_at) = (0usize, 0usize, 0usize);

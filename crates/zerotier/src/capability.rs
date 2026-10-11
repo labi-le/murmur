@@ -148,7 +148,9 @@ impl Capability {
         {
             return (Address::new(0), false);
         }
-        let signed_data = self.signed_data();
+        let Ok(signed_data) = self.signed_data() else {
+            return (Address::new(0), false);
+        };
         for (index, custody) in self.custody.iter().enumerate() {
             let expected_from = if index == 0 {
                 controller(self.network_id)
@@ -172,38 +174,33 @@ impl Capability {
     }
 
     /// The protocol bytes authenticated by each custodian.
-    #[must_use]
-    pub fn signed_data(&self) -> Vec<u8> {
+    pub fn signed_data(&self) -> Result<Vec<u8>, InvalidCapability> {
         let mut data = Vec::with_capacity(64);
         data.extend_from_slice(&0x7f7f_7f7f_7f7f_7f7fu64.to_be_bytes());
-        data = append_capability_base(data, self);
+        data = append_capability_base(data, self)?;
         data.extend_from_slice(&0u16.to_be_bytes());
         data.extend_from_slice(&0x7f7f_7f7f_7f7f_7f7fu64.to_be_bytes());
-        data
+        Ok(data)
     }
 
     /// Appends the complete wire encoding of this capability to `data`.
-    #[must_use]
-    #[expect(
-        clippy::cast_possible_truncation,
-        reason = "the signature length field is 16 bits by definition and SIGNATURE_SIZE is 96"
-    )]
-    pub fn append_binary(&self, mut data: Vec<u8>) -> Vec<u8> {
+    pub fn append_binary(&self, mut data: Vec<u8>) -> Result<Vec<u8>, InvalidCapability> {
         if !self.raw.is_empty() {
             data.extend_from_slice(&self.raw);
-            return data;
+            return Ok(data);
         }
-        data = append_capability_base(data, self);
+        data = append_capability_base(data, self)?;
+        let signature_length = u16::try_from(SIGNATURE_SIZE).map_err(|_| InvalidCapability)?;
         for custody in &self.custody {
             data.extend_from_slice(&custody.to.bytes());
             data.extend_from_slice(&custody.from.bytes());
             data.push(1);
-            data.extend_from_slice(&(SIGNATURE_SIZE as u16).to_be_bytes());
+            data.extend_from_slice(&signature_length.to_be_bytes());
             data.extend_from_slice(&custody.signature);
         }
         data.extend_from_slice(&[0u8; ADDRESS_SIZE]);
         data.extend_from_slice(&0u16.to_be_bytes());
-        data
+        Ok(data)
     }
 
     /// The capability's own wire encoding, as decoded.
@@ -214,22 +211,22 @@ impl Capability {
 }
 
 /// Serializes the unsigned fixed fields and rule list.
-#[expect(
-    clippy::cast_possible_truncation,
-    reason = "the rule count and each rule value length are 16- and 8-bit wire fields by definition"
-)]
-fn append_capability_base(mut data: Vec<u8>, capability: &Capability) -> Vec<u8> {
+fn append_capability_base(mut data: Vec<u8>, capability: &Capability) -> Result<Vec<u8>, InvalidCapability> {
+    if capability.rules.len() > MAX_CAPABILITY_RULES {
+        return Err(InvalidCapability);
+    }
+    let rule_count = u16::try_from(capability.rules.len()).map_err(|_| InvalidCapability)?;
     data.extend_from_slice(&capability.network_id.to_be_bytes());
     data.extend_from_slice(&capability.timestamp.to_be_bytes());
     data.extend_from_slice(&capability.id.to_be_bytes());
-    data.extend_from_slice(&(capability.rules.len() as u16).to_be_bytes());
+    data.extend_from_slice(&rule_count.to_be_bytes());
     for rule in &capability.rules {
         data.push(rule.rule_type);
-        data.push(rule.value.len() as u8);
+        data.push(u8::try_from(rule.value.len()).map_err(|_| InvalidCapability)?);
         data.extend_from_slice(&rule.value);
     }
     data.push(capability.max_custody_chain_length);
-    data
+    Ok(data)
 }
 
 fn read_array<const N: usize>(data: &[u8], offset: usize) -> Result<[u8; N], InvalidCapability> {
@@ -245,7 +242,7 @@ mod tests {
     use super::*;
     use crate::dictionary::{append_dictionary_entry, append_dictionary_uint};
     use crate::network_config::parse_network_config;
-    use crate::rules::RULE_ACTION_ACCEPT;
+    use crate::rules::{RULE_ACTION_ACCEPT, RULE_MATCH_IP_PROTOCOL};
 
     /// Builds the two-link chain a controller issues through a holder, the way
     /// both signers authenticate the same capability bytes.
@@ -255,14 +252,14 @@ mod tests {
             timestamp: 1000,
             id: 5,
             rules: vec![
-                NetworkRule { rule_type: crate::rules::RULE_MATCH_IP_PROTOCOL, value: vec![6] },
+                NetworkRule { rule_type: RULE_MATCH_IP_PROTOCOL, value: vec![6] },
                 NetworkRule { rule_type: RULE_ACTION_ACCEPT, value: Vec::new() },
             ],
             max_custody_chain_length: 2,
             custody: Vec::new(),
             raw: Vec::new(),
         };
-        let signed = capability.signed_data();
+        let signed = capability.signed_data().expect("the capability encodes");
         capability.custody = vec![
             CapabilityCustody {
                 from: controller_identity.address(),
@@ -286,7 +283,7 @@ mod tests {
         let network_id = controller_identity.address().uint64() << 24 | 0x1234;
         let capability = chain(&controller_identity, &holder, &recipient, network_id);
 
-        let encoded = capability.append_binary(Vec::new());
+        let encoded = capability.append_binary(Vec::new()).expect("the capability encodes");
         let (parsed, consumed) = Capability::parse(&encoded).unwrap();
         assert_eq!(consumed, encoded.len());
 
@@ -312,7 +309,7 @@ mod tests {
         let network_id = controller_identity.address().uint64() << 24 | 0x1234;
         let mut capability = chain(&controller_identity, &holder, &recipient, network_id);
         capability.raw.clear();
-        let (parsed, _) = Capability::parse(&capability.append_binary(Vec::new())).unwrap();
+        let (parsed, _) = Capability::parse(&capability.append_binary(Vec::new()).expect("the capability encodes")).unwrap();
 
         let identity_for =
             |address: Address| (address == controller_identity.address()).then(|| controller_identity.clone());
@@ -329,10 +326,10 @@ mod tests {
         // Re-sign the first link, which only moves the failure to the network's
         // controller address rather than the signature.
         capability.custody[0].from = impostor.address();
-        let signed = capability.signed_data();
+        let signed = capability.signed_data().expect("the capability encodes");
         capability.custody[0].signature = impostor.sign(&signed).expect("impostor signs");
 
-        let (parsed, _) = Capability::parse(&capability.append_binary(Vec::new())).unwrap();
+        let (parsed, _) = Capability::parse(&capability.append_binary(Vec::new()).expect("the capability encodes")).unwrap();
         let identities = [(impostor.address(), impostor.clone()), (recipient.address(), recipient.clone())];
         let identity_for = |address: Address| {
             identities.iter().find(|(known, _)| *known == address).map(|(_, identity)| identity.clone())
@@ -348,7 +345,8 @@ mod tests {
         let controller_identity = Identity::generate();
         let network_id = controller_identity.address().uint64() << 24 | 0x1234;
         let encoded = chain(&controller_identity, &Identity::generate(), &Identity::generate(), network_id)
-            .append_binary(Vec::new());
+            .append_binary(Vec::new())
+            .expect("the capability encodes");
 
         let mut too_many_rules = encoded.clone();
         too_many_rules[20..22].copy_from_slice(&((MAX_CAPABILITY_RULES + 1) as u16).to_be_bytes());
@@ -373,6 +371,26 @@ mod tests {
         assert_eq!(Capability::parse(&truncated), Err(InvalidCapability));
     }
 
+    /// A rule value the length byte cannot carry must be refused, not truncated.
+    #[test]
+    fn a_rule_value_longer_than_a_u8_is_refused_by_the_encoder() {
+        let mut capability = Capability::default();
+        capability.max_custody_chain_length = 1;
+        capability.rules = vec![NetworkRule { rule_type: RULE_MATCH_IP_PROTOCOL, value: vec![0u8; 256] }];
+
+        assert_eq!(capability.append_binary(Vec::new()), Err(InvalidCapability));
+    }
+
+    /// A rule count beyond the protocol's limit must be refused too.
+    #[test]
+    fn more_rules_than_the_protocol_allows_are_refused_by_the_encoder() {
+        let mut capability = Capability::default();
+        capability.max_custody_chain_length = 1;
+        capability.rules = vec![NetworkRule { rule_type: RULE_ACTION_ACCEPT, value: Vec::new() }; MAX_CAPABILITY_RULES + 1];
+
+        assert_eq!(capability.append_binary(Vec::new()), Err(InvalidCapability));
+    }
+
     #[test]
     fn a_network_config_retains_and_verifies_its_capability() {
         let controller_identity = Identity::generate();
@@ -380,7 +398,7 @@ mod tests {
         let recipient = Identity::generate();
         let network_id = controller_identity.address().uint64() << 24 | 0x1234;
         let capability = chain(&controller_identity, &holder, &recipient, network_id);
-        let encoded = capability.append_binary(Vec::new());
+        let encoded = capability.append_binary(Vec::new()).expect("the capability encodes");
 
         let dictionary = append_dictionary_uint(Vec::new(), "nwid", network_id).unwrap();
         let dictionary = append_dictionary_uint(dictionary, "v", 7).unwrap();
