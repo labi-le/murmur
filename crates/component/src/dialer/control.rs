@@ -269,6 +269,15 @@ pub fn bind_quic_client_socket(bind_addr: SocketAddr) -> io::Result<std::net::Ud
 #[cfg(target_os = "linux")]
 const IPPROTO_MPTCP: i32 = 0x106;
 
+/// Whether the error from creating an `IPPROTO_MPTCP` socket is the kernel's "no MPTCP here"
+/// answer — `EPROTONOSUPPORT` or `EINVAL`; any other error means "available but currently
+/// failing". The inner `|` is an or-pattern, so errno 95 (`EOPNOTSUPP`, the two constants' bitwise
+/// OR) is *not* one of them.
+#[cfg(target_os = "linux")]
+const fn mptcp_absence_errno(errno: Option<i32>) -> bool {
+    matches!(errno, Some(libc::EPROTONOSUPPORT | libc::EINVAL))
+}
+
 /// Probes the running kernel once for MPTCP support, by attempting to create an
 /// `IPPROTO_MPTCP` socket, and caches the result. `EPROTONOSUPPORT`/`EINVAL` mean the kernel has
 /// no MPTCP support (< 5.6); any other error is treated as "available but currently failing".
@@ -278,7 +287,7 @@ fn supports_multipath_tcp() -> bool {
         let domain = if supports_ipv4() { Domain::IPV4 } else { Domain::IPV6 };
         match Socket::new(domain, Type::STREAM, Some(Protocol::from(IPPROTO_MPTCP))) {
             Ok(_) => true,
-            Err(err) => !matches!(err.raw_os_error(), Some(libc::EPROTONOSUPPORT | libc::EINVAL)),
+            Err(err) => !mptcp_absence_errno(err.raw_os_error()),
         }
     });
     *AVAILABLE
@@ -789,14 +798,14 @@ impl StdListenConfig {
         }
         #[cfg(any(target_os = "linux", target_os = "android"))]
         if !self.disable_tfo {
-            set_tfo_listener(&socket, backlog).map_err(|err| anyhow::anyhow!("setsockopt(TCP_FASTOPEN): {err}"))?;
+            set_tfo_listener(&socket).map_err(|err| anyhow::anyhow!("setsockopt(TCP_FASTOPEN): {err}"))?;
         }
 
         socket.bind(&SockAddr::from(bind_addr))?;
         socket.listen(listener_backlog())?;
 
         let listener = TcpListener::from_std(std::net::TcpListener::from(socket))?;
-        Ok(Box::new(KeepAliveAcceptor::new(Box::new(TcpAcceptor::new(listener)), self.keep_alive_config)))
+        Ok(Box::new(TcpAcceptor::new(listener)))
     }
 
     pub async fn listen_packet(
@@ -1431,3 +1440,22 @@ mod listener_backlog_freebsd_tests {
         assert_eq!(listener_backlog(), want.min(u32::from(u16::MAX)) as i32);
     }
 }
+
+#[cfg(all(test, target_os = "linux"))]
+mod mptcp_probe_tests {
+    use super::mptcp_absence_errno;
+
+    /// A kernel without MPTCP answers the probe with `EPROTONOSUPPORT` (93) and a malformed
+    /// request with `EINVAL` (22); both mean "unavailable", while their bitwise OR is 95
+    /// (`EOPNOTSUPP`), a third errno that means available.
+    #[test]
+    fn the_no_mptcp_errnos_are_unavailable_and_the_merged_value_is_not() {
+        assert!(mptcp_absence_errno(Some(libc::EPROTONOSUPPORT)));
+        assert!(mptcp_absence_errno(Some(libc::EINVAL)));
+        assert_eq!(libc::EPROTONOSUPPORT | libc::EINVAL, libc::EOPNOTSUPP);
+        assert!(!mptcp_absence_errno(Some(libc::EOPNOTSUPP)));
+        assert!(!mptcp_absence_errno(Some(libc::EACCES)));
+        assert!(!mptcp_absence_errno(None));
+    }
+}
+
