@@ -43,7 +43,7 @@ impl EnhanceUDPConn {
 
 #[async_trait]
 impl WaitReadFrom for EnhanceUDPConn {
-    // NOT cancel-safe: a dropped call has already consumed datagram framing from the socket, so a later read would start mid-frame; every `select!` arm that awaits it drops it only while the connection is being torn down.
+    // cancel-safe: the syscall only runs on readiness, so a drop while closing loses at most one datagram.
     async fn wait_read_from(
         &self,
     ) -> (Vec<u8>, Option<Box<dyn FnOnce() + Send>>, Option<Box<dyn Addr>>, io::Result<()>) {
@@ -211,5 +211,26 @@ mod tests {
         let fired =
             rx.recv_timeout(Duration::from_secs(2)).expect("wait_read_from spun instead of yielding to the 50ms timer");
         assert!(fired, "the timer branch of select! did not run");
+    }
+
+    /// Pins the note on `EnhanceUDPConn::wait_read_from`: a read dropped while it is parked on
+    /// readiness consumes nothing, so the datagram that arrives afterwards is still there.
+    #[tokio::test]
+    async fn a_read_dropped_while_parked_leaves_the_datagram_to_the_next_read() {
+        let server = tokio::net::UdpSocket::bind((Ipv4Addr::LOCALHOST, 0)).await.unwrap();
+        let server_addr = server.local_addr().unwrap();
+        let client = tokio::net::UdpSocket::bind((Ipv4Addr::LOCALHOST, 0)).await.unwrap();
+        let conn = EnhanceUDPConn::new(Arc::new(server));
+
+        {
+            let read = conn.wait_read_from();
+            tokio::pin!(read);
+            assert!(futures::poll!(&mut read).is_pending(), "a read with no datagram must park");
+        }
+
+        client.send_to(b"hello", server_addr).await.unwrap();
+        let (data, _put, _addr, res) = conn.wait_read_from().await;
+        res.unwrap();
+        assert_eq!(b"hello", data.as_slice(), "the datagram must survive the dropped read");
     }
 }

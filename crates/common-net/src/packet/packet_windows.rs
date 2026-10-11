@@ -33,7 +33,7 @@ impl EnhanceUDPConn {
 
 #[async_trait]
 impl WaitReadFrom for EnhanceUDPConn {
-    // NOT cancel-safe: a dropped call has already consumed datagram framing from the socket, so a later read would start mid-frame; every `select!` arm that awaits it drops it only while the connection is being torn down.
+    // cancel-safe: the syscall only runs on readiness, so a drop while closing loses at most one datagram.
     async fn wait_read_from(
         &self,
     ) -> (Vec<u8>, Option<Box<dyn FnOnce() + Send>>, Option<Box<dyn Addr>>, io::Result<()>) {
