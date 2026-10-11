@@ -623,11 +623,10 @@ impl ZeroTier {
     fn live_runtime_stored(&self) -> bool {
         let stopped = {
             let mut runtime = self.runtime.lock();
-            match runtime.as_ref() {
-                None => return false,
-                Some(handle) if !handle.thread.is_finished() => return true,
-                Some(_) => runtime.take(),
+            if runtime.as_ref().is_some_and(|handle| !handle.thread.is_finished()) {
+                return true;
             }
+            runtime.take()
         };
         if let Some(stopped) = stopped {
             stopped.close();
