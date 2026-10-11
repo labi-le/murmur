@@ -38,6 +38,7 @@ murmur-log = { path = "../log" }
 [dev-dependencies]
 murmur-component-ca = { path = "../component-ca" }
 murmur-component-tls = { path = "../component-tls" }
+tokio = { workspace = true, features = ["test-util"] }
 
 [features]
 no_fake_tcp = []

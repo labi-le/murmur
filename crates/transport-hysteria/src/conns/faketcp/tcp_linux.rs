@@ -99,20 +99,22 @@ fn lockflow(flow_table: &Mutex<HashMap<String, TcpFlow>>, addr: &dyn Addr, f: im
 // sweep runs.
 async fn cleaner(die: CancellationToken, flow_table: Arc<Mutex<HashMap<String, TcpFlow>>>) {
     let mut ticker = tokio::time::interval_at(Instant::now() + EXPIRE, EXPIRE);
-    tokio::select! {
-        () = die.cancelled() => {}
-        _ = ticker.tick() => {
-            let mut flows = flow_table.lock();
-            flows.retain(|_, flow| {
-                if flow.ts.elapsed() <= EXPIRE {
-                    return true;
-                }
-                if let Some(conn) = &flow.conn {
-                    let _ = set_ttl(conn, 64);
-                    let _ = close_stream(&**conn);
-                }
-                false
-            });
+    loop {
+        tokio::select! {
+            () = die.cancelled() => return,
+            _ = ticker.tick() => {
+                let mut flows = flow_table.lock();
+                flows.retain(|_, flow| {
+                    if flow.ts.elapsed() <= EXPIRE {
+                        return true;
+                    }
+                    if let Some(conn) = &flow.conn {
+                        let _ = set_ttl(conn, 64);
+                        let _ = close_stream(&**conn);
+                    }
+                    false
+                });
+            }
         }
     }
 }
@@ -1306,5 +1308,59 @@ mod iptables {
 
     const fn iptables_wait_support_second(v1: i32, v2: i32, _v3: i32) -> bool {
         v1 > 1 || (v1 == 1 && v2 >= 6)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Moves the paused clock past more than one sweep period. The first yield lets the cleaner
+    /// register its ticker, which otherwise starts counting from the already advanced clock.
+    async fn advance_past_sweeps() {
+        tokio::task::yield_now().await;
+        tokio::time::advance(EXPIRE * 3 + Duration::from_secs(1)).await;
+        tokio::task::yield_now().await;
+    }
+
+    /// The sweep runs on every elapsed period, so a flow that goes stale after an earlier sweep is
+    /// evicted too and the table does not grow past one `EXPIRE` window of entries.
+    #[tokio::test(start_paused = true)]
+    async fn cleaner_evicts_a_flow_that_expired_after_an_earlier_sweep() {
+        let flow_table = Arc::new(Mutex::new(HashMap::new()));
+        let die = CancellationToken::new();
+        let sweep = tokio::spawn(cleaner(die.clone(), Arc::clone(&flow_table)));
+
+        flow_table.lock().insert("first-peer".to_owned(), TcpFlow::new());
+        advance_past_sweeps().await;
+        assert!(flow_table.lock().is_empty(), "the first tick evicted the expired flow");
+
+        flow_table.lock().insert("second-peer".to_owned(), TcpFlow::new());
+        advance_past_sweeps().await;
+        assert!(flow_table.lock().is_empty(), "a flow that expired after the first sweep was never evicted");
+
+        die.cancel();
+        sweep.await.unwrap();
+    }
+
+    /// The reaper keeps its entry until the connection is dropped, which is what makes the sweeps
+    /// repeat rather than stop after the first one.
+    #[tokio::test(start_paused = true)]
+    async fn cleaner_keeps_sweeping_until_cancelled() {
+        let flow_table = Arc::new(Mutex::new(HashMap::new()));
+        let die = CancellationToken::new();
+        let sweep = tokio::spawn(cleaner(die.clone(), Arc::clone(&flow_table)));
+
+        for round in 0..3 {
+            flow_table.lock().insert(format!("peer-{round}"), TcpFlow::new());
+            advance_past_sweeps().await;
+            assert!(flow_table.lock().is_empty(), "sweep {round} did not evict the expired flow");
+        }
+
+        die.cancel();
+        sweep.await.unwrap();
+        flow_table.lock().insert("after-cancel".to_owned(), TcpFlow::new());
+        advance_past_sweeps().await;
+        assert_eq!(flow_table.lock().len(), 1, "a cancelled cleaner must stop sweeping");
     }
 }
