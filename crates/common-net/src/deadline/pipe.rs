@@ -109,6 +109,9 @@ impl CloseSignalWaiter {
 }
 
 /// A point in time at which the deadline fires, and the signal it fires through.
+///
+/// Dropping it cancels a timer it armed, so a dropped deadline releases its state at once rather
+/// than at the instant it was armed for.
 #[derive(Debug)]
 pub struct PipeDeadline {
     mu: Arc<Mutex<PipeDeadlineInner>>,
@@ -168,9 +171,15 @@ impl PipeDeadline {
                 inner.cancel = Arc::new(CloseSignal::new());
             }
             let cancel = Arc::clone(&inner.cancel);
-            let mu = Arc::clone(&self.mu);
+            // Weak, not a clone of the `Arc`: a timer that owned the state would keep it, and the
+            // signal it closes, alive until the armed instant even after its deadline is dropped.
+            let mu = Arc::downgrade(&self.mu);
             inner.timer = Some(tokio::spawn(async move {
                 tokio::time::sleep(until.to_std().unwrap_or(Duration::MAX)).await;
+                let Some(mu) = mu.upgrade() else {
+                    // Its deadline is gone; there is no state left to close.
+                    return;
+                };
                 let inner = mu.lock();
                 if inner.generation == generation {
                     cancel.close();
@@ -189,6 +198,17 @@ impl PipeDeadline {
     #[must_use]
     pub fn wait(&self) -> Arc<CloseSignal> {
         Arc::clone(&self.mu.lock().cancel)
+    }
+}
+
+impl Drop for PipeDeadline {
+    /// Aborts an armed timer. A `JoinHandle`'s own destructor only detaches the task, so without
+    /// this the sleeper would keep waiting for an instant nobody observes any more.
+    fn drop(&mut self) {
+        let timer = self.mu.lock().timer.take();
+        if let Some(timer) = timer {
+            timer.abort();
+        }
     }
 }
 
@@ -395,6 +415,22 @@ mod tests {
         tokio::time::timeout(Duration::from_millis(50), re_armed.wait())
             .await
             .expect_err("a disarmed deadline must not fire");
+    }
+
+    /// Dropping the last `PipeDeadline` while its timer is armed releases the deadline state at
+    /// once, not when the timer fires: the sleeping task must not keep the mutex, and the signal it
+    /// closes, alive after its owner is gone.
+    #[tokio::test]
+    async fn dropping_an_armed_deadline_releases_its_state_without_waiting_for_the_timer() {
+        let pd = make_pipe_deadline();
+        let state = Arc::downgrade(&pd.mu);
+        pd.set(Some(Utc::now() + TimeDelta::seconds(60)));
+        tokio::task::yield_now().await;
+
+        drop(pd);
+        tokio::task::yield_now().await;
+
+        assert!(state.upgrade().is_none(), "a dropped deadline must not retain its state until the armed instant");
     }
 
     /// A `set` racing an already-firing timer must win, so a re-arm is not cut short and a clear is

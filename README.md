@@ -714,6 +714,8 @@ Re-arming a fired deadline changes the signal identity and replaces the old subs
 All active waiters still wake on close; no last-waker shortcut or waiter cap is used.
 An errored/cancelled polling read may retain its last cached registration until replacement,
 reset or connection drop, but registrations no longer accumulate with operation count.
+Dropping a `PipeDeadline` aborts the timer it armed, and that timer holds the deadline state
+weakly, so neither an abandoned task nor the state outlives the last owner of the deadline.
 
 The unchanged `vless_established_pipe_16384` workload includes the compatibility pipe and peer
 drain, not just VLESS. Before the fix, the waiter deduplication scan consumed 90.70% of sampled
