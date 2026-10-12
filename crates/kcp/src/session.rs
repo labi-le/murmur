@@ -1232,6 +1232,8 @@ mod tests {
 
     #[async_trait]
     impl Datagram for PendingDatagram {
+        // cancel-safe: `pending` never resolves and holds no state, so cancelling the await inside
+        // `client_read_loop`'s `select!` arm loses nothing.
         async fn recv_from(&self, _buf: &mut [u8]) -> io::Result<(usize, SocketAddr)> {
             std::future::pending().await
         }
