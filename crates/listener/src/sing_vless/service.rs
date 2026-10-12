@@ -305,20 +305,21 @@ impl ServerConn {
     /// capacity — so the fixed header is resumed from `response_sent` across polls. Only the header
     /// is buffered: the payload is written from the caller's own `buf` once the header is on the
     /// wire, so a `Pending` never retains application bytes from a call the caller may abandon, and
-    /// a resumed write reports bytes of the buffer it was actually handed.
+    /// a resumed write reports bytes of the buffer it was actually handed. The offset is wire
+    /// state, not call state: it survives a failed poll, so a retry after a cleared write deadline
+    /// resumes the header instead of repeating the bytes already sent.
     fn poll_write_response(&mut self, cx: &mut Context<'_>, buf: &[u8]) -> Poll<io::Result<usize>> {
         while self.response_sent < RESPONSE_HEADER.len() {
             let (_, unsent) = RESPONSE_HEADER.split_at(self.response_sent);
             match Pin::new(&mut self.extended_conn).poll_write(cx, unsent) {
+                // The offset is the wire's own progress and outlives a failed poll: a caller that
+                // clears a fired write deadline and writes again must resume the header, not repeat
+                // the bytes already on the wire.
                 Poll::Ready(Ok(0)) => {
-                    self.response_sent = 0;
                     return Poll::Ready(Err(io::Error::new(io::ErrorKind::WriteZero, "vless: response write zero")));
                 }
                 Poll::Ready(Ok(sent)) => self.response_sent += sent,
-                Poll::Ready(Err(err)) => {
-                    self.response_sent = 0;
-                    return Poll::Ready(Err(err));
-                }
+                Poll::Ready(Err(err)) => return Poll::Ready(Err(err)),
                 Poll::Pending => return Poll::Pending,
             }
         }
@@ -656,6 +657,8 @@ mod tests {
         /// What `per_write` becomes once `park_on` has passed, so a test can model a send buffer
         /// that was full during the parked call and has room again on the next one.
         per_write_after_park: usize,
+        /// The poll that fails with a recoverable `TimedOut` instead of accepting anything.
+        timed_out_on: Option<usize>,
         calls: usize,
     }
 
@@ -669,6 +672,7 @@ mod tests {
                     budget,
                     park_on: None,
                     per_write_after_park: per_write,
+                    timed_out_on: None,
                     calls: 0,
                 },
                 wire,
@@ -690,6 +694,9 @@ mod tests {
             if this.park_on == Some(call) {
                 cx.waker().wake_by_ref();
                 return Poll::Pending;
+            }
+            if this.timed_out_on == Some(call) {
+                return Poll::Ready(Err(io::Error::new(io::ErrorKind::TimedOut, "the write deadline fired")));
             }
             // Calls after the park see a wider send buffer, the way a socket that refused the whole
             // frame while full accepts all of it once the peer has drained.
@@ -787,6 +794,28 @@ mod tests {
             replacement.len()
         );
         assert_eq!(*wire.lock().expect("the wire is not poisoned"), vec![vless::VERSION, 0, b'B', b'B', b'B']);
+    }
+
+    /// A recoverable write error must not lose the header bytes already on the wire: the retry
+    /// resumes from the offset instead of emitting `VERSION` a second time.
+    #[tokio::test]
+    async fn a_retry_after_a_recoverable_error_does_not_repeat_the_header() {
+        let (stream, wire) = TrickleStream::new(1, usize::MAX);
+        let stream = TrickleStream { timed_out_on: Some(1), ..stream };
+        let mut conn = ServerConn::new(new_extended_conn(stream));
+        let mut cx = Context::from_waker(std::task::Waker::noop());
+
+        let payload = [0xA1, 0xB2];
+        match Pin::new(&mut conn).poll_write(&mut cx, &payload) {
+            Poll::Ready(Err(err)) => assert_eq!(err.kind(), io::ErrorKind::TimedOut),
+            Poll::Ready(Ok(accepted)) => panic!("the failed write reported {accepted} bytes"),
+            Poll::Pending => panic!("a fired deadline is an error, not a park"),
+        }
+        assert_eq!(*wire.lock().expect("the wire is not poisoned"), vec![vless::VERSION]);
+
+        conn.write_all(&payload).await.expect("the retry writes the payload");
+
+        assert_eq!(*wire.lock().expect("the wire is not poisoned"), vec![vless::VERSION, 0, 0xA1, 0xB2]);
     }
 
     /// The header is framing, not caller data: a writer that takes the two header bytes and then
