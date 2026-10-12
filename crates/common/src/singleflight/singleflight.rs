@@ -211,19 +211,16 @@ impl<'g, T: Clone + Send + Sync + 'static> CallGuard<'g, T> {
         });
         self.published = Some(Arc::clone(&result));
 
-        if let Some(err) = result.err.as_ref() {
-            if err.is::<PanicError>() {
-                // The waiters cannot be unblocked by a result, so the panic is kept.
-                self.call.done.send_replace(Some(Arc::clone(&result)));
-                let message = err.to_string();
-                panic!("{message}");
-            }
-            if err.is::<TaskAbortedError>() {
-                self.call.done.send_replace(Some(result));
-                return self.published.clone();
-            }
+        if let Some(err) = result.err.as_ref().filter(|err| err.is::<PanicError>()) {
+            // The waiters cannot be unblocked by a result, so the panic is kept.
+            self.call.done.send_replace(Some(Arc::clone(&result)));
+            let message = err.to_string();
+            panic!("{message}");
         }
 
+        // Every other outcome, `TaskAbortedError` included, is published to the waiters on `done`
+        // and to the senders queued in `chans`, so a cancelled call reaches the callers that were
+        // already waiting on it.
         self.call.done.send_replace(Some(Arc::clone(&result)));
         for chan in self.call.chans.lock().drain(..) {
             let _ = chan.send(Result { val: result.val.clone(), err: result.err.clone(), shared });
@@ -373,6 +370,9 @@ impl<T: Clone + Send + Sync + 'static> Group<T> {
 #[cfg(test)]
 mod tests {
     use std::task::Poll;
+    use std::time::Duration;
+
+    use tokio::time::timeout;
 
     use super::*;
 
@@ -391,5 +391,70 @@ mod tests {
             Poll::Pending => panic!("the retained call left the second receiver with no sender to wake it"),
         };
         assert_eq!(got.outcome().unwrap(), 1, "the stored result answers, not the closure's");
+    }
+
+    #[tokio::test]
+    async fn aborting_a_retained_call_reaches_the_waiter_registered_before_the_abort() {
+        let Group { mu, .. } = Group::<i32>::default();
+        let group = Arc::new(Group { mu, store_result: true });
+
+        let running = {
+            let group = Arc::clone(&group);
+            tokio::spawn(async move {
+                group.do_("k", || async { std::future::pending::<anyhow::Result<i32>>().await }).await
+            })
+        };
+        // `do_` inserts the call before it awaits the closure, so the key means the guard is live.
+        while !group.mu.lock().contains_key("k") {
+            tokio::task::yield_now().await;
+        }
+
+        let attached = group.do_chan("k", || async { Ok(2) });
+        running.abort();
+        assert!(running.await.is_err_and(|err| err.is_cancelled()), "the first call is aborted, not completed");
+
+        let early = timeout(Duration::from_secs(5), attached)
+            .await
+            .expect("the abort wakes the waiter attached before it")
+            .expect("the abort result is delivered instead of the sender being dropped");
+        let err = early.err.expect("the aborted call reports an error");
+        assert!(err.is::<TaskAbortedError>(), "the attached waiter sees the abort, not another failure");
+        assert!(early.val.is_none(), "no value is stored next to the abort");
+
+        // The abort stays stored, so a caller arriving after it is answered as well.
+        let late = group.do_chan("k", || async { Ok(3) });
+        let stored = match futures::poll!(late) {
+            Poll::Ready(Ok(result)) => result,
+            Poll::Ready(Err(err)) => panic!("the later receiver was dropped without a result: {err}"),
+            Poll::Pending => panic!("the retained call left the later receiver with no sender to wake it"),
+        };
+        assert!(stored.err.is_some_and(|err| err.is::<TaskAbortedError>()), "the later waiter sees the same abort");
+        assert!(stored.val.is_none(), "no value is stored next to the abort");
+    }
+
+    #[tokio::test]
+    async fn aborting_a_call_that_is_not_retained_delivers_the_abort_to_the_waiter() {
+        let group = Arc::new(Group::<i32>::default());
+
+        let running = {
+            let group = Arc::clone(&group);
+            tokio::spawn(async move {
+                group.do_("k", || async { std::future::pending::<anyhow::Result<i32>>().await }).await
+            })
+        };
+        while !group.mu.lock().contains_key("k") {
+            tokio::task::yield_now().await;
+        }
+
+        let attached = group.do_chan("k", || async { Ok(2) });
+        running.abort();
+        assert!(running.await.is_err_and(|err| err.is_cancelled()), "the first call is aborted, not completed");
+
+        let early = timeout(Duration::from_secs(5), attached)
+            .await
+            .expect("the abort wakes the waiter attached before it")
+            .expect("the abort result is delivered instead of the sender being dropped");
+        assert!(early.err.is_some_and(|err| err.is::<TaskAbortedError>()), "the attached waiter sees the abort");
+        assert!(group.mu.lock().is_empty(), "a call that is not retained leaves the map on completion");
     }
 }

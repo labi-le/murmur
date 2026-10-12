@@ -9,7 +9,7 @@ use std::collections::HashMap;
 use std::io;
 use std::net::SocketAddr;
 use std::pin::Pin;
-use std::sync::{Arc, Mutex as StdMutex};
+use std::sync::{Arc, Mutex as StdMutex, Weak};
 use std::task::{Context, Poll, Waker};
 use std::time::{Duration, Instant};
 
@@ -351,6 +351,10 @@ struct Shared {
     postprocess_task: Mutex<Option<tokio::task::JoinHandle<()>>>,
     /// Everything else (`updater`, the client's own reader loop): safe to abort immediately,
     /// they carry no unflushed data.
+    ///
+    /// These workers hold [`Weak<Shared>`], never a strong handle: a strong one would keep the
+    /// session alive past the last [`Session`], so `Drop` could never reach its teardown and a
+    /// dropped client session would leak its socket and its tasks.
     tasks: Mutex<Vec<tokio::task::JoinHandle<()>>>,
 }
 
@@ -394,15 +398,27 @@ impl Shared {
         }
         self.wakers.wake_read();
         self.wakers.wake_write();
-        for task in self.tasks.lock().drain(..) {
-            task.abort();
-        }
+        self.abort_tasks();
         let postprocess = self.postprocess_task.lock().take();
         if let Some(task) = postprocess {
-            tokio::spawn(async move {
-                tokio::time::sleep(CLOSE_DRAIN_GRACE).await;
+            // `Drop` can run on the runtime's shutdown path, where spawning panics; aborting a
+            // task that is already stopping is a no-op.
+            if let Ok(handle) = tokio::runtime::Handle::try_current() {
+                handle.spawn(async move {
+                    tokio::time::sleep(CLOSE_DRAIN_GRACE).await;
+                    task.abort();
+                });
+            } else {
                 task.abort();
-            });
+            }
+        }
+    }
+
+    /// Aborts the workers that hold no unflushed data: what cancels them even when the last
+    /// [`Session`] handle is dropped rather than closed explicitly.
+    fn abort_tasks(&self) {
+        for task in self.tasks.lock().drain(..) {
+            task.abort();
         }
     }
 }
@@ -777,46 +793,89 @@ async fn postprocess_task(
 /// tick.
 // cancel-safe: a flush is synchronous, so a dropped sleep only delays the next one. The idle
 // check is what evicts a listener session the table's own clone would otherwise pin forever.
-async fn updater_task(shared: Arc<Shared>) {
+// The `Weak` keeps the session collectable: the task exits, rather than resurrecting it, once
+// the last `Session` handle is gone.
+async fn updater_task(weak: Weak<Shared>) {
     loop {
         let delay = {
-            let mut eng = shared.engine.lock();
-            let interval = eng.kcp.flush(crate::core::FlushType::Full);
-            let waitsnd = eng.kcp.wait_snd();
-            if waitsnd < eng.kcp.snd_wnd as usize {
-                drop(eng);
-                shared.wakers.wake_write();
+            let Some(shared) = weak.upgrade() else {
+                return;
+            };
+            let interval = {
+                let mut eng = shared.engine.lock();
+                let interval = eng.kcp.flush(crate::core::FlushType::Full);
+                let waitsnd = eng.kcp.wait_snd();
+                if waitsnd < eng.kcp.snd_wnd as usize {
+                    drop(eng);
+                    shared.wakers.wake_write();
+                }
+                interval
+            };
+            if shared.idle_expired() {
+                shared.close_now();
+                return;
+            }
+            if shared.closed.is_cancelled() {
+                return;
             }
             interval
         };
-        if shared.idle_expired() {
-            shared.close_now();
-            return;
-        }
+        // Never park holding an upgraded `Arc`: doing so would keep the session alive from the
+        // moment the last `Session` handle drops and stall its teardown indefinitely.
         tokio::select! {
             () = tokio::time::sleep(Duration::from_millis(u64::from(delay))) => {}
-            () = shared.closed.cancelled() => return,
+            () = weak_cancelled(&weak) => return,
         }
     }
+}
+
+/// Waits for the session's close token through a [`Weak`] handle, so the waiter parks without
+/// owning the session. Resolves once the session is gone, whether it closed itself or its last
+/// handle was dropped.
+// cancel-safe: `CancellationToken::cancelled` is cancel-safe, and this only ever observes the
+// token, never mutating session state.
+async fn weak_cancelled(weak: &Weak<Shared>) {
+    let Some(shared) = weak.upgrade() else {
+        return;
+    };
+    let closed = shared.closed.clone();
+    drop(shared);
+    closed.cancelled().await;
 }
 
 /// The client's own reader task (only used when this session owns its
 /// `conn` exclusively, i.e. [`new_conn4`]).
 // cancel-safe: `Datagram::recv_from` is cancel-safe, and a dropped iteration loses at most one
 // datagram, which KCP retransmits.
-async fn client_read_loop(shared: Arc<Shared>) {
+// The `Weak` keeps the session collectable: a parked `recv_from` therefore cannot hold the
+// socket open past the last `Session` handle.
+async fn client_read_loop(weak: Weak<Shared>) {
+    let Some(initial) = weak.upgrade() else {
+        return;
+    };
+    // Holding the socket itself is what keeps it open: the session's own handle is released with
+    // the session, and a parked `recv_from` on this task must not keep the session alive to do so.
+    let conn = Arc::clone(&initial.conn);
+    drop(initial);
     let mut buf = vec![0u8; crypt::MTU_LIMIT];
     loop {
+        // Never park holding an upgraded `Arc`: the session must stay collectable while this task
+        // waits for the next datagram.
         let (n, from) = tokio::select! {
-            result = shared.conn.recv_from(&mut buf) => match result {
+            result = conn.recv_from(&mut buf) => match result {
                 Ok(v) => v,
                 Err(err) => {
-                    *shared.socket_read_error.lock() = Some(err);
-                    shared.wakers.wake_read();
+                    if let Some(shared) = weak.upgrade() {
+                        *shared.socket_read_error.lock() = Some(err);
+                        shared.wakers.wake_read();
+                    }
                     return;
                 }
             },
-            () = shared.closed.cancelled() => return,
+            () = weak_cancelled(&weak) => return,
+        };
+        let Some(shared) = weak.upgrade() else {
+            return;
         };
         if from != shared.remote {
             continue;
@@ -977,7 +1036,8 @@ fn new_session(
 
     let fec_encoder = FecEncoder::new(data_shards, parity_shards, layout.fec_offset);
     let pp_task = tokio::spawn(postprocess_task(rx, sock, remote, block, fec_encoder, rate_limiter));
-    let up_task = tokio::spawn(updater_task(Arc::clone(&shared)));
+    let weak = Arc::downgrade(&shared);
+    let up_task = tokio::spawn(updater_task(weak));
     *shared.postprocess_task.lock() = Some(pp_task);
     shared.tasks.lock().push(up_task);
 
@@ -995,7 +1055,7 @@ pub fn new_conn4(
 ) -> Result<Box<dyn UdpSession>> {
     let conn: Arc<dyn Datagram> = Arc::from(conn);
     let session = new_session(convid, raddr, conn, own_conn, block, data_shards, parity_shards, None);
-    let read_task = tokio::spawn(client_read_loop(Arc::clone(&session.0)));
+    let read_task = tokio::spawn(client_read_loop(Arc::downgrade(&session.0)));
     session.0.tasks.lock().push(read_task);
     Ok(Box::new(session))
 }
@@ -1047,6 +1107,7 @@ fn new_listener(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::atomic::{AtomicUsize, Ordering};
     use tokio::io::AsyncWriteExt;
     use tokio::net::UdpSocket;
 
@@ -1158,5 +1219,66 @@ mod tests {
         session.0.close_now();
 
         assert_eq!(session_count(&listener), 0, "a teardown must remove its own entry");
+    }
+
+    /// A client socket that never yields an inbound packet, so only the teardown itself can stop
+    /// the reader task, and that records its close calls. The `alive` marker is held by the session
+    /// and by the reader's own socket clone: a `Weak` to it only dies once both released it, which
+    /// is what makes a reader that leaked while parked observable.
+    struct PendingDatagram {
+        close_calls: Arc<AtomicUsize>,
+        alive: Arc<()>,
+    }
+
+    #[async_trait]
+    impl Datagram for PendingDatagram {
+        // cancel-safe: `pending` never resolves and holds no state, so cancelling the await inside
+        // `client_read_loop`'s `select!` arm loses nothing.
+        async fn recv_from(&self, _buf: &mut [u8]) -> io::Result<(usize, SocketAddr)> {
+            std::future::pending().await
+        }
+
+        async fn send_to(&self, buf: &[u8], _addr: SocketAddr) -> io::Result<usize> {
+            Ok(buf.len())
+        }
+
+        fn local_addr(&self) -> io::Result<SocketAddr> {
+            Ok(SocketAddr::from(([127, 0, 0, 1], 9)))
+        }
+
+        fn close(&self) -> io::Result<()> {
+            self.close_calls.fetch_add(1, Ordering::SeqCst);
+            Ok(())
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn dropping_the_last_client_handle_closes_it_and_stops_its_workers() {
+        let close_calls = Arc::new(AtomicUsize::new(0));
+        let sock = Arc::new(PendingDatagram { close_calls: Arc::clone(&close_calls), alive: Arc::new(()) });
+        let alive = Arc::downgrade(&sock.alive);
+        let session_sock = Arc::clone(&sock);
+        let client =
+            new_session(0xdead_beef, SocketAddr::from(([127, 0, 0, 1], 9)), session_sock, true, None, 0, 0, None);
+        let read_task = tokio::spawn(client_read_loop(Arc::downgrade(&client.0)));
+        client.0.tasks.lock().push(read_task);
+        let weak = Arc::downgrade(&client.0);
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        assert!(weak.upgrade().is_some(), "the live session must be upgradeable");
+        drop(sock);
+
+        drop(client);
+        // Let the runtime reap the workers before asking whether anything survived the drop.
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while alive.upgrade().is_some() && Instant::now() < deadline {
+            tokio::task::yield_now().await;
+        }
+
+        assert_eq!(close_calls.load(Ordering::SeqCst), 1, "the drop must reach the teardown's close hook");
+        assert!(weak.upgrade().is_none(), "the dropped session must be collectable");
+        assert!(
+            alive.upgrade().is_none(),
+            "the reader loop must exit and release its socket clone, not stay parked on a Weak-only session"
+        );
     }
 }

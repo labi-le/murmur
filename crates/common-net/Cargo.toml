@@ -32,5 +32,9 @@ murmur-sing = { path = "../sing" }
 murmur-std-compat = { path = "../std-compat" }
 
 
+[dev-dependencies]
+tokio = { workspace = true, features = ["test-util"] }
+
+
 [lints]
 workspace = true
