@@ -494,9 +494,9 @@ impl PacketReader for ServerPacketConn {
 /// otherwise the next read decodes payload bytes as a length prefix. A conn that breaks mid-drain
 /// reports its own error rather than the short-buffer one, which would look recoverable on a
 /// stream that is gone.
-// NOT cancel-safe: a dropped drain has already consumed part of the rejected datagram, so a later
-// read would start mid-frame; `read_from` is awaited inside the deadline layer's `select!`, where a
-// cancellation tears the connection down instead of permitting another read.
+// NOT cancel-safe: a dropped drain has already taken part of the rejected datagram off the stream,
+// so the stream stays mid-frame and a caller that cancels the read must tear the connection down
+// rather than read again.
 async fn discard_payload<R>(conn: &mut R, len: usize) -> io::Result<()>
 where
     R: AsyncRead + Unpin,
