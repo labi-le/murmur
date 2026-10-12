@@ -6,9 +6,8 @@ on:
     types: [opened, reopened, ready_for_review]
 
 permissions:
-  # gh resolves the pull request over GraphQL before commenting through the issues API.
-  issues: write
-  pull-requests: read
+  # gh resolves the pull request and posts the comment through the pull requests API.
+  pull-requests: write
 
 jobs:
   request:
