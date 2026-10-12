@@ -98,8 +98,14 @@ impl PacketConn for NetPacketConn {
         self.packet_conn.close()
     }
 
+    /// The combined setter drives both halves through this wrapper: the read half reuses
+    /// [`Self::set_read_deadline`] so a combined deadline arms (or clears) the wrapper's own read
+    /// token, and the write half still forwards to the wrapped conn. Forwarding the whole call to
+    /// [`PacketConn::set_deadline`] instead left the wrapper's read token untouched, so a combined
+    /// deadline never ended a parked read and a combined clear never dropped one already armed.
     fn set_deadline(&self, deadline: Option<Instant>) -> io::Result<()> {
-        self.packet_conn.set_deadline(deadline)
+        self.packet_conn.set_write_deadline(deadline)?;
+        self.set_read_deadline(deadline)
     }
 
     fn set_write_deadline(&self, deadline: Option<Instant>) -> io::Result<()> {
@@ -199,6 +205,27 @@ mod tests {
 
         let result = tokio::time::timeout(Duration::from_secs(5), conn.read_from(&mut buf)).await;
         assert!(exceeded(&result), "the read deadline must end the read once it elapses, got {result:?}");
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn the_combined_deadline_ends_a_parked_read_like_the_read_deadline_does() {
+        let conn = new_net_packet_conn(Arc::new(NeverReadyPacketConn));
+        conn.set_deadline(Some(Instant::now() + Duration::from_millis(600))).expect("set the combined deadline");
+
+        let mut buf = [0u8; 1500];
+        let result = tokio::time::timeout(Duration::from_secs(2), conn.read_from(&mut buf)).await;
+        assert!(exceeded(&result), "the combined deadline must end the read, got {result:?}");
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn the_combined_deadline_clears_a_read_deadline_set_before_it() {
+        let conn = new_net_packet_conn(Arc::new(NeverReadyPacketConn));
+        conn.set_read_deadline(Some(Instant::now() + Duration::from_millis(200))).expect("set the read deadline");
+        conn.set_deadline(None).expect("clear the combined deadline");
+
+        let mut buf = [0u8; 1500];
+        let result = tokio::time::timeout(Duration::from_millis(500), conn.read_from(&mut buf)).await;
+        assert!(result.is_err(), "a combined clear must leave the read unbounded, got {result:?}");
     }
 
     #[tokio::test]
