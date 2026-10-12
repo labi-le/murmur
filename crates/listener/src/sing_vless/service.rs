@@ -483,9 +483,9 @@ fn deadline_exceeded() -> io::Error {
 /// write, `close` or deadline update needs.
 ///
 /// The read is raced against `deadline`, so a deadline armed after this read parked still ends it.
-/// A token `DeadlineToken::set` replaced is re-read rather than kept, so a deadline that fires and
-/// is then cleared or re-armed before this task is next polled does not end the read through the
-/// stale token; the completed read is preferred over an expired deadline, as in
+/// The read is polled before the token, and the token only decides once the read is `Pending` and
+/// the token in force is still the one that fired — so a completed read wins over an expired
+/// deadline and a token `set` replaced does not end the read through the stale one, as in
 /// `CancellableStream::poll_read`.
 ///
 /// NOT cancel-safe: `filled` is local to the polls below, so a drop mid-read loses the offset.
@@ -497,13 +497,13 @@ async fn read_bytes_exact(
     let mut read = std::pin::pin!(read_bytes_poll(conn, buf));
     loop {
         let token = deadline.token();
-        if token.is_cancelled() {
-            return Err(deadline_exceeded());
-        }
         tokio::select! {
             biased;
             result = &mut read => return result,
             () = token.cancelled() => {}
+        }
+        if deadline.token().is_cancelled() {
+            return Err(deadline_exceeded());
         }
     }
 }
@@ -562,8 +562,8 @@ async fn read_frame_exact(
 /// parked read does not hold it.
 ///
 /// The write is raced against `deadline`, so a deadline armed after this write parked still ends
-/// it, with the same token refresh [`read_bytes_exact`] does. NOT cancel-safe: `written` is local
-/// to the polls below.
+/// it, with the same poll order and token refresh [`read_bytes_exact`] uses. NOT cancel-safe:
+/// `written` is local to the polls below.
 async fn write_frame(
     conn: &parking_lot::Mutex<Box<dyn CommonExtendedConn>>,
     framed: &[u8],
@@ -572,13 +572,13 @@ async fn write_frame(
     let mut write = std::pin::pin!(write_frame_poll(conn, framed));
     loop {
         let token = deadline.token();
-        if token.is_cancelled() {
-            return Err(deadline_exceeded());
-        }
         tokio::select! {
             biased;
             result = &mut write => return result,
             () = token.cancelled() => {}
+        }
+        if deadline.token().is_cancelled() {
+            return Err(deadline_exceeded());
         }
     }
 }
@@ -859,6 +859,66 @@ mod tests {
         assert_eq!(err.kind(), io::ErrorKind::TimedOut);
     }
 
+    /// Both the network and the deadline can become ready before this task is resumed. The frame
+    /// must win: the I/O is polled before the deadline token, as in `CancellableStream::poll_read`.
+    /// The gate holds the read back so the deadline really does expire while the frame is already
+    /// waiting, and the two are armed in the same scheduling step.
+    #[tokio::test]
+    async fn a_frame_ready_beside_an_expired_deadline_is_still_delivered() {
+        let gate = Arc::new(Gate::default());
+        let (conn, mut client) = gated_packet_conn(Arc::clone(&gate)).await;
+        let conn = Arc::new(conn);
+        client.write_all(&[0x00, 0x03, b'a', b'b', b'c']).await.expect("the frame is written");
+
+        // A deadline far enough away that the parked read waits on it rather than failing.
+        conn.set_read_deadline(Some(Instant::now() + Duration::from_secs(30))).expect("the deadline is armed");
+        let reader = tokio::spawn({
+            let conn = Arc::clone(&conn);
+            async move {
+                let mut buffer = murmur_compat::sing_buf::new_packet();
+                conn.read_packet(&mut buffer).await.map(|_| buffer.bytes().to_vec())
+            }
+        });
+        for _ in 0..4 {
+            tokio::task::yield_now().await;
+        }
+
+        // Now the deadline expires and the frame becomes readable before the reader is resumed.
+        conn.set_read_deadline(Some(Instant::now() - Duration::from_millis(1))).expect("the deadline expires");
+        gate.allow_reads(64);
+
+        let read = tokio::time::timeout(Duration::from_millis(300), reader)
+            .await
+            .expect("the reader resumes")
+            .expect("the reader joins")
+            .expect("a readable frame wins over the deadline that expired while it parked");
+        assert_eq!(read.as_slice(), b"abc");
+    }
+
+    /// The write-side counterpart: the socket can take the frame while the deadline is already
+    /// expired, and the frame must still go out. A first frame establishes the socket's writability,
+    /// so the poll after it is ready on its first try and only this type's poll order decides.
+    #[tokio::test]
+    async fn a_frame_a_writable_socket_takes_beside_an_expired_deadline_is_still_written() {
+        let gate = Arc::new(Gate::default());
+        gate.allow_writes(4096);
+        let (conn, mut client) = gated_packet_conn(Arc::clone(&gate)).await;
+
+        conn.write_to(b"x", &udp_addr(&Socksaddr::default())).await.expect("the first frame is written");
+        let mut first = [0u8; 3];
+        client.read_exact(&mut first).await.expect("the peer drains it");
+        assert_eq!(first, [0x00, 0x01, b'x']);
+
+        conn.set_write_deadline(Some(Instant::now() - Duration::from_millis(1))).expect("the deadline expires");
+        conn.write_to(b"abc", &udp_addr(&Socksaddr::default()))
+            .await
+            .expect("a writable socket wins over the expired deadline");
+
+        let mut framed = [0u8; 5];
+        client.read_exact(&mut framed).await.expect("the peer receives the frame");
+        assert_eq!(framed, [0x00, 0x03, b'a', b'b', b'c']);
+    }
+
     async fn conn_carrying(frame: &[u8]) -> (Box<dyn Stream>, tokio::net::TcpStream) {
         let listener =
             tokio::net::TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).await.expect("an ephemeral port is free");
@@ -998,7 +1058,7 @@ mod tests {
     async fn overlapping_writes_do_not_splice_one_frame_into_another() {
         let gate = Arc::new(Gate::default());
         // Let the first writer take four bytes, then stall with the socket still empty.
-        gate.allow(4);
+        gate.allow_writes(4);
         let (conn, mut client) = gated_packet_conn(Arc::clone(&gate)).await;
         let conn = Arc::new(conn);
 
@@ -1030,7 +1090,7 @@ mod tests {
         assert_eq!(head, [0x00, 0x20, b'a', b'a'], "only the first frame's head may be on the wire");
         assert!(!two.is_finished(), "the second writer must wait for the first frame");
 
-        gate.allow(4096);
+        gate.allow_writes(4096);
         let mut expected = Vec::with_capacity(2 + first.len() + 2 + second.len());
         expected.extend_from_slice(&(first.len() as u16).to_be_bytes());
         expected.extend_from_slice(&first);
@@ -1047,41 +1107,66 @@ mod tests {
         two.await.expect("the second writer joins").expect("the second frame is written");
     }
 
-    /// How many bytes the next write poll may take; `usize::MAX`'s `0` default stalls every write.
+    /// How many bytes the next read and write poll may take; `usize::MAX`'s `0` default stalls both.
     #[derive(Default)]
     struct Gate {
-        budget: AtomicUsize,
-        waker: parking_lot::Mutex<Option<Waker>>,
+        read_budget: AtomicUsize,
+        write_budget: AtomicUsize,
+        reader_waker: parking_lot::Mutex<Option<Waker>>,
+        writer_waker: parking_lot::Mutex<Option<Waker>>,
     }
 
     impl Gate {
-        fn allow(&self, bytes: usize) {
-            self.budget.store(bytes, Ordering::SeqCst);
-            if let Some(waker) = self.waker.lock().take() {
+        fn allow(&self, budget: &AtomicUsize, waker: &parking_lot::Mutex<Option<Waker>>, bytes: usize) {
+            budget.store(bytes, Ordering::SeqCst);
+            if let Some(waker) = waker.lock().take() {
                 waker.wake();
             }
         }
+
+        fn allow_reads(&self, bytes: usize) {
+            self.allow(&self.read_budget, &self.reader_waker, bytes);
+        }
+
+        fn allow_writes(&self, bytes: usize) {
+            self.allow(&self.write_budget, &self.writer_waker, bytes);
+        }
     }
 
-    /// A conn whose writes stall once the gate's budget is spent, so a frame can be stopped part way
-    /// with the socket still empty — the state a second writer must not splice itself into.
-    struct GatedWrites<S> {
+    /// A conn whose reads and writes stall once their gate budgets are spent, so a frame can be
+    /// stopped part way (or held back) with the socket still empty — states the packet conn must
+    /// keep whole frames out of.
+    struct GatedStream<S> {
         inner: S,
         gate: Arc<Gate>,
     }
 
-    impl<S: AsyncRead + Unpin> AsyncRead for GatedWrites<S> {
+    impl<S: AsyncRead + Unpin> AsyncRead for GatedStream<S> {
         fn poll_read(self: Pin<&mut Self>, cx: &mut Context<'_>, buf: &mut ReadBuf<'_>) -> Poll<io::Result<()>> {
-            Pin::new(&mut self.get_mut().inner).poll_read(cx, buf)
+            let this = self.get_mut();
+            if this.gate.read_budget.load(Ordering::SeqCst) == 0 {
+                *this.gate.reader_waker.lock() = Some(cx.waker().clone());
+                return Poll::Pending;
+            }
+            let before = buf.filled().len();
+            match Pin::new(&mut this.inner).poll_read(cx, buf) {
+                Poll::Ready(Ok(())) => {
+                    let read = buf.filled().len() - before;
+                    this.gate.read_budget.fetch_sub(read, Ordering::SeqCst);
+                    Poll::Ready(Ok(()))
+                }
+                Poll::Ready(Err(err)) => Poll::Ready(Err(err)),
+                Poll::Pending => Poll::Pending,
+            }
         }
     }
 
-    impl<S: AsyncWrite + Unpin> AsyncWrite for GatedWrites<S> {
+    impl<S: AsyncWrite + Unpin> AsyncWrite for GatedStream<S> {
         fn poll_write(self: Pin<&mut Self>, cx: &mut Context<'_>, buf: &[u8]) -> Poll<io::Result<usize>> {
             let this = self.get_mut();
-            let allowed = this.gate.budget.load(Ordering::SeqCst);
+            let allowed = this.gate.write_budget.load(Ordering::SeqCst);
             if allowed == 0 {
-                *this.gate.waker.lock() = Some(cx.waker().clone());
+                *this.gate.writer_waker.lock() = Some(cx.waker().clone());
                 return Poll::Pending;
             }
             let Some(slice) = buf.get(..allowed) else {
@@ -1089,7 +1174,7 @@ mod tests {
             };
             match Pin::new(&mut this.inner).poll_write(cx, slice) {
                 Poll::Ready(Ok(n)) => {
-                    this.gate.budget.fetch_sub(n, Ordering::SeqCst);
+                    this.gate.write_budget.fetch_sub(n, Ordering::SeqCst);
                     Poll::Ready(Ok(n))
                 }
                 Poll::Ready(Err(err)) => Poll::Ready(Err(err)),
@@ -1106,7 +1191,7 @@ mod tests {
         }
     }
 
-    impl<S: Stream> Stream for GatedWrites<S> {
+    impl<S: Stream> Stream for GatedStream<S> {
         fn local_addr(&self) -> io::Result<std::net::SocketAddr> {
             self.inner.local_addr()
         }
@@ -1115,14 +1200,14 @@ mod tests {
         }
     }
 
-    /// A real TCP pair over [`GatedWrites`], so the test decides how much of each write reaches the
-    /// socket.
+    /// A real TCP pair over [`GatedStream`], so the test decides how much of each read and write
+    /// reaches the socket.
     async fn gated_packet_conn(gate: Arc<Gate>) -> (ServerPacketConn, tokio::net::TcpStream) {
         let listener =
             tokio::net::TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).await.expect("an ephemeral port is free");
         let addr = listener.local_addr().expect("the probe is bound");
         let client = tokio::net::TcpStream::connect(addr).await.expect("the client connects");
         let (server, _) = listener.accept().await.expect("the probe accepts");
-        (ServerPacketConn::new(new_extended_conn(GatedWrites { inner: server, gate }), Socksaddr::default()), client)
+        (ServerPacketConn::new(new_extended_conn(GatedStream { inner: server, gate }), Socksaddr::default()), client)
     }
 }
