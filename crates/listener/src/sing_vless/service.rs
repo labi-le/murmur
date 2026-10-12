@@ -435,6 +435,15 @@ pub struct ServerPacketConn {
     extended_conn: Arc<parking_lot::Mutex<Box<dyn CommonExtendedConn>>>,
     destination: Socksaddr,
     read_wait_options: parking_lot::Mutex<ReadWaitOptions>,
+    /// One whole frame at a time per direction.
+    ///
+    /// The conn lock above is held per poll, so it cannot keep two concurrent callers from
+    /// interleaving their frames: the first can stop half way through a frame and the second would
+    /// then write its length prefix (or read the first payload's bytes as its own prefix). These
+    /// are `tokio::sync::Mutex`es because they are deliberately held across the frame's polls, and
+    /// they are per direction so a parked reader still blocks neither a writer nor `close`.
+    read_frame_lock: tokio::sync::Mutex<()>,
+    write_frame_lock: tokio::sync::Mutex<()>,
     /// The read/write deadlines this type enforces itself.
     ///
     /// The wrapped conn is an `ExtendedConnWrapper`, whose `old_conn` is `None`, so forwarding a
@@ -474,21 +483,34 @@ fn deadline_exceeded() -> io::Error {
 /// write, `close` or deadline update needs.
 ///
 /// The read is raced against `deadline`, so a deadline armed after this read parked still ends it.
+/// A token `DeadlineToken::set` replaced is re-read rather than kept, so a deadline that fires and
+/// is then cleared or re-armed before this task is next polled does not end the read through the
+/// stale token; the completed read is preferred over an expired deadline, as in
+/// `CancellableStream::poll_read`.
 ///
-/// NOT cancel-safe: `filled` is local to this call, so a drop mid-read loses the offset.
+/// NOT cancel-safe: `filled` is local to the polls below, so a drop mid-read loses the offset.
 async fn read_bytes_exact(
     conn: &parking_lot::Mutex<Box<dyn CommonExtendedConn>>,
     buf: &mut [u8],
     deadline: &DeadlineToken,
 ) -> io::Result<()> {
-    let token = deadline.token();
-    tokio::select! {
-        result = read_bytes_poll(conn, buf) => result,
-        () = token.cancelled() => Err(deadline_exceeded()),
+    let mut read = std::pin::pin!(read_bytes_poll(conn, buf));
+    loop {
+        let token = deadline.token();
+        if token.is_cancelled() {
+            return Err(deadline_exceeded());
+        }
+        tokio::select! {
+            biased;
+            result = &mut read => return result,
+            () = token.cancelled() => {}
+        }
     }
 }
 
 /// The poll half of [`read_bytes_exact`], without the deadline race.
+// NOT cancel-safe: `filled` is local to this call, so a drop mid-read loses the offset and the
+// bytes already taken off the conn.
 async fn read_bytes_poll(conn: &parking_lot::Mutex<Box<dyn CommonExtendedConn>>, buf: &mut [u8]) -> io::Result<()> {
     let mut filled = 0;
     poll_fn(|cx| {
@@ -515,7 +537,7 @@ async fn read_bytes_poll(conn: &parking_lot::Mutex<Box<dyn CommonExtendedConn>>,
     .await
 }
 
-/// Reads exactly `size` more bytes into `buffer`'s free space.
+/// Reads exactly `size` more bytes into `buffer`, after whatever it already holds.
 ///
 /// NOT cancel-safe: `truncate` commits only after the whole block, so a drop mid-read loses bytes.
 async fn read_frame_exact(
@@ -524,6 +546,7 @@ async fn read_frame_exact(
     size: usize,
     deadline: &DeadlineToken,
 ) -> io::Result<()> {
+    let already = buffer.len();
     if buffer.free_len() < size {
         return Err(short_buffer());
     }
@@ -531,29 +554,38 @@ async fn read_frame_exact(
         return Err(short_buffer());
     };
     read_bytes_exact(conn, free, deadline).await?;
-    buffer.truncate(size);
+    buffer.truncate(already + size);
     Ok(())
 }
 
 /// Writes one length-prefixed frame, taking the conn lock fresh for each poll so a concurrently
-/// parked read does not hold it. Prefix and payload stay one `framed` unit, so a frame cannot
-/// interleave into another frame's payload.
+/// parked read does not hold it.
 ///
 /// The write is raced against `deadline`, so a deadline armed after this write parked still ends
-/// it. NOT cancel-safe: `written` is local to this call.
+/// it, with the same token refresh [`read_bytes_exact`] does. NOT cancel-safe: `written` is local
+/// to the polls below.
 async fn write_frame(
     conn: &parking_lot::Mutex<Box<dyn CommonExtendedConn>>,
     framed: &[u8],
     deadline: &DeadlineToken,
 ) -> io::Result<()> {
-    let token = deadline.token();
-    tokio::select! {
-        result = write_frame_poll(conn, framed) => result,
-        () = token.cancelled() => Err(deadline_exceeded()),
+    let mut write = std::pin::pin!(write_frame_poll(conn, framed));
+    loop {
+        let token = deadline.token();
+        if token.is_cancelled() {
+            return Err(deadline_exceeded());
+        }
+        tokio::select! {
+            biased;
+            result = &mut write => return result,
+            () = token.cancelled() => {}
+        }
     }
 }
 
 /// The poll half of [`write_frame`], without the deadline race.
+// NOT cancel-safe: `written` is local to this call, so a drop mid-frame loses the offset and
+// leaves a partial frame on the wire.
 async fn write_frame_poll(conn: &parking_lot::Mutex<Box<dyn CommonExtendedConn>>, framed: &[u8]) -> io::Result<()> {
     let mut written = 0;
     poll_fn(|cx| {
@@ -575,6 +607,7 @@ async fn write_frame_poll(conn: &parking_lot::Mutex<Box<dyn CommonExtendedConn>>
 }
 
 /// Reads the `u16` big-endian length prefix of the next frame.
+// NOT cancel-safe: inherits [`read_bytes_exact`]'s answer for the prefix bytes.
 async fn read_packet_len(
     conn: &parking_lot::Mutex<Box<dyn CommonExtendedConn>>,
     deadline: &DeadlineToken,
@@ -590,6 +623,8 @@ impl ServerPacketConn {
             extended_conn: Arc::new(parking_lot::Mutex::new(extended_conn)),
             destination,
             read_wait_options: parking_lot::Mutex::new(ReadWaitOptions::default()),
+            read_frame_lock: tokio::sync::Mutex::new(()),
+            write_frame_lock: tokio::sync::Mutex::new(()),
             read_deadline: DeadlineToken::new(),
             write_deadline: DeadlineToken::new(),
         }
@@ -606,6 +641,7 @@ impl ReadWaitable for ServerPacketConn {
 #[async_trait]
 impl PacketReadWaiter for ServerPacketConn {
     async fn wait_read_packet(&self) -> io::Result<(Buffer, Socksaddr)> {
+        let _frame = self.read_frame_lock.lock().await;
         let options = *self.read_wait_options.lock();
         let packet_len = read_packet_len(&self.extended_conn, &self.read_deadline).await?;
 
@@ -623,6 +659,7 @@ impl PacketReadWaiter for ServerPacketConn {
 #[async_trait]
 impl PacketReader for ServerPacketConn {
     async fn read_packet(&self, buffer: &mut Buffer) -> io::Result<Socksaddr> {
+        let _frame = self.read_frame_lock.lock().await;
         let packet_len = read_packet_len(&self.extended_conn, &self.read_deadline).await?;
         read_frame_exact(&self.extended_conn, buffer, packet_len, &self.read_deadline).await?;
         Ok(self.destination.clone())
@@ -632,6 +669,7 @@ impl PacketReader for ServerPacketConn {
 #[async_trait]
 impl NetPacketReader for ServerPacketConn {
     async fn read_from(&self, p: &mut [u8]) -> io::Result<(usize, Box<dyn Addr>)> {
+        let _frame = self.read_frame_lock.lock().await;
         let packet_len = read_packet_len(&self.extended_conn, &self.read_deadline).await?;
         let Some(dst) = p.get_mut(..packet_len) else {
             return Err(io::Error::other("short buffer"));
@@ -658,6 +696,7 @@ impl PacketWriter for ServerPacketConn {
         let mut framed = Vec::with_capacity(2 + buffer.len());
         framed.extend_from_slice(&len.to_be_bytes());
         framed.extend_from_slice(buffer.bytes());
+        let _frame = self.write_frame_lock.lock().await;
         write_frame(&self.extended_conn, &framed, &self.write_deadline).await
     }
 }
@@ -671,6 +710,7 @@ impl NetPacketWriter for ServerPacketConn {
         let mut framed = Vec::with_capacity(2 + p.len());
         framed.extend_from_slice(&len.to_be_bytes());
         framed.extend_from_slice(p);
+        let _frame = self.write_frame_lock.lock().await;
         write_frame(&self.extended_conn, &framed, &self.write_deadline).await?;
         Ok(p.len())
     }
@@ -712,6 +752,8 @@ impl NeedAdditionalReadDeadline for ServerPacketConn {
 #[cfg(test)]
 mod tests {
     use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::task::Waker;
     use std::time::Duration;
 
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -855,5 +897,232 @@ mod tests {
             read_addr_port(&mut *server).await.expect("0x03 is ipv6"),
             Socksaddr::from_ip(IpAddr::V6(Ipv6Addr::LOCALHOST), 53)
         );
+    }
+
+    /// A frame read appends after whatever the buffer already holds, the way the
+    /// `Buffer::read_full_from` it replaced did.
+    #[tokio::test]
+    async fn a_frame_read_appends_after_the_bytes_the_buffer_already_holds() {
+        let (conn, mut client) = packet_conn_carrying().await;
+        let mut buffer = murmur_compat::sing_buf::new_packet();
+        buffer.write_bytes(b"prefix").expect("the buffer takes the prefix");
+        client.write_all(&[0x00, 0x03, b'a', b'b', b'c']).await.expect("the frame is written");
+
+        conn.read_packet(&mut buffer).await.expect("the frame is read");
+
+        assert_eq!(buffer.bytes(), b"prefixabc");
+    }
+
+    /// Two overlapping reads must not mix frames: the first can stop after the length prefix and
+    /// part of its payload, and the second must wait for that frame rather than read the rest of its
+    /// payload as a prefix of its own.
+    #[tokio::test]
+    async fn overlapping_reads_do_not_mix_frames() {
+        let (conn, mut client) = packet_conn_carrying().await;
+        let conn = Arc::new(conn);
+
+        // A ten-byte frame with only three bytes of its payload sent yet.
+        client.write_all(&[0x00, 0x0A, b'a', b'a', b'a']).await.expect("the first frame's head is written");
+        let first = tokio::spawn({
+            let conn = Arc::clone(&conn);
+            async move {
+                let mut buffer = murmur_compat::sing_buf::new_packet();
+                conn.read_packet(&mut buffer).await.map(|_| buffer.bytes().to_vec())
+            }
+        });
+        for _ in 0..4 {
+            tokio::task::yield_now().await;
+        }
+        let second = tokio::spawn({
+            let conn = Arc::clone(&conn);
+            async move {
+                let mut buffer = murmur_compat::sing_buf::new_packet();
+                conn.read_packet(&mut buffer).await.map(|_| buffer.bytes().to_vec())
+            }
+        });
+        for _ in 0..4 {
+            tokio::task::yield_now().await;
+        }
+
+        // The rest of the first payload, then a complete second frame.
+        client
+            .write_all(&[b'a', b'a', b'a', b'a', b'a', b'a', b'a', 0x00, 0x04, b'b', b'b', b'b', b'b'])
+            .await
+            .expect("the rest of the stream is written");
+
+        let first = tokio::time::timeout(Duration::from_secs(1), first)
+            .await
+            .expect("the first frame completes")
+            .expect("the first reader joins")
+            .expect("the first frame is read");
+        assert_eq!(first.as_slice(), b"aaaaaaaaaa", "the second reader took the first payload's bytes");
+
+        let second = tokio::time::timeout(Duration::from_secs(1), second)
+            .await
+            .expect("the second frame completes")
+            .expect("the second reader joins")
+            .expect("the second frame is read");
+        assert_eq!(second.as_slice(), b"bbbb");
+    }
+
+    /// An expired deadline that is re-armed before the parked read is polled again must not end that
+    /// read through the token it replaced.
+    #[tokio::test]
+    async fn a_deadline_re_armed_before_the_parked_read_is_polled_again_does_not_end_it() {
+        let (conn, _client) = packet_conn_carrying().await;
+        let conn = Arc::new(conn);
+
+        let mut reader = tokio::spawn({
+            let conn = Arc::clone(&conn);
+            async move { conn.read_packet(&mut Buffer::default()).await }
+        });
+        for _ in 0..4 {
+            tokio::task::yield_now().await;
+        }
+
+        // An already-expired deadline cancels the token the parked read waits on; the re-arm below
+        // swaps in a fresh one before that read is next polled.
+        conn.set_read_deadline(Some(Instant::now() - Duration::from_millis(1))).expect("the expired deadline is set");
+        conn.set_read_deadline(Some(Instant::now() + Duration::from_secs(30))).expect("the deadline is re-armed");
+
+        let ended = tokio::time::timeout(Duration::from_millis(200), &mut reader).await;
+        assert!(ended.is_err(), "the read must wait on the re-armed deadline, not report the replaced token");
+
+        reader.abort();
+    }
+
+    /// Two overlapping writes must not splice one frame into another: the first can stop part way
+    /// through a frame, and the second must wait for that frame instead of writing its prefix into
+    /// the payload.
+    #[tokio::test]
+    async fn overlapping_writes_do_not_splice_one_frame_into_another() {
+        let gate = Arc::new(Gate::default());
+        // Let the first writer take four bytes, then stall with the socket still empty.
+        gate.allow(4);
+        let (conn, mut client) = gated_packet_conn(Arc::clone(&gate)).await;
+        let conn = Arc::new(conn);
+
+        let first = vec![b'a'; 32];
+        let second = vec![b'b'; 8];
+        let one = tokio::spawn({
+            let conn = Arc::clone(&conn);
+            let first = first.clone();
+            async move { conn.write_to(&first, &udp_addr(&Socksaddr::default())).await }
+        });
+        for _ in 0..8 {
+            tokio::task::yield_now().await;
+        }
+        let two = tokio::spawn({
+            let conn = Arc::clone(&conn);
+            let second = second.clone();
+            async move { conn.write_to(&second, &udp_addr(&Socksaddr::default())).await }
+        });
+        for _ in 0..4 {
+            tokio::task::yield_now().await;
+        }
+
+        // Only the first frame's first four bytes may be on the wire so far.
+        let mut head = [0u8; 4];
+        tokio::time::timeout(Duration::from_millis(200), client.read_exact(&mut head))
+            .await
+            .expect("the first four bytes are written")
+            .expect("the peer reads them");
+        assert_eq!(head, [0x00, 0x20, b'a', b'a'], "only the first frame's head may be on the wire");
+        assert!(!two.is_finished(), "the second writer must wait for the first frame");
+
+        gate.allow(4096);
+        let mut expected = Vec::with_capacity(2 + first.len() + 2 + second.len());
+        expected.extend_from_slice(&(first.len() as u16).to_be_bytes());
+        expected.extend_from_slice(&first);
+        expected.extend_from_slice(&(second.len() as u16).to_be_bytes());
+        expected.extend_from_slice(&second);
+        let mut rest = vec![0u8; expected.len() - head.len()];
+        tokio::time::timeout(Duration::from_secs(5), client.read_exact(&mut rest))
+            .await
+            .expect("both frames reach the peer")
+            .expect("the peer reads the whole stream");
+        assert_eq!(rest, expected[head.len()..], "a frame was spliced into another frame's payload");
+
+        one.await.expect("the first writer joins").expect("the first frame is written");
+        two.await.expect("the second writer joins").expect("the second frame is written");
+    }
+
+    /// How many bytes the next write poll may take; `usize::MAX`'s `0` default stalls every write.
+    #[derive(Default)]
+    struct Gate {
+        budget: AtomicUsize,
+        waker: parking_lot::Mutex<Option<Waker>>,
+    }
+
+    impl Gate {
+        fn allow(&self, bytes: usize) {
+            self.budget.store(bytes, Ordering::SeqCst);
+            if let Some(waker) = self.waker.lock().take() {
+                waker.wake();
+            }
+        }
+    }
+
+    /// A conn whose writes stall once the gate's budget is spent, so a frame can be stopped part way
+    /// with the socket still empty — the state a second writer must not splice itself into.
+    struct GatedWrites<S> {
+        inner: S,
+        gate: Arc<Gate>,
+    }
+
+    impl<S: AsyncRead + Unpin> AsyncRead for GatedWrites<S> {
+        fn poll_read(self: Pin<&mut Self>, cx: &mut Context<'_>, buf: &mut ReadBuf<'_>) -> Poll<io::Result<()>> {
+            Pin::new(&mut self.get_mut().inner).poll_read(cx, buf)
+        }
+    }
+
+    impl<S: AsyncWrite + Unpin> AsyncWrite for GatedWrites<S> {
+        fn poll_write(self: Pin<&mut Self>, cx: &mut Context<'_>, buf: &[u8]) -> Poll<io::Result<usize>> {
+            let this = self.get_mut();
+            let allowed = this.gate.budget.load(Ordering::SeqCst);
+            if allowed == 0 {
+                *this.gate.waker.lock() = Some(cx.waker().clone());
+                return Poll::Pending;
+            }
+            let Some(slice) = buf.get(..allowed) else {
+                return Pin::new(&mut this.inner).poll_write(cx, buf);
+            };
+            match Pin::new(&mut this.inner).poll_write(cx, slice) {
+                Poll::Ready(Ok(n)) => {
+                    this.gate.budget.fetch_sub(n, Ordering::SeqCst);
+                    Poll::Ready(Ok(n))
+                }
+                Poll::Ready(Err(err)) => Poll::Ready(Err(err)),
+                Poll::Pending => Poll::Pending,
+            }
+        }
+
+        fn poll_flush(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+            Pin::new(&mut self.get_mut().inner).poll_flush(cx)
+        }
+
+        fn poll_shutdown(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+            Pin::new(&mut self.get_mut().inner).poll_shutdown(cx)
+        }
+    }
+
+    impl<S: Stream> Stream for GatedWrites<S> {
+        fn local_addr(&self) -> io::Result<std::net::SocketAddr> {
+            self.inner.local_addr()
+        }
+        fn peer_addr(&self) -> io::Result<std::net::SocketAddr> {
+            self.inner.peer_addr()
+        }
+    }
+
+    /// A real TCP pair over [`GatedWrites`], so the test decides how much of each write reaches the
+    /// socket.
+    async fn gated_packet_conn(gate: Arc<Gate>) -> (ServerPacketConn, tokio::net::TcpStream) {
+        let listener =
+            tokio::net::TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).await.expect("an ephemeral port is free");
+        let addr = listener.local_addr().expect("the probe is bound");
+        let client = tokio::net::TcpStream::connect(addr).await.expect("the client connects");
+        let (server, _) = listener.accept().await.expect("the probe accepts");
+        (ServerPacketConn::new(new_extended_conn(GatedWrites { inner: server, gate }), Socksaddr::default()), client)
     }
 }
