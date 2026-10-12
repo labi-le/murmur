@@ -1,0 +1,22 @@
+name: Codex review
+
+# Codex reacts to an "@codex review" comment and to nothing else a repository can
+# trigger; the automatic-review toggle lives in the Codex account settings.
+on:
+  pull_request:
+    types: [opened, reopened, ready_for_review]
+
+permissions:
+  issues: write
+  pull-requests: write
+
+jobs:
+  request:
+    name: Request a review
+    runs-on: ubuntu-latest
+    steps:
+      - name: Comment "@codex review"
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          PR: ${{ github.event.pull_request.number }}
+        run: gh pr comment "$PR" --repo "$GITHUB_REPOSITORY" --body '@codex review'
