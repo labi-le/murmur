@@ -20,7 +20,7 @@ use std::task::{Context, Poll};
 use std::time::Duration;
 
 use anyhow::{bail, Result};
-use bytes::Bytes;
+use bytes::{Bytes, BytesMut};
 use parking_lot::Mutex;
 use rand::Rng;
 use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
@@ -32,7 +32,9 @@ use murmur_std_compat::net::{Conn, PacketConn};
 use crate::obfs::Obfs;
 use crate::packet::{QuicDatagrams, UdpPacketConn};
 use crate::protocol::{self, AuthRequest, UdpMessage};
-use crate::quic::{transport_config, CongestionOption, PacketConnSocket, QuicConfig, QuicConn, QuicStream};
+use crate::quic::{
+    poll_write_header, transport_config, CongestionOption, PacketConnSocket, QuicConfig, QuicConn, QuicStream,
+};
 
 const MIN_HOP_INTERVAL: Duration = Duration::from_secs(5);
 const DEFAULT_HOP_INTERVAL: Duration = Duration::from_secs(30);
@@ -413,8 +415,13 @@ pub fn next_hop_interval(start: Duration, max: Duration) -> Duration {
 /// withholds the payload until the peer's verdict has been read.
 #[derive(Debug)]
 pub struct ClientStream {
-    stream: QuicStream,
+    /// `Conn::close` takes `&self` and still has to reset a send half holding a header prefix, so the
+    /// stream sits behind a mutex; every poll path reaches it through `get_mut` and never locks.
+    stream: Mutex<QuicStream>,
     destination: String,
+    /// The request header while any of it is still on its way to the peer; `None` before the first
+    /// write builds it and after the send half has taken every byte of it.
+    request_header: Option<BytesMut>,
     request_written: bool,
     response_read: bool,
     prefix: Vec<u8>,
@@ -422,7 +429,32 @@ pub struct ClientStream {
 
 impl ClientStream {
     fn new(stream: QuicStream, destination: String) -> Self {
-        Self { stream, destination, request_written: false, response_read: false, prefix: Vec::new() }
+        Self {
+            stream: Mutex::new(stream),
+            destination,
+            request_header: None,
+            request_written: false,
+            response_read: false,
+            prefix: Vec::new(),
+        }
+    }
+
+    /// Hands whatever is left of the request header to the send half, keeping the tail a short
+    /// accept left over for the poll that follows. Nothing is built here: an absent header means the
+    /// first write has not been polled yet, so a flush or a shutdown before it still sends nothing.
+    fn poll_request_header(&mut self, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+        let Some(header) = self.request_header.as_mut() else {
+            return Poll::Ready(Ok(()));
+        };
+        match poll_write_header(&mut self.stream.get_mut().send, cx, header) {
+            Poll::Ready(Ok(())) => {
+                self.request_written = true;
+                self.request_header = None;
+                Poll::Ready(Ok(()))
+            }
+            Poll::Ready(Err(err)) => Poll::Ready(Err(err)),
+            Poll::Pending => Poll::Pending,
+        }
     }
 
     /// Consumes the response header out of `prefix`, growing it from the stream until it parses.
@@ -448,7 +480,7 @@ impl ClientStream {
                 Err(_) => {
                     let mut scratch = [0u8; 512];
                     let mut read_buf = ReadBuf::new(&mut scratch);
-                    match AsyncRead::poll_read(Pin::new(&mut self.stream.recv), cx, &mut read_buf) {
+                    match AsyncRead::poll_read(Pin::new(&mut self.stream.get_mut().recv), cx, &mut read_buf) {
                         Poll::Ready(Ok(())) => {
                             let filled = read_buf.filled();
                             if filled.is_empty() {
@@ -483,37 +515,48 @@ impl AsyncRead for ClientStream {
             self.prefix.drain(..len);
             return Poll::Ready(Ok(()));
         }
-        AsyncRead::poll_read(Pin::new(&mut self.stream.recv), cx, buf)
+        AsyncRead::poll_read(Pin::new(&mut self.stream.get_mut().recv), cx, buf)
     }
 }
 
 impl AsyncWrite for ClientStream {
     fn poll_write(mut self: Pin<&mut Self>, cx: &mut Context<'_>, buf: &[u8]) -> Poll<io::Result<usize>> {
-        if !self.request_written {
-            let frame = protocol::write_tcp_request(&self.destination, buf);
-            let frame_len = frame.len();
-            return match AsyncWrite::poll_write(Pin::new(&mut self.stream.send), cx, &frame) {
-                Poll::Ready(Ok(written)) if written == frame_len => {
-                    self.request_written = true;
-                    Poll::Ready(Ok(buf.len()))
-                }
-                Poll::Ready(Ok(_)) => {
-                    Poll::Ready(Err(io::Error::other("hysteria2: short write of the stream request")))
-                }
-                Poll::Ready(Err(err)) => Poll::Ready(Err(err)),
-                // Nothing was accepted, so the header still has to go out on the next poll.
-                Poll::Pending => Poll::Pending,
-            };
+        let this = self.as_mut().get_mut();
+        if !this.request_written {
+            if this.request_header.is_none() {
+                this.request_header = Some(protocol::write_tcp_request_header(&this.destination));
+            }
+            // The header goes out whole before any payload byte can follow it; a window too small for
+            // it leaves the tail here for the next poll instead of failing the write.
+            match this.poll_request_header(cx) {
+                Poll::Ready(Ok(())) => {}
+                Poll::Ready(Err(err)) => return Poll::Ready(Err(err)),
+                Poll::Pending => return Poll::Pending,
+            }
         }
-        AsyncWrite::poll_write(Pin::new(&mut self.stream.send), cx, buf)
+        AsyncWrite::poll_write(Pin::new(&mut this.stream.get_mut().send), cx, buf)
     }
 
     fn poll_flush(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
-        AsyncWrite::poll_flush(Pin::new(&mut self.stream.send), cx)
+        let this = self.as_mut().get_mut();
+        // A flush cannot report success while a header the send half only partly took is still here.
+        match this.poll_request_header(cx) {
+            Poll::Ready(Ok(())) => {}
+            Poll::Ready(Err(err)) => return Poll::Ready(Err(err)),
+            Poll::Pending => return Poll::Pending,
+        }
+        AsyncWrite::poll_flush(Pin::new(&mut this.stream.get_mut().send), cx)
     }
 
     fn poll_shutdown(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
-        AsyncWrite::poll_shutdown(Pin::new(&mut self.stream.send), cx)
+        let this = self.as_mut().get_mut();
+        // The FIN may only follow a complete header, never a truncated one.
+        match this.poll_request_header(cx) {
+            Poll::Ready(Ok(())) => {}
+            Poll::Ready(Err(err)) => return Poll::Ready(Err(err)),
+            Poll::Pending => return Poll::Pending,
+        }
+        AsyncWrite::poll_shutdown(Pin::new(&mut this.stream.get_mut().send), cx)
     }
 }
 
@@ -560,8 +603,16 @@ impl Conn for ClientStream {
     }
 
     fn close(&self) -> io::Result<()> {
-        self.stream.send_stop();
-        Ok(())
+        let mut stream = self.stream.lock();
+        stream.cancel_read();
+        if self.request_header.is_some() {
+            // A request header the send half only took a prefix of cannot be completed from here, and
+            // the finish quinn performs when the stream is dropped would present the truncated header
+            // to the peer as the whole request.
+            stream.reset();
+            return Ok(());
+        }
+        stream.finish()
     }
 }
 
@@ -574,6 +625,7 @@ mod tests {
     use base64::Engine as _;
     use murmur_component_ca::keypair::{new_random_tls_key_pair, KeyPairType};
     use rustls::pki_types::{CertificateDer, PrivateKeyDer, PrivatePkcs8KeyDer};
+    use tokio::io::AsyncWriteExt;
 
     use super::*;
 
@@ -887,5 +939,165 @@ mod tests {
             "a zero receive window leaves the first write unaccepted"
         );
         assert!(!stream.request_written, "nothing was accepted, so the next poll still has to send the request");
+    }
+
+    /// A raw quinn pair whose server advertises `stream_window` as its stream receive window, so a
+    /// first write can only be accepted a prefix at a time. The endpoints have to outlive the
+    /// connection, which is why the caller keeps this alive for the whole test body.
+    struct RawPair {
+        _server_endpoint: quinn::Endpoint,
+        _client_endpoint: quinn::Endpoint,
+        connection: quinn::Connection,
+        server_connection: quinn::Connection,
+    }
+
+    async fn raw_pair(stream_window: u32) -> RawPair {
+        let mut transport = quinn::TransportConfig::default();
+        transport.stream_receive_window(quinn::VarInt::from_u32(stream_window));
+        let crypto =
+            quinn::crypto::rustls::QuicServerConfig::try_from((*server_tls()).clone()).expect("quinn takes the config");
+        let mut server_config = quinn::ServerConfig::with_crypto(Arc::new(crypto));
+        server_config.transport_config(Arc::new(transport));
+        let server_endpoint = quinn::Endpoint::server(server_config, "127.0.0.1:0".parse().expect("loopback address"))
+            .expect("bind the server endpoint");
+        let addr = server_endpoint.local_addr().expect("the endpoint has a local address");
+
+        let client_endpoint = quinn::Endpoint::client("127.0.0.1:0".parse().expect("loopback address"))
+            .expect("bind the client endpoint");
+        let crypto =
+            quinn::crypto::rustls::QuicClientConfig::try_from((*client_tls()).clone()).expect("quinn takes the config");
+        let connecting = client_endpoint
+            .connect_with(quinn::ClientConfig::new(Arc::new(crypto)), addr, "localhost")
+            .expect("dial the server");
+        // The server answers the handshake only once the application takes the connection.
+        let accepting = async {
+            server_endpoint
+                .accept()
+                .await
+                .expect("the server endpoint is still accepting")
+                .await
+                .expect("the server handshake completes")
+        };
+        let (connection, server_connection) = futures::join!(connecting, accepting);
+        RawPair {
+            _server_endpoint: server_endpoint,
+            _client_endpoint: client_endpoint,
+            connection: connection.expect("the client handshake completes"),
+            server_connection,
+        }
+    }
+
+    /// The server advertises a window smaller than the request header alone, so the send half can
+    /// only take a prefix of the first write; a short accept is progress, and the bytes it leaves
+    /// behind still have to reach the peer as exactly one request header followed by the payload.
+    #[tokio::test]
+    async fn a_short_first_write_still_carries_one_request_header() {
+        murmur_testsupport_probe::ensure_test_crypto_provider();
+        let pair = raw_pair(64).await;
+        let (send, recv) = pair.connection.open_bi().await.expect("open a proxy stream");
+        let mut stream = ClientStream::new(QuicStream { send, recv }, "example.com:443".to_owned());
+        let payload = vec![0x5a; 4096];
+
+        // The peer reads while the client writes, which is what reopens the credit a short accept
+        // left closed.
+        let body_len = payload.len();
+        let server_connection = pair.server_connection.clone();
+        let reader = tokio::spawn(async move {
+            let (_, mut server_recv) = server_connection.accept_bi().await.expect("accept the proxy stream");
+            let destination = protocol::read_tcp_request(&mut server_recv).await.expect("the request header parses");
+            let mut body = vec![0u8; body_len];
+            server_recv.read_exact(&mut body).await.expect("the payload arrives whole");
+            (destination, body)
+        });
+
+        stream.write_all(&payload).await.expect("the first write completes once the peer reopens the window");
+        let parsed = tokio::time::timeout(Duration::from_secs(20), reader)
+            .await
+            .expect("the peer parses in time")
+            .expect("the peer task does not fail");
+        assert_eq!(parsed.0, "example.com:443", "exactly one request header precedes the payload");
+        assert_eq!(parsed.1, payload, "the payload arrives byte for byte");
+    }
+
+    /// A first write the window cut short leaves a request-header tail behind; the shutdown that
+    /// follows has to put the rest of the header on the wire before it may send the FIN, or the peer
+    /// parses a truncated request instead.
+    #[tokio::test]
+    async fn a_shutdown_after_a_short_first_write_keeps_the_request_header_whole() {
+        murmur_testsupport_probe::ensure_test_crypto_provider();
+        let pair = raw_pair(64).await;
+        let (send, recv) = pair.connection.open_bi().await.expect("open a proxy stream");
+        let mut stream = ClientStream::new(QuicStream { send, recv }, "example.com:443".to_owned());
+
+        // One poll takes a prefix of the header and leaves the tail behind — the state a cancelled
+        // write hands to the shutdown.
+        let mut cx = Context::from_waker(futures::task::noop_waker_ref());
+        assert!(
+            Pin::new(&mut stream).poll_write(&mut cx, b"payload").is_pending(),
+            "a 64-byte window cannot carry the header in one write"
+        );
+
+        let server_connection = pair.server_connection.clone();
+        let reader = tokio::spawn(async move {
+            let (_, mut server_recv) = server_connection.accept_bi().await.expect("accept the proxy stream");
+            let destination = protocol::read_tcp_request(&mut server_recv).await.expect("the request header parses");
+            let mut body = [0u8; 1];
+            let read = server_recv.read(&mut body).await.expect("the peer reads to the FIN");
+            (destination, read)
+        });
+
+        futures::future::poll_fn(|cx| Pin::new(&mut stream).poll_shutdown(cx))
+            .await
+            .expect("the shutdown completes once the peer reads");
+
+        let (destination, read) = tokio::time::timeout(Duration::from_secs(20), reader)
+            .await
+            .expect("the peer parses in time")
+            .expect("the peer task does not fail");
+        assert_eq!(destination, "example.com:443", "the whole request header precedes the FIN");
+        assert_eq!(read, None, "the FIN follows the header with no payload byte sent");
+    }
+
+    /// A request header the send half only took a prefix of cannot be finished, so the synchronous
+    /// `Conn::close` has to reset the stream: a FIN would present the truncated header to the peer as
+    /// the whole request.
+    #[tokio::test]
+    async fn a_close_after_a_short_first_write_resets_instead_of_finishing() {
+        murmur_testsupport_probe::ensure_test_crypto_provider();
+        let pair = raw_pair(64).await;
+        let (send, recv) = pair.connection.open_bi().await.expect("open a proxy stream");
+        let mut stream = ClientStream::new(QuicStream { send, recv }, "example.com:443".to_owned());
+
+        // One poll takes a prefix of the header and leaves the tail behind — the state a cancelled
+        // write hands to the close.
+        let mut cx = Context::from_waker(futures::task::noop_waker_ref());
+        assert!(
+            Pin::new(&mut stream).poll_write(&mut cx, b"payload").is_pending(),
+            "a 64-byte window cannot carry the header in one write"
+        );
+
+        let server_connection = pair.server_connection.clone();
+        let reader = tokio::spawn(async move {
+            let (_, mut server_recv) = server_connection.accept_bi().await.expect("accept the proxy stream");
+            let mut buf = [0u8; 512];
+            loop {
+                match server_recv.read(&mut buf).await {
+                    Ok(Some(_)) => {}
+                    Ok(None) => panic!("a FIN followed a truncated request header"),
+                    Err(err) => return err.to_string(),
+                }
+            }
+        });
+
+        stream.close().expect("the proxy stream closes");
+        // The relay drops the conn right after closing it, which is what lets quinn finish a stream
+        // nobody closed.
+        drop(stream);
+
+        let error = tokio::time::timeout(Duration::from_secs(20), reader)
+            .await
+            .expect("the peer sees the outcome in time")
+            .expect("the peer task does not fail");
+        assert!(error.contains("reset"), "the peer has to see a reset, not a clean end: {error}");
     }
 }
