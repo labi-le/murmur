@@ -489,6 +489,28 @@ impl PacketReader for ServerPacketConn {
     }
 }
 
+/// Reads and drops `len` payload bytes the caller's slice could not hold. The length prefix is
+/// already off the stream when a read rejects a datagram, so the payload has to leave it too;
+/// otherwise the next read decodes payload bytes as a length prefix. A conn that breaks mid-drain
+/// reports its own error rather than the short-buffer one, which would look recoverable on a
+/// stream that is gone.
+async fn discard_payload<R>(conn: &mut R, len: usize) -> io::Result<()>
+where
+    R: AsyncRead + Unpin,
+{
+    let mut scratch = [0u8; 512];
+    let mut remaining = len;
+    while remaining > 0 {
+        let chunk = remaining.min(scratch.len());
+        let Some(dst) = scratch.get_mut(..chunk) else {
+            return Err(io::Error::other("vless: discard window exceeds the scratch block"));
+        };
+        conn.read_exact(dst).await?;
+        remaining -= chunk;
+    }
+    Ok(())
+}
+
 #[async_trait]
 impl NetPacketReader for ServerPacketConn {
     async fn read_from(&self, p: &mut [u8]) -> io::Result<(usize, Box<dyn Addr>)> {
@@ -497,6 +519,7 @@ impl NetPacketReader for ServerPacketConn {
         conn.read_exact(&mut packet_len).await?;
         let packet_len = u16::from_be_bytes(packet_len) as usize;
         let Some(dst) = p.get_mut(..packet_len) else {
+            discard_payload(&mut *conn, packet_len).await?;
             return Err(io::Error::other("short buffer"));
         };
         conn.read_exact(dst).await?;
@@ -628,5 +651,73 @@ mod tests {
             read_addr_port(&mut *server).await.expect("0x03 is ipv6"),
             Socksaddr::from_ip(IpAddr::V6(Ipv6Addr::LOCALHOST), 53)
         );
+    }
+
+    /// A server packet conn over a fresh accepted loopback socket carrying `frame`.
+    async fn packet_conn_carrying(frame: &[u8]) -> (ServerPacketConn, tokio::net::TcpStream) {
+        let listener =
+            tokio::net::TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).await.expect("an ephemeral port is free");
+        let addr = listener.local_addr().expect("the probe is bound");
+        let mut peer = tokio::net::TcpStream::connect(addr).await.expect("the peer connects");
+        let (server, _) = listener.accept().await.expect("the probe accepts");
+        peer.write_all(frame).await.expect("the frame is written");
+        let destination = Socksaddr::from_ip(IpAddr::V4(Ipv4Addr::LOCALHOST), 53);
+        (ServerPacketConn::new(new_extended_conn(server), destination), peer)
+    }
+
+    /// The stream from the report: `00 04 | 00 01 41 42` then `00 02 | 43 44`. A two-byte slice
+    /// rejects the first datagram; the read after it must start at the second length prefix
+    /// instead of decoding `00 01` as a header.
+    #[tokio::test]
+    async fn a_short_buffer_does_not_leave_the_read_between_datagram_boundaries() {
+        let (conn, _peer) = packet_conn_carrying(&[0x00, 0x04, 0x00, 0x01, 0x41, 0x42, 0x00, 0x02, 0x43, 0x44]).await;
+
+        let mut small = [0u8; 2];
+        let err = NetPacketReader::read_from(&conn, &mut small)
+            .await
+            .expect_err("four payload bytes do not fit a two-byte slice");
+        assert_eq!(err.to_string(), "short buffer");
+
+        let mut larger = [0u8; 8];
+        let (n, _addr) = NetPacketReader::read_from(&conn, &mut larger)
+            .await
+            .expect("the read after a short buffer must start at the second length prefix");
+        assert_eq!(&larger[..n], b"CD", "the second datagram must survive the rejected first one");
+    }
+
+    /// The drain spans more than one read, so a payload larger than a single drain chunk must
+    /// still leave the stream aligned on the next datagram.
+    #[tokio::test]
+    async fn a_short_buffer_drains_a_payload_larger_than_one_chunk() {
+        let payload = [0xABu8; 4096];
+        let mut frame = Vec::new();
+        frame.extend_from_slice(&u16::try_from(payload.len()).expect("4096 fits a u16").to_be_bytes());
+        frame.extend_from_slice(&payload);
+        frame.extend_from_slice(&[0x00, 0x02, 0x43, 0x44]);
+        let (conn, _peer) = packet_conn_carrying(&frame).await;
+
+        let mut small = [0u8; 16];
+        NetPacketReader::read_from(&conn, &mut small).await.expect_err("4096 payload bytes do not fit a 16-byte slice");
+
+        let mut larger = [0u8; 8];
+        let (n, _addr) = NetPacketReader::read_from(&conn, &mut larger)
+            .await
+            .expect("the datagram behind the drained one must be readable");
+        assert_eq!(&larger[..n], b"CD");
+    }
+
+    /// A slice that holds the payload exactly is a fit, not a short buffer, and the read after it
+    /// must still find the next length prefix.
+    #[tokio::test]
+    async fn a_payload_exactly_filling_the_slice_is_returned_intact() {
+        let (conn, _peer) = packet_conn_carrying(&[0x00, 0x02, 0x43, 0x44, 0x00, 0x02, 0x45, 0x46]).await;
+
+        let mut exact = [0u8; 2];
+        let (n, _addr) =
+            NetPacketReader::read_from(&conn, &mut exact).await.expect("an exact fit is not a short buffer");
+        assert_eq!(&exact[..n], b"CD");
+
+        let (n, _addr) = NetPacketReader::read_from(&conn, &mut exact).await.expect("the second exact fit reads too");
+        assert_eq!(&exact[..n], b"EF");
     }
 }
