@@ -14,6 +14,22 @@ use super::protocol::{Address, Packet, ATYP_NONE, PACKET_OVER_HEAD};
 /// `1200` is the default max datagram size and `-3` the per-frame header overhead.
 pub static MAX_FRAG_SIZE: LazyLock<usize> = LazyLock::new(|| 1200 - *PACKET_OVER_HEAD - 3);
 
+/// A datagram that cannot be fragmented into something the v5 `PACKET` command can carry.
+///
+/// `frag_total` and `frag_id` are single wire bytes, so a zero fragment capacity (nothing to
+/// divide the payload into) and a count above 255 (which would be written as a wrapped
+/// `frag_total` and then overflow `frag_id`) are unrepresentable. Both fail closed here instead
+/// of sending a header the peer would read as a different message.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, thiserror::Error)]
+pub enum FragmentCapacityError {
+    #[error("tuic v5: fragment capacity is zero, so a {payload_size} byte payload cannot be fragmented")]
+    ZeroCapacity { payload_size: usize },
+    #[error(
+        "tuic v5: a {payload_size} byte payload at capacity {frag_size} needs {fragment_count} fragments, above the 255 the wire fields hold"
+    )]
+    CountOverflow { payload_size: usize, frag_size: usize, fragment_count: usize },
+}
+
 pub(crate) async fn frag_write_native(
     quic_conn: &dyn QuicConn,
     mut packet: Packet,
@@ -21,14 +37,22 @@ pub(crate) async fn frag_write_native(
     frag_size: usize,
 ) -> anyhow::Result<()> {
     let full_payload = packet.data.clone();
+    if frag_size == 0 {
+        return Err(FragmentCapacityError::ZeroCapacity { payload_size: full_payload.len() }.into());
+    }
+    let frag_count = full_payload.len().div_ceil(frag_size);
+    // `frag_id` counts up once per fragment, so a count the single-byte wire fields hold is what
+    // keeps both `frag_total` and the final `frag_id += 1` representable.
+    let Ok(frag_total) = u8::try_from(frag_count) else {
+        return Err(FragmentCapacityError::CountOverflow {
+            payload_size: full_payload.len(),
+            frag_size,
+            fragment_count: frag_count,
+        }
+        .into());
+    };
     let mut off = 0usize;
     let mut frag_id = 0u8;
-    let frag_count = full_payload.len().div_ceil(frag_size);
-    #[expect(
-        clippy::cast_possible_truncation,
-        reason = "the fragment count is bounded by the udp relay payload limit divided by the fragment size, which fits the single-byte wire field"
-    )]
-    let frag_total = frag_count as u8;
     packet.frag_total = frag_total;
     while off < full_payload.len() {
         let mut payload_size = full_payload.len() - off;
@@ -312,5 +336,71 @@ mod tests {
             payloads.extend_from_slice(&parsed.data);
         }
         assert_eq!(payloads, b"abcdefghijkl");
+    }
+
+    /// A zero capacity has nothing to divide the payload into, so it must be rejected before any
+    /// fragment is written rather than panicking inside `div_ceil`.
+    #[tokio::test]
+    async fn a_zero_fragment_capacity_is_rejected_before_any_fragment_is_sent() {
+        let conn = RecordingConn::default();
+        let addr = protocol::new_address_addr_port(SocketAddr::from(([192, 0, 2, 1], 9)));
+        let packet = protocol::new_packet(1, 4, 1, 0, 4, addr, bytes::Bytes::from_static(b"abcd"));
+        let mut buf = BytesMut::new();
+
+        let err = frag_write_native(&conn, packet, &mut buf, 0).await.expect_err("a zero capacity must fail closed");
+
+        assert!(
+            matches!(err.downcast_ref::<FragmentCapacityError>(), Some(FragmentCapacityError::ZeroCapacity { .. })),
+            "the error must name the unrepresentable capacity, got: {err}"
+        );
+        assert!(conn.0.lock().is_empty(), "a zero capacity must not write a fragment");
+    }
+
+    /// `frag_total` is one wire byte: a payload needing 256 fragments must be rejected instead of
+    /// being written with `frag_total = 0` and, on the last fragment, overflowing `frag_id`.
+    #[tokio::test]
+    async fn a_payload_needing_more_than_two_hundred_and_fifty_five_fragments_is_rejected_without_a_partial_send() {
+        let conn = RecordingConn::default();
+        let addr = protocol::new_address_addr_port(SocketAddr::from(([192, 0, 2, 1], 9)));
+        let payload = bytes::Bytes::from(vec![7u8; usize::from(u16::MAX)]);
+        let packet = protocol::new_packet(1, 4, 1, 0, u16::MAX, addr, payload);
+        let mut buf = BytesMut::new();
+
+        let err =
+            frag_write_native(&conn, packet, &mut buf, 256).await.expect_err("256 fragments do not fit the wire field");
+
+        assert!(
+            matches!(
+                err.downcast_ref::<FragmentCapacityError>(),
+                Some(FragmentCapacityError::CountOverflow { fragment_count: 256, .. })
+            ),
+            "the error must name the fragment count, got: {err}"
+        );
+        assert!(conn.0.lock().is_empty(), "a count above 255 must not write a partial fragment run");
+    }
+
+    /// The other side of the boundary: 255 fragments is the largest count the wire fields hold and
+    /// must still be sent intact.
+    #[tokio::test]
+    async fn a_payload_needing_exactly_two_hundred_and_fifty_five_fragments_is_sent() {
+        let conn = RecordingConn::default();
+        let addr = protocol::new_address_addr_port(SocketAddr::from(([192, 0, 2, 1], 9)));
+        let payload = vec![7u8; 255 * 256];
+        let packet = protocol::new_packet(1, 4, 1, 0, u16::MAX, addr, bytes::Bytes::from(payload.clone()));
+        let mut buf = BytesMut::new();
+
+        frag_write_native(&conn, packet, &mut buf, 256).await.expect("255 fragments fit the wire fields");
+
+        let sent = conn.0.lock().clone();
+        assert_eq!(sent.len(), 255);
+        let mut reassembled = Vec::new();
+        for (index, frame) in sent.iter().enumerate() {
+            let mut cursor = std::io::Cursor::new(&frame[..]);
+            let parsed = protocol::read_packet(&mut cursor).await.expect("the frame parses");
+            assert_eq!(parsed.frag_total, 255);
+            assert_eq!(usize::from(parsed.frag_id), index);
+            reassembled.extend_from_slice(&parsed.data);
+        }
+        assert_eq!(reassembled, payload);
     }
 }
