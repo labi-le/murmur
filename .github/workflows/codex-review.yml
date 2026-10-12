@@ -3,7 +3,7 @@ name: Codex review
 # Codex reacts to an "@codex review" comment; the automatic-review toggle lives in the Codex account settings.
 on:
   pull_request:
-    types: [opened, reopened, ready_for_review]
+    types: [opened, reopened, ready_for_review, synchronize]
 
 permissions:
   # gh resolves the pull request and posts the comment through the pull requests API.
