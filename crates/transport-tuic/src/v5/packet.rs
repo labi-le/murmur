@@ -174,13 +174,16 @@ impl QuicStreamPacketConn {
             };
             if let Err(err) = &send_result {
                 if let Some(too_large) = err.downcast_ref::<DatagramTooLargeError>() {
-                    #[expect(
-                        clippy::cast_possible_truncation,
-                        clippy::cast_sign_loss,
-                        reason = "the frame payload bound is a non-negative byte count that fits a usize"
-                    )]
-                    let frag_size = (too_large.max_datagram_payload_size as usize).saturating_sub(*PACKET_OVER_HEAD);
-                    send_result = frag_write_native(&*self.quic_conn, packet.clone(), &mut buf, frag_size).await;
+                    // A frame budget at or below the TUIC overhead leaves no capacity to fragment
+                    // into, so the original too-large error is kept rather than retried with a
+                    // zero fragment size.
+                    let capacity = usize::try_from(too_large.max_datagram_payload_size)
+                        .unwrap_or(0)
+                        .checked_sub(*PACKET_OVER_HEAD)
+                        .filter(|frag_size| *frag_size > 0);
+                    if let Some(frag_size) = capacity {
+                        send_result = frag_write_native(&*self.quic_conn, packet.clone(), &mut buf, frag_size).await;
+                    }
                 }
             }
             send_result?;
@@ -317,4 +320,156 @@ impl WaitReadFromDatagram for QuicStreamPacketConn {
 /// The network-error guard, reused by `client.rs`.
 pub(crate) fn is_net_error_ref(err: Option<&anyhow::Error>) -> bool {
     err.is_some_and(is_net_error)
+}
+
+#[cfg(test)]
+mod tests {
+    use std::net::SocketAddr;
+
+    use parking_lot::Mutex as StdMutex;
+
+    use super::*;
+
+    /// A QUIC conn that rejects any datagram frame larger than the budget it was given, which is
+    /// what drives the packet conn's `DatagramTooLargeError` retry path.
+    struct BudgetQuicConn {
+        budget: usize,
+        sent: StdMutex<Vec<Vec<u8>>>,
+    }
+
+    #[async_trait::async_trait]
+    impl QuicConn for BudgetQuicConn {
+        fn local_addr(&self) -> Box<dyn murmur_std_compat::net::Addr> {
+            unimplemented!("the send path never reads the local address")
+        }
+
+        fn remote_addr(&self) -> Box<dyn murmur_std_compat::net::Addr> {
+            unimplemented!("the send path never reads the remote address")
+        }
+
+        fn close_with_error(&self, _code: u64, _reason: &str) -> anyhow::Result<()> {
+            anyhow::bail!("the send path never closes the connection")
+        }
+
+        fn config(&self) -> murmur_quic::Config {
+            unimplemented!("the send path never reads the config")
+        }
+
+        fn connection_stats(&self) -> murmur_quic::ConnectionStats {
+            unimplemented!("the send path never reads the stats")
+        }
+
+        fn connection_state(&self) -> murmur_quic::ConnectionState {
+            unimplemented!("the send path never reads the connection state")
+        }
+
+        fn context(&self) -> tokio_util::sync::CancellationToken {
+            unimplemented!("the send path never reads the context")
+        }
+
+        async fn handshake_complete(&self) {}
+
+        fn export_keying_material(&self, _label: &[u8], _context: &[u8], _length: usize) -> anyhow::Result<Vec<u8>> {
+            anyhow::bail!("the send path never exports keying material")
+        }
+
+        async fn open_stream(
+            &self,
+            _ctx: &tokio_util::sync::CancellationToken,
+        ) -> anyhow::Result<Box<dyn murmur_quic::Stream>> {
+            anyhow::bail!("the send path never opens a stream")
+        }
+
+        async fn open_uni_stream(
+            &self,
+            _ctx: &tokio_util::sync::CancellationToken,
+        ) -> anyhow::Result<Box<dyn murmur_quic::SendStream>> {
+            anyhow::bail!("the send path never opens a uni stream")
+        }
+
+        async fn accept_stream(
+            &self,
+            _ctx: &tokio_util::sync::CancellationToken,
+        ) -> anyhow::Result<Box<dyn murmur_quic::Stream>> {
+            anyhow::bail!("the send path never accepts a stream")
+        }
+
+        async fn accept_uni_stream(
+            &self,
+            _ctx: &tokio_util::sync::CancellationToken,
+        ) -> anyhow::Result<Box<dyn murmur_quic::ReceiveStream>> {
+            anyhow::bail!("the send path never accepts a uni stream")
+        }
+
+        fn send_datagram(&self, data: &[u8]) -> anyhow::Result<()> {
+            if data.len() > self.budget {
+                return Err(DatagramTooLargeError {
+                    max_datagram_payload_size: i64::try_from(self.budget).unwrap_or(i64::MAX),
+                }
+                .into());
+            }
+            self.sent.lock().push(data.to_vec());
+            Ok(())
+        }
+
+        async fn receive_datagram(&self, _ctx: &tokio_util::sync::CancellationToken) -> anyhow::Result<Vec<u8>> {
+            anyhow::bail!("the send path never receives a datagram")
+        }
+    }
+
+    fn new_packet_conn(quic_conn: Arc<dyn QuicConn>, max_udp_relay_packet_size: usize) -> Arc<QuicStreamPacketConn> {
+        QuicStreamPacketConn::new(
+            1,
+            quic_conn,
+            None,
+            types::type_::UdpRelayMode::NATIVE,
+            max_udp_relay_packet_size,
+            None,
+            None,
+            None,
+        )
+    }
+
+    /// A transport budget with no room above the TUIC overhead has no capacity to fragment into, so
+    /// the retry must be skipped and the original too-large error kept rather than dividing by zero.
+    #[tokio::test]
+    async fn a_retry_with_no_room_above_the_tuic_overhead_keeps_the_original_error() {
+        let conn = Arc::new(BudgetQuicConn { budget: *PACKET_OVER_HEAD, sent: StdMutex::new(Vec::new()) });
+        let quic_conn = Arc::clone(&conn);
+        let pc = new_packet_conn(quic_conn, 1500);
+        let addr: SocketAddr = "198.51.100.7:9".parse().expect("the test address parses");
+
+        let err = pc.send_to(&[7u8; 1000], addr).await.expect_err("a frame over the budget must fail");
+
+        assert!(
+            err.to_string().contains("DATAGRAM frame too large"),
+            "the original too-large error must be kept, got: {err}"
+        );
+        assert!(conn.sent.lock().is_empty(), "a budget with no room above the overhead must not send a fragment");
+    }
+
+    /// The retry still runs when the budget does leave room: the payload is fragmented and the
+    /// fragments reassemble to the original.
+    #[tokio::test]
+    async fn a_retry_with_room_above_the_tuic_overhead_fragments_the_payload() {
+        let conn = Arc::new(BudgetQuicConn { budget: *PACKET_OVER_HEAD + 512, sent: StdMutex::new(Vec::new()) });
+        let quic_conn = Arc::clone(&conn);
+        let pc = new_packet_conn(quic_conn, 1500);
+        let addr: SocketAddr = "198.51.100.7:9".parse().expect("the test address parses");
+        let payload = vec![7u8; 1000];
+
+        let sent_len = pc.send_to(&payload, addr).await.expect("the payload is fragmented and sent");
+        assert_eq!(sent_len, payload.len());
+
+        let sent = conn.sent.lock().clone();
+        assert_eq!(sent.len(), 2, "1000 bytes at a 512 byte capacity is two fragments");
+        let mut reassembled = Vec::new();
+        for frame in &sent {
+            let mut cursor = io::Cursor::new(&frame[..]);
+            let parsed = protocol::read_packet(&mut cursor).await.expect("the frame parses");
+            assert_eq!(parsed.frag_total, 2);
+            reassembled.extend_from_slice(&parsed.data);
+        }
+        assert_eq!(reassembled, payload);
+    }
 }
