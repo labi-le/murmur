@@ -273,15 +273,14 @@ async fn read_addr_port(conn: &mut dyn Stream) -> Result<Socksaddr> {
 
 /// The response header prepended to the first application write: the version byte, then the
 /// reserved/addon-length byte.
-const RESPONSE_HEADER_LEN: usize = 2;
+const RESPONSE_HEADER: [u8; 2] = [vless::VERSION, 0];
 
 pub struct ServerConn {
     extended_conn: Box<dyn CommonExtendedConn>,
     response_written: bool,
-    /// The response frame (header plus the caller's first buffer) and how many of its leading bytes
-    /// the wrapped conn has accepted so far.
-    write_pending: Option<Vec<u8>>,
-    write_pending_sent: usize,
+    /// How many of the fixed header bytes have reached the wire. Only the header is ever retained,
+    /// so no application byte outlives the call that supplied it.
+    response_sent: usize,
 }
 
 /// The wrapped conn is not printable, so it is skipped and only the response state is reported.
@@ -289,63 +288,43 @@ impl core::fmt::Debug for ServerConn {
     fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
         f.debug_struct("ServerConn")
             .field("response_written", &self.response_written)
-            .field("write_pending", &self.write_pending.as_ref().map(|data| (data.len(), self.write_pending_sent)))
+            .field("response_sent", &self.response_sent)
             .finish_non_exhaustive()
     }
 }
 
 impl ServerConn {
     fn new(extended_conn: Box<dyn CommonExtendedConn>) -> Self {
-        Self { extended_conn, response_written: false, write_pending: None, write_pending_sent: 0 }
+        Self { extended_conn, response_written: false, response_sent: 0 }
     }
 
     /// The buffered-response half of the server conn's write path.
     ///
     /// One `poll_write` on the wrapped conn may accept only part of what it is handed — a socket
     /// whose send buffer has little room, a `tokio::io::duplex` carrier capped at its channel
-    /// capacity — so the frame is resumed from `write_pending_sent` across polls instead of being
-    /// dropped. Only payload bytes the conn actually accepted are reported: the header is framing,
-    /// not caller data. Once the header is on the wire the leftover of `buf` is written from `buf`
-    /// itself, so a resumption can never replay a stale copy of an earlier buffer.
+    /// capacity — so the fixed header is resumed from `response_sent` across polls. Only the header
+    /// is buffered: the payload is written from the caller's own `buf` once the header is on the
+    /// wire, so a `Pending` never retains application bytes from a call the caller may abandon, and
+    /// a resumed write reports bytes of the buffer it was actually handed.
     fn poll_write_response(&mut self, cx: &mut Context<'_>, buf: &[u8]) -> Poll<io::Result<usize>> {
-        if self.write_pending.is_none() {
-            let mut data = Vec::with_capacity(RESPONSE_HEADER_LEN + buf.len());
-            data.push(vless::VERSION);
-            data.push(0);
-            data.extend_from_slice(buf);
-            self.write_pending = Some(data);
-            self.write_pending_sent = 0;
-        }
-        loop {
-            if self.write_pending_sent >= RESPONSE_HEADER_LEN {
-                let accepted = self.write_pending_sent - RESPONSE_HEADER_LEN;
-                self.write_pending = None;
-                self.write_pending_sent = 0;
-                self.response_written = true;
-                if accepted > 0 {
-                    return Poll::Ready(Ok(accepted));
-                }
-                return Pin::new(&mut self.extended_conn).poll_write(cx, buf);
-            }
-            let Some(data) = self.write_pending.as_deref() else {
-                return Poll::Ready(Err(io::Error::other("vless: response header buffer missing")));
-            };
-            let (_, unsent) = data.split_at(self.write_pending_sent);
+        while self.response_sent < RESPONSE_HEADER.len() {
+            let (_, unsent) = RESPONSE_HEADER.split_at(self.response_sent);
             match Pin::new(&mut self.extended_conn).poll_write(cx, unsent) {
                 Poll::Ready(Ok(0)) => {
-                    self.write_pending = None;
-                    self.write_pending_sent = 0;
+                    self.response_sent = 0;
                     return Poll::Ready(Err(io::Error::new(io::ErrorKind::WriteZero, "vless: response write zero")));
                 }
-                Poll::Ready(Ok(sent)) => self.write_pending_sent += sent,
+                Poll::Ready(Ok(sent)) => self.response_sent += sent,
                 Poll::Ready(Err(err)) => {
-                    self.write_pending = None;
-                    self.write_pending_sent = 0;
+                    self.response_sent = 0;
                     return Poll::Ready(Err(err));
                 }
                 Poll::Pending => return Poll::Pending,
             }
         }
+        self.response_sent = 0;
+        self.response_written = true;
+        Pin::new(&mut self.extended_conn).poll_write(cx, buf)
     }
 }
 
@@ -674,13 +653,26 @@ mod tests {
         per_write: usize,
         budget: usize,
         park_on: Option<usize>,
+        /// What `per_write` becomes once `park_on` has passed, so a test can model a send buffer
+        /// that was full during the parked call and has room again on the next one.
+        per_write_after_park: usize,
         calls: usize,
     }
 
     impl TrickleStream {
         fn new(per_write: usize, budget: usize) -> (Self, Arc<Mutex<Vec<u8>>>) {
             let wire = Arc::new(Mutex::new(Vec::new()));
-            (Self { wire: Arc::clone(&wire), per_write, budget, park_on: None, calls: 0 }, wire)
+            (
+                Self {
+                    wire: Arc::clone(&wire),
+                    per_write,
+                    budget,
+                    park_on: None,
+                    per_write_after_park: per_write,
+                    calls: 0,
+                },
+                wire,
+            )
         }
     }
 
@@ -699,7 +691,14 @@ mod tests {
                 cx.waker().wake_by_ref();
                 return Poll::Pending;
             }
-            let accepted = buf.len().min(this.per_write).min(this.budget);
+            // Calls after the park see a wider send buffer, the way a socket that refused the whole
+            // frame while full accepts all of it once the peer has drained.
+            let per_write = if this.park_on.is_some_and(|parked| call > parked) {
+                this.per_write_after_park
+            } else {
+                this.per_write
+            };
+            let accepted = buf.len().min(per_write).min(this.budget);
             this.budget -= accepted;
             this.wire.lock().expect("the wire is not poisoned").extend_from_slice(&buf[..accepted]);
             Poll::Ready(Ok(accepted))
@@ -761,6 +760,33 @@ mod tests {
         conn.write_all(&[0xA1, 0xB2]).await.expect("the payload is written");
 
         assert_eq!(*wire.lock().expect("the wire is not poisoned"), vec![vless::VERSION, 0, 0xA1, 0xB2]);
+    }
+
+    /// An application write abandoned after a `Pending` may be replaced by a different buffer. Only
+    /// the fixed header survives the abandoned call, so the resumed write reports bytes of the
+    /// buffer it was handed and never transmits the abandoned one.
+    #[tokio::test]
+    async fn an_abandoned_buffer_is_never_transmitted_by_a_resumed_write() {
+        let (stream, wire) = TrickleStream::new(1, usize::MAX);
+        let stream = TrickleStream { park_on: Some(1), per_write_after_park: usize::MAX, ..stream };
+        let mut conn = ServerConn::new(new_extended_conn(stream));
+        let mut cx = Context::from_waker(std::task::Waker::noop());
+
+        let abandoned = [b'A'; 4];
+        assert!(Pin::new(&mut conn).poll_write(&mut cx, &abandoned).is_pending(), "the writer parks");
+
+        let replacement = [b'B'; 3];
+        let accepted = match Pin::new(&mut conn).poll_write(&mut cx, &replacement) {
+            Poll::Ready(Ok(accepted)) => accepted,
+            Poll::Ready(Err(err)) => panic!("the resumed write failed: {err}"),
+            Poll::Pending => panic!("the resumed write must report bytes, not park again"),
+        };
+        assert!(
+            accepted <= replacement.len(),
+            "a resumed write reported {accepted} bytes of a {} byte buffer",
+            replacement.len()
+        );
+        assert_eq!(*wire.lock().expect("the wire is not poisoned"), vec![vless::VERSION, 0, b'B', b'B', b'B']);
     }
 
     /// The header is framing, not caller data: a writer that takes the two header bytes and then
