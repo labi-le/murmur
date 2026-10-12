@@ -20,7 +20,7 @@
 
 use std::io;
 use std::net::SocketAddr;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -195,4 +195,51 @@ async fn encrypted_round_trip_with_simple_xor_cipher() {
         .expect("server read timed out")
         .expect("server read_exact");
     assert_eq!(received, payload, "encrypted packets must decrypt to exactly the original bytes");
+}
+
+/// A socket that never yields an inbound packet and records how often it was closed, so a
+/// dropped client session's ownership of it can be observed directly. Its `alive` marker is only
+/// held by the session once it is moved in, which is what makes the leak visible.
+struct PendingDatagram {
+    close_calls: Arc<AtomicUsize>,
+    alive: Arc<()>,
+}
+
+#[async_trait]
+impl Datagram for PendingDatagram {
+    async fn recv_from(&self, _buf: &mut [u8]) -> io::Result<(usize, SocketAddr)> {
+        std::future::pending().await
+    }
+
+    async fn send_to(&self, buf: &[u8], _addr: SocketAddr) -> io::Result<usize> {
+        Ok(buf.len())
+    }
+
+    fn local_addr(&self) -> io::Result<SocketAddr> {
+        Ok("127.0.0.1:0".parse().unwrap())
+    }
+
+    fn close(&self) -> io::Result<()> {
+        self.close_calls.fetch_add(1, Ordering::SeqCst);
+        Ok(())
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn dropping_a_client_session_closes_its_socket_and_stops_its_workers() {
+    let close_calls = Arc::new(AtomicUsize::new(0));
+    let sock = PendingDatagram { close_calls: Arc::clone(&close_calls), alive: Arc::new(()) };
+    let alive = Arc::downgrade(&sock.alive);
+    let client =
+        new_conn4(0xdead_beef, "127.0.0.1:9".parse().unwrap(), None, 0, 0, true, Box::new(sock)).expect("new_conn4");
+    tokio::time::sleep(Duration::from_millis(50)).await;
+
+    drop(client);
+
+    assert_eq!(close_calls.load(Ordering::SeqCst), 1, "dropping the last session handle must close the socket");
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+    while alive.upgrade().is_some() && tokio::time::Instant::now() < deadline {
+        tokio::task::yield_now().await;
+    }
+    assert!(alive.upgrade().is_none(), "the session's background tasks must exit, releasing the socket");
 }
