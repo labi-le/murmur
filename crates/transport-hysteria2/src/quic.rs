@@ -358,12 +358,6 @@ impl QuicStream {
     pub fn reset(&mut self) {
         let _ = self.send.reset(quinn::VarInt::from_u32(0));
     }
-
-    /// Cancels the read side and closes the send side, unreachable from the shared-reference
-    /// `Conn::close`.
-    pub fn send_stop(&self) {
-        drop(self.send.stopped());
-    }
 }
 
 /// Hands a protocol header to `send`, keeping whatever the send half did not take in `header`.
