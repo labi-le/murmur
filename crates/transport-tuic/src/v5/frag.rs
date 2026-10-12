@@ -59,12 +59,21 @@ pub(crate) async fn frag_write_native(
 /// the peer picks `frag_total`, and a peer relaying datagrams has only a few messages in flight.
 const FRAGMENT_BAG_LIMIT: usize = 1024;
 
+/// The largest payload one message may reassemble to, the bound the 16-bit wire `size` field can
+/// describe and the bound `send_to` accepts. A bag that would exceed it is dropped before the
+/// bytes are retained, so the cache holds at most one fragment of slack per bag rather than a
+/// count-limited number of unaccounted payloads.
+const MAX_REASSEMBLED_PAYLOAD: usize = 65_535;
+
 /// The bag's fields, held under one lock.
 #[derive(Default)]
 struct PacketBagState {
     /// The fragments received so far, at most one per `frag_id`, so a bag is sized by what the
     /// peer actually sent rather than by the `frag_total` it declared.
     frags: Vec<Packet>,
+    /// The payload bytes those fragments hold, summed as they arrive so a message is refused
+    /// before it can outgrow [`MAX_REASSEMBLED_PAYLOAD`].
+    held_bytes: usize,
     /// The `frag_total` the message in flight declared; a different one starts a new message.
     frag_total: u8,
 }
@@ -103,11 +112,21 @@ impl DeFragger {
         let mut state = bag.state.lock();
         if state.frag_total != m.frag_total {
             state.frags.clear();
+            state.held_bytes = 0;
             state.frag_total = m.frag_total;
         }
         if state.frags.iter().any(|frag| frag.frag_id == frag_id) {
             return None;
         }
+        let held_bytes = state.held_bytes.saturating_add(m.data.len());
+        if held_bytes > MAX_REASSEMBLED_PAYLOAD {
+            // The peer is past the size a single udp datagram can carry: drop what this message
+            // retained instead of adding to it, and let a fresh message start on this `pkt_id`.
+            drop(state);
+            lru.delete(pkt_id);
+            return None;
+        }
+        state.held_bytes = held_bytes;
         state.frags.push(m);
         if state.frags.len() != usize::from(state.frag_total) {
             return None;
@@ -122,11 +141,9 @@ impl DeFragger {
             data.extend_from_slice(&frag.data);
         }
         let mut p = frags.into_iter().next()?;
-        #[expect(
-            clippy::cast_possible_truncation,
-            reason = "the reassembled payload is bounded by the original udp datagram size, which fits the 16-bit wire field"
-        )]
-        let reassembled_len = data.len() as u16;
+        // `held_bytes` bounded every fragment as it arrived, so this holds; a checked conversion
+        // keeps the size consistent with the payload even if that bound is ever loosened.
+        let reassembled_len = u16::try_from(data.len()).ok()?;
         p.size = reassembled_len;
         p.data = bytes::Bytes::from(data);
         p.frag_id = 0;
@@ -143,15 +160,22 @@ mod tests {
     use super::*;
     use crate::v5::protocol;
 
-    fn packet(pkt_id: u16, frag_total: u8, frag_id: u8, data: &'static [u8]) -> Packet {
+    fn packet(pkt_id: u16, frag_total: u8, frag_id: u8, data: &[u8]) -> Packet {
         let addr = protocol::new_address_addr_port(SocketAddr::from(([192, 0, 2, 1], 9)));
         let size = u16::try_from(data.len()).expect("the test payloads fit the wire field");
-        protocol::new_packet(1, pkt_id, frag_total, frag_id, size, addr, bytes::Bytes::from_static(data))
+        protocol::new_packet(1, pkt_id, frag_total, frag_id, size, addr, bytes::Bytes::copy_from_slice(data))
     }
 
     fn held_fragments(defragger: &DeFragger, pkt_id: u16) -> usize {
         let (bag, _) = defragger.lru().get_or_store(pkt_id, || Arc::new(PacketBag::default()));
         let held = bag.state.lock().frags.len();
+        held
+    }
+
+    /// The payload bytes a bag retains right now, the value the aggregate bound caps.
+    fn bag_held_bytes(defragger: &DeFragger, pkt_id: u16) -> usize {
+        let (bag, _) = defragger.lru().get_or_store(pkt_id, || Arc::new(PacketBag::default()));
+        let held = bag.state.lock().held_bytes;
         held
     }
 
@@ -188,6 +212,46 @@ mod tests {
         assert_eq!(assembled.frag_id, 0);
         assert_eq!(assembled.frag_total, 1);
         assert_eq!(assembled.addr.string(), addr.string());
+    }
+
+    #[test]
+    fn two_maximum_size_fragments_never_assemble_past_the_size_a_datagram_carries() {
+        let defragger = DeFragger::default();
+        let big = vec![0u8; 40_000];
+        assert!(defragger.feed(packet(11, 2, 0, &big)).is_none());
+        assert!(
+            defragger.feed(packet(11, 2, 1, &big)).is_none(),
+            "80 000 retained bytes must not be returned against a 14464-byte `size` field"
+        );
+        assert_eq!(held_fragments(&defragger, 11), 0, "the refused message must not stay in the cache");
+        assert!(defragger.feed(packet(11, 2, 0, b"ab")).is_none());
+        assert!(defragger.feed(packet(11, 2, 1, b"cd")).is_some(), "a fresh message must reassemble");
+    }
+
+    #[test]
+    fn a_message_is_refused_before_its_fragments_outgrow_one_udp_datagram() {
+        let defragger = DeFragger::default();
+        let fragment = vec![0u8; 1_200];
+        let mut completed = Vec::new();
+        let mut peak_retained = 0usize;
+        for frag_id in 0..200u8 {
+            if defragger.feed(packet(4, 200, frag_id, &fragment)).is_some() {
+                completed.push(frag_id);
+            }
+            peak_retained = peak_retained.max(bag_held_bytes(&defragger, 4));
+        }
+        assert!(completed.is_empty(), "an incomplete message past the udp bound must never complete: {completed:?}");
+        assert_eq!(peak_retained, 64_800, "a bag must stop retaining fragments at the udp bound");
+    }
+
+    #[test]
+    fn a_message_that_lands_below_the_udp_bound_still_reassembles() {
+        let defragger = DeFragger::default();
+        let half = vec![0u8; 30_000];
+        assert!(defragger.feed(packet(6, 2, 0, &half)).is_none());
+        let assembled = defragger.feed(packet(6, 2, 1, &half)).expect("60 000 bytes fit one udp datagram");
+        assert_eq!(assembled.data.len(), 60_000);
+        assert_eq!(usize::from(assembled.size), 60_000);
     }
 
     #[test]
