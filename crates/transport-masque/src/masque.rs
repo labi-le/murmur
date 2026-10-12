@@ -1567,7 +1567,9 @@ pub mod h3 {
     const MAX_SETTINGS_FRAME_LEN: u64 = 16 * 1024;
 
     /// The frames preceding the final response may not exceed the field-section size this client
-    /// advertises, which bounds both the allocation and the loop.
+    /// advertises, which bounds both the allocation and the loop. Each frame is charged its
+    /// encoded header as well as its declared payload, so a peer cannot spend the wire on frames
+    /// the client skips for free.
     const MAX_RESPONSE_PREAMBLE_BYTES: u64 = DEFAULT_MAX_FIELD_SECTION_SIZE;
 
     /// Informational responses are the only reason to loop here, and RFC 9110 does not require
@@ -1600,7 +1602,10 @@ pub mod h3 {
         }
     }
 
-    async fn read_varint(recv: &mut RecvStream) -> anyhow::Result<u64> {
+    /// Reads one varint, returning its value and the wire bytes it occupied: RFC 9000 fixes the
+    /// width a value is encoded in, not the value, so a peer can spend more bytes on a small
+    /// number than its magnitude needs.
+    async fn read_varint(recv: &mut RecvStream) -> anyhow::Result<(u64, usize)> {
         let first = read_byte(recv).await?;
         let length = 1usize << (first >> 6);
         let mut value = u64::from(first & 0x3f);
@@ -1609,7 +1614,7 @@ pub mod h3 {
                 read_byte(recv).await.map_err(|err| if err.is::<Eof>() { anyhow!("unexpected EOF") } else { err })?;
             value = (value << 8) | u64::from(byte);
         }
-        Ok(value)
+        Ok((value, length))
     }
 
     async fn read_full(recv: &mut RecvStream, buf: &mut [u8]) -> anyhow::Result<()> {
@@ -1644,10 +1649,11 @@ pub mod h3 {
         Ok(())
     }
 
-    async fn read_frame_header(recv: &mut RecvStream) -> anyhow::Result<(u64, u64)> {
-        let frame_type = read_varint(recv).await?;
-        let length = read_varint(recv).await?;
-        Ok((frame_type, length))
+    /// A frame's type, its declared payload length, and the wire bytes its own header cost.
+    async fn read_frame_header(recv: &mut RecvStream) -> anyhow::Result<(u64, u64, usize)> {
+        let (frame_type, type_len) = read_varint(recv).await?;
+        let (length, length_len) = read_varint(recv).await?;
+        Ok((frame_type, length, type_len + length_len))
     }
 
     /// Drops the routing entries whose receiver is gone, so a table entry cannot outlive the code
@@ -1813,7 +1819,7 @@ pub mod h3 {
         }
 
         async fn handle_uni_stream(self: Arc<Self>, mut recv: RecvStream) -> anyhow::Result<()> {
-            let Ok(stream_type) = read_varint(&mut recv).await else {
+            let Ok((stream_type, _)) = read_varint(&mut recv).await else {
                 return Ok(());
             };
             match stream_type {
@@ -1833,7 +1839,7 @@ pub mod h3 {
         }
 
         async fn handle_control_stream(self: &Arc<Self>, recv: &mut RecvStream) -> anyhow::Result<()> {
-            let Ok((frame_type, length)) = read_frame_header(recv).await else {
+            let Ok((frame_type, length, _)) = read_frame_header(recv).await else {
                 self.close_with_error(H3_MISSING_SETTINGS, "missing SETTINGS frame");
                 return Err(anyhow!("http3: missing SETTINGS frame"));
             };
@@ -1853,7 +1859,7 @@ pub mod h3 {
             self.settings_notify.notify_waiters();
 
             loop {
-                let (frame_type, length) = match read_frame_header(recv).await {
+                let (frame_type, length, _) = match read_frame_header(recv).await {
                     Ok(header) => header,
                     Err(err) => {
                         if err.is::<Eof>() {
@@ -2233,8 +2239,9 @@ pub mod h3 {
             let _ = self.recv.stop(VarInt::from_u32(code));
         }
 
-        /// The next frame header of the response body; `None` at a clean end of stream.
-        async fn next_frame(&mut self) -> anyhow::Result<Option<(u64, u64)>> {
+        /// The next frame header of the response body and the wire bytes that header cost; `None`
+        /// at a clean end of stream.
+        async fn next_frame(&mut self) -> anyhow::Result<Option<(u64, u64, usize)>> {
             match read_frame_header(&mut self.recv).await {
                 Ok(header) => Ok(Some(header)),
                 Err(err) if err.is::<Eof>() => Ok(None),
@@ -2442,7 +2449,7 @@ pub mod h3 {
             let mut preamble_bytes: u64 = 0;
             let mut interim_responses: u64 = 0;
             loop {
-                let Some((frame_type, length)) = self.recv.next_frame().await? else {
+                let Some((frame_type, length, header_len)) = self.recv.next_frame().await? else {
                     self.send.conn.close_with_error(H3_REQUEST_INCOMPLETE, "request stream closed before response");
                     return Err(anyhow!("http3: request stream closed before response"));
                 };
@@ -2450,7 +2457,10 @@ pub mod h3 {
                     self.send.conn.close_with_error(H3_EXCESSIVE_LOAD, "response headers too large");
                     return Err(anyhow!("http3: response headers too large"));
                 }
-                preamble_bytes = preamble_bytes.saturating_add(length);
+                // The peer spent these bytes on the wire whatever the client does with the frame,
+                // so the header counts against the preamble budget along with the payload; a run
+                // of zero-length frames would otherwise cost nothing.
+                preamble_bytes = preamble_bytes.saturating_add(length).saturating_add(header_len as u64);
                 if preamble_bytes > MAX_RESPONSE_PREAMBLE_BYTES {
                     self.send.conn.close_with_error(H3_EXCESSIVE_LOAD, "response preamble too large");
                     return Err(anyhow!("http3: response frames exceed {MAX_RESPONSE_PREAMBLE_BYTES} bytes"));
@@ -3141,6 +3151,10 @@ pub mod h3 {
         /// frame bound fails the test instead of hanging the suite.
         const FRAME_TIMEOUT: Duration = Duration::from_secs(10);
 
+        /// Pushing the whole preamble budget through the client reads an order of magnitude more
+        /// frames than the other loop-bound tests, so it gets a bound of its own.
+        const PREAMBLE_BUDGET_TIMEOUT: Duration = Duration::from_secs(60);
+
         struct TestPair {
             client: Arc<ClientConn>,
             server: quinn::Connection,
@@ -3334,6 +3348,71 @@ pub mod h3 {
             let result = timeout(FRAME_TIMEOUT, stream.read_response()).await.expect("the response loop is bounded");
             let err = result.expect_err("a preamble past the byte cap is rejected");
             assert!(err.to_string().contains("exceed"), "unexpected error: {err}");
+        }
+
+        /// The largest header a peer can encode for a frame that carries no payload: an 8-byte
+        /// unknown frame type and a non-minimal 8-byte length of zero.
+        fn zero_length_unknown_frame() -> Vec<u8> {
+            let mut header: Vec<u8> = Vec::new();
+            quicvarint::append(&mut header, 1 << 56);
+            header.extend_from_slice(&[0xc0, 0, 0, 0, 0, 0, 0, 0]);
+            header
+        }
+
+        /// Writes `count` copies of `frame` in chunks, tolerating a peer that has already failed
+        /// closed.
+        async fn write_frames(send: &mut SendStream, frame: &[u8], count: u64) {
+            let chunk: Vec<u8> = frame.repeat(4096);
+            let total = count * frame.len() as u64;
+            let mut written = 0u64;
+            while written < total {
+                let remaining = usize::try_from(total - written).unwrap_or(usize::MAX);
+                let part = &chunk[..remaining.min(chunk.len())];
+                if send.write_all(part).await.is_err() {
+                    return;
+                }
+                written += part.len() as u64;
+            }
+        }
+
+        /// A run of zero-length unknown frames costs the peer at least their encoded headers, so a
+        /// preamble made of nothing but those headers must still trip the byte cap.
+        #[tokio::test]
+        async fn a_preamble_of_zero_length_unknown_frames_past_the_cap_fails_closed() {
+            let frame = zero_length_unknown_frame();
+            assert_eq!(frame.len(), 16, "the widest header a zero-length frame can carry");
+            let frames = MAX_RESPONSE_PREAMBLE_BYTES / frame.len() as u64 + 1;
+
+            let pair = connect_pair().await;
+            let (mut stream, mut server_send) = open_response_stream(&pair).await;
+            let writer = tokio::spawn(async move {
+                write_frames(&mut server_send, &frame, frames).await;
+                let block = qpack::encode_fields(&[(":status".to_owned(), "200".to_owned())]);
+                let mut response: Vec<u8> = Vec::new();
+                quicvarint::append(&mut response, FRAME_HEADERS);
+                quicvarint::append(&mut response, block.len() as u64);
+                response.extend_from_slice(&block);
+                let _ = server_send.write_all(&response).await;
+            });
+
+            let result =
+                timeout(PREAMBLE_BUDGET_TIMEOUT, stream.read_response()).await.expect("the response loop is bounded");
+            let err = result.expect_err("a preamble past the byte cap is rejected");
+            assert!(err.to_string().contains("exceed"), "unexpected error: {err}");
+            writer.abort();
+        }
+
+        /// The cap on a preamble the client ignores must not reject one that stays under it.
+        #[tokio::test]
+        async fn unknown_frames_within_the_cap_precede_the_final_response() {
+            let frame = zero_length_unknown_frame();
+            let pair = connect_pair().await;
+            let (mut stream, mut server_send) = open_response_stream(&pair).await;
+            write_frames(&mut server_send, &frame, 8).await;
+            write_headers(&mut server_send, "200").await;
+
+            let response = timeout(FRAME_TIMEOUT, stream.read_response()).await.expect("the response arrives");
+            assert_eq!(response.expect("a response within the caps").status_code, 200);
         }
 
         #[tokio::test]
