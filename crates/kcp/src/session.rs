@@ -1222,9 +1222,12 @@ mod tests {
     }
 
     /// A client socket that never yields an inbound packet, so only the teardown itself can stop
-    /// the reader task, and that records its close calls.
+    /// the reader task, and that records its close calls. The `alive` marker is held by the session
+    /// and by the reader's own socket clone: a `Weak` to it only dies once both released it, which
+    /// is what makes a reader that leaked while parked observable.
     struct PendingDatagram {
         close_calls: Arc<AtomicUsize>,
+        alive: Arc<()>,
     }
 
     #[async_trait]
@@ -1250,32 +1253,30 @@ mod tests {
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn dropping_the_last_client_handle_closes_it_and_stops_its_workers() {
         let close_calls = Arc::new(AtomicUsize::new(0));
-        let client = new_session(
-            0xdead_beef,
-            SocketAddr::from(([127, 0, 0, 1], 9)),
-            Arc::new(PendingDatagram { close_calls: Arc::clone(&close_calls) }),
-            true,
-            None,
-            0,
-            0,
-            None,
-        );
+        let sock = Arc::new(PendingDatagram { close_calls: Arc::clone(&close_calls), alive: Arc::new(()) });
+        let alive = Arc::downgrade(&sock.alive);
+        let session_sock = Arc::clone(&sock);
+        let client =
+            new_session(0xdead_beef, SocketAddr::from(([127, 0, 0, 1], 9)), session_sock, true, None, 0, 0, None);
         let read_task = tokio::spawn(client_read_loop(Arc::downgrade(&client.0)));
         client.0.tasks.lock().push(read_task);
         let weak = Arc::downgrade(&client.0);
         tokio::time::sleep(Duration::from_millis(50)).await;
         assert!(weak.upgrade().is_some(), "the live session must be upgradeable");
+        drop(sock);
 
         drop(client);
-        // Let the runtime reap the aborted workers before asking whether the session survived.
-        for _ in 0..10 {
+        // Let the runtime reap the workers before asking whether anything survived the drop.
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while alive.upgrade().is_some() && Instant::now() < deadline {
             tokio::task::yield_now().await;
         }
 
         assert_eq!(close_calls.load(Ordering::SeqCst), 1, "the drop must reach the teardown's close hook");
+        assert!(weak.upgrade().is_none(), "the dropped session must be collectable");
         assert!(
-            weak.upgrade().is_none(),
-            "no worker may keep the dropped session alive; its socket and tasks must free"
+            alive.upgrade().is_none(),
+            "the reader loop must exit and release its socket clone, not stay parked on a Weak-only session"
         );
     }
 }
