@@ -1071,8 +1071,12 @@ impl<D: phy::Device> Driver<D> {
                     if !tcp.may_send() {
                         break;
                     }
-                    let chunk: Vec<u8> = entry.outbox.iter().take(TCP_SOCKET_BUFFER).copied().collect();
-                    let Ok(accepted) = tcp.send_slice(&chunk) else {
+                    // Straight from the outbox's contiguous region: `smoltcp` copies what it
+                    // accepts into its own send buffer, so a temporary here would copy the
+                    // bytes a second time on the way. A wrapped outbox is two regions, and the
+                    // next pass, or the `accepted` that stops short of one, takes the rest.
+                    let (region, _) = entry.outbox.as_slices();
+                    let Ok(accepted) = tcp.send_slice(region) else {
                         break;
                     };
                     if accepted == 0 {
@@ -1255,8 +1259,16 @@ impl tokio::io::AsyncRead for TcpConn {
             return if this.read_closed && this.incoming.is_empty() { Poll::Ready(Ok(())) } else { Poll::Pending };
         }
         let take = buf.remaining().min(this.incoming.len());
-        let chunk: Vec<u8> = this.incoming.drain(..take).collect();
-        buf.put_slice(&chunk);
+        // The caller's buffer takes the queue's bytes directly, so a read is never staged
+        // through a temporary. A queue whose head sits mid-buffer wraps into two regions, and a
+        // read shorter than the first takes only the head of it.
+        let (head, tail) = this.incoming.as_slices();
+        let head_taken = take.min(head.len());
+        let (head, _) = head.split_at(head_taken);
+        buf.put_slice(head);
+        let (tail, _) = tail.split_at(take - head_taken);
+        buf.put_slice(tail);
+        this.incoming.drain(..take);
         // The driver stops draining a full queue, so a read is what lets it drain again.
         this.wake.notify();
         Poll::Ready(Ok(()))
@@ -1544,6 +1556,8 @@ fn bind(socket: &mut udp::Socket, requested: IpListenEndpoint) -> Result<IpListe
 mod tests {
     use super::*;
 
+    use tokio::io::AsyncReadExt as _;
+
     /// How many bytes the socket still holds once the driver has run out of queue.
     const LEFTOVER: usize = 8;
 
@@ -1576,15 +1590,16 @@ mod tests {
         }
     }
 
-    /// A driver over the two structures `drain_events` and `resolve_connects` read, the socket set
-    /// and the entries. The interface is never polled, so an idle loopback device is enough.
-    fn driver(handle: SocketHandle, sockets: SocketSet<'static>, events: mpsc::Sender<Event>) -> Driver<phy::Loopback> {
-        let mut device = phy::Loopback::new(Medium::Ip);
-        let iface = Interface::new(IfaceConfig::new(HardwareAddress::Ip), &mut device, now());
+    /// A driver over the socket set and entries a test prepared, with the loopback device and the
+    /// interface that only moves packets when the test polls it.
+    fn driver_over(
+        iface: Interface,
+        device: phy::Loopback,
+        sockets: SocketSet<'static>,
+        entries: HashMap<u64, Entry>,
+    ) -> Driver<phy::Loopback> {
         let (_commands, commands) = mpsc::unbounded_channel();
         let (accepts, _accepted) = mpsc::unbounded_channel();
-        let mut entries = HashMap::new();
-        entries.insert(1_u64, entry(handle, events));
         Driver {
             iface,
             device,
@@ -1598,6 +1613,80 @@ mod tests {
             closed: CancellationToken::new(),
             events: Events::default(),
         }
+    }
+
+    /// A driver over the two structures `drain_events` and `resolve_connects` read, the socket set
+    /// and the entries. The interface is never polled, so an idle loopback device is enough.
+    fn driver(handle: SocketHandle, sockets: SocketSet<'static>, events: mpsc::Sender<Event>) -> Driver<phy::Loopback> {
+        let mut device = phy::Loopback::new(Medium::Ip);
+        let iface = Interface::new(IfaceConfig::new(HardwareAddress::Ip), &mut device, now());
+        let mut entries = HashMap::new();
+        entries.insert(1_u64, entry(handle, events));
+        driver_over(iface, device, sockets, entries)
+    }
+
+    /// A driver whose one entry owns an open TCP connection, made by dialing a listener inside the
+    /// same stack over the loopback device. The outbox path only runs for a socket `may_send`
+    /// reports true for, and `smoltcp` says that only for an open connection. The dialing socket's
+    /// transmit buffer is `capacity` bytes, so a small one takes a part of every region it is
+    /// handed. Both sockets ACK without the default delay, which is what lets a test poll the
+    /// handshake and the acknowledgements through in a handful of passes.
+    fn connected(capacity: usize) -> (Driver<phy::Loopback>, SocketHandle, SocketHandle) {
+        const PORT: u16 = 51_832;
+        let mut device = phy::Loopback::new(Medium::Ip);
+        let mut iface = Interface::new(IfaceConfig::new(HardwareAddress::Ip), &mut device, now());
+        iface.update_ip_addrs(|addrs| {
+            addrs
+                .push(IpCidr::new(IpAddress::Ipv4(Ipv4Address::new(10, 0, 0, 1)), 32))
+                .expect("the stack holds one local address");
+        });
+        let mut sockets = SocketSet::new(Vec::new());
+        let peer =
+            sockets.add(tcp::Socket::new(tcp::SocketBuffer::new(vec![0u8; 64]), tcp::SocketBuffer::new(vec![0u8; 64])));
+        sockets.get_mut::<tcp::Socket>(peer).set_ack_delay(None);
+        sockets
+            .get_mut::<tcp::Socket>(peer)
+            .listen(IpListenEndpoint { addr: None, port: PORT })
+            .expect("the peer listens");
+        let established = sockets
+            .add(tcp::Socket::new(tcp::SocketBuffer::new(vec![0u8; 64]), tcp::SocketBuffer::new(vec![0u8; capacity])));
+        sockets.get_mut::<tcp::Socket>(established).set_ack_delay(None);
+        let remote = IpEndpoint::new(IpAddress::Ipv4(Ipv4Address::new(10, 0, 0, 1)), PORT);
+        sockets
+            .get_mut::<tcp::Socket>(established)
+            .connect(iface.context(), remote, IpListenEndpoint { addr: None, port: 49_000 })
+            .expect("the dialing socket connects");
+        for _ in 0..64 {
+            iface.poll(now(), &mut device, &mut sockets);
+            if sockets.get::<tcp::Socket>(established).state() == tcp::State::Established {
+                break;
+            }
+        }
+        assert_eq!(
+            sockets.get::<tcp::Socket>(established).state(),
+            tcp::State::Established,
+            "the handshake has to complete over the loopback device"
+        );
+
+        let (events, _queue) = mpsc::channel(PACKET_QUEUE_SIZE);
+        let mut entries = HashMap::new();
+        entries.insert(1_u64, entry(established, events));
+        (driver_over(iface, device, sockets, entries), established, peer)
+    }
+
+    /// A connection surface over an event queue the test fills by hand, so a read can start from a
+    /// receive queue in an exact state rather than one a driver happened to produce.
+    fn conn(events: mpsc::Receiver<Event>) -> TcpConn {
+        let (actions, _actions_rx) = mpsc::unbounded_channel();
+        TcpConn::new(
+            actions,
+            events,
+            Arc::new(Signal::default()),
+            Events::default(),
+            Arc::new(std::sync::atomic::AtomicU64::new(0)),
+            Arc::new(Mutex::new(SocketAddr::new(IpAddr::V4(Ipv4Addr::UNSPECIFIED), 0))),
+            IpEndpoint::new(IpAddress::Ipv4(Ipv4Address::new(10, 0, 0, 1)), 51_832),
+        )
     }
 
     /// `drain_events` stops before taking anything out of a socket whose queue is full, leaving
@@ -1638,5 +1727,97 @@ mod tests {
         );
         driver.drain_events();
         assert!(matches!(queue.try_recv(), Ok(Event::Closed)), "the close must follow the bytes the socket held");
+    }
+
+    /// The outbox holds the bytes `smoltcp` has not accepted. A wrapped queue offers them as two
+    /// regions, and a transmit buffer with room for part of one takes only that part, so the drain
+    /// has to stop there and leave the rest queued. A full buffer takes nothing while `may_send`
+    /// still answers true, and what it left has to be there for the pass the acknowledgements wake
+    /// (#135 was the case where the unaccepted tail was dropped instead).
+    #[test]
+    fn a_wrapped_outbox_crosses_a_small_send_buffer_whole() {
+        let (mut driver, established, peer) = connected(4);
+        let mut outbox: VecDeque<u8> = VecDeque::with_capacity(16);
+        for byte in b"efgh" {
+            outbox.push_back(*byte);
+        }
+        for byte in b"dc" {
+            outbox.push_front(*byte);
+        }
+        let (head, tail) = outbox.as_slices();
+        assert!(!head.is_empty() && !tail.is_empty(), "the outbox has to wrap for this case to be the two-region one");
+        driver.entries.get_mut(&1).expect("the entry").outbox = outbox;
+
+        driver.drain_outbox();
+        assert_eq!(
+            driver.sockets.get::<tcp::Socket>(established).send_queue(),
+            4,
+            "a four-byte transmit buffer takes a part of the outbox"
+        );
+        assert_eq!(
+            driver.entries.get(&1).expect("the entry").outbox.iter().copied().collect::<Vec<u8>>(),
+            b"gh",
+            "every byte the socket did not take has to stay queued"
+        );
+
+        // The peer acknowledges what it receives, which frees the transmit buffer for the passes
+        // that follow.
+        for _ in 0..8 {
+            driver.iface.poll(now(), &mut driver.device, &mut driver.sockets);
+            driver.drain_outbox();
+        }
+        assert!(
+            driver.entries.get(&1).expect("the entry").outbox.is_empty(),
+            "the outbox has to drain once the transmit buffer keeps taking bytes"
+        );
+        let mut received = [0u8; 16];
+        let size =
+            driver.sockets.get_mut::<tcp::Socket>(peer).recv_slice(&mut received).expect("the peer reads the stream");
+        assert_eq!(&received[..size], b"cdefgh", "the whole outbox has to cross the connection in order");
+    }
+
+    /// A receive queue whose head sits mid-buffer holds its bytes in two regions. A read shorter
+    /// than the first has to take exactly what the caller's buffer holds and leave the rest,
+    /// including the second region, queued in order.
+    #[tokio::test]
+    async fn a_read_from_a_wrapped_receive_queue_stops_at_the_callers_buffer() {
+        let (_events, queue) = mpsc::channel(PACKET_QUEUE_SIZE);
+        let mut conn = conn(queue);
+        conn.incoming = VecDeque::with_capacity(8);
+        for byte in b"def" {
+            conn.incoming.push_back(*byte);
+        }
+        for byte in b"cba" {
+            conn.incoming.push_front(*byte);
+        }
+        let (head, tail) = conn.incoming.as_slices();
+        assert!(!head.is_empty() && !tail.is_empty(), "the queue has to wrap for this case to be the two-region one");
+
+        let mut small = [0u8; 4];
+        assert_eq!(conn.read(&mut small).await.expect("read"), 4, "a four-byte buffer takes four bytes");
+        assert_eq!(&small, b"abcd");
+
+        let mut rest = [0u8; 8];
+        assert_eq!(conn.read(&mut rest).await.expect("read"), 2, "the rest of the queue follows");
+        assert_eq!(&rest[..2], b"ef");
+    }
+
+    /// The reader has to see the bytes a closed peer left queued before the end of the stream, so
+    /// the close cannot overtake them.
+    #[tokio::test]
+    async fn a_read_hands_over_a_closed_peers_bytes_before_the_end_of_stream() {
+        let (events, queue) = mpsc::channel(PACKET_QUEUE_SIZE);
+        let mut conn = conn(queue);
+        events.try_send(Event::Data(b"tail".to_vec())).expect("queue the bytes");
+        events.try_send(Event::Closed).expect("queue the close");
+
+        let mut buffer = [0u8; 8];
+        assert_eq!(conn.read(&mut buffer).await.expect("read"), 4, "the bytes the peer sent come first");
+        assert_eq!(&buffer[..4], b"tail");
+        assert_eq!(
+            conn.read(&mut buffer).await.expect("read"),
+            0,
+            "the stream ends once the socket gave up what it held"
+        );
     }
 }
