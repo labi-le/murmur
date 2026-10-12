@@ -39,6 +39,10 @@ async fn read_full(conn: &SharedConn, dst: &mut [u8]) -> (usize, io::Result<()>)
 /// next read decodes payload bytes as a length prefix and every later datagram is corrupt. A conn
 /// that breaks mid-drain reports its own error rather than the short-buffer one, which would look
 /// recoverable on a stream that is gone.
+// NOT cancel-safe: a dropped drain has already consumed part of the rejected datagram, so a later
+// read would start mid-frame; `read_from` is awaited inside the deadline layer's `select!`
+// (`NetPacketConn::with_read_deadline`), where a cancellation tears the connection down instead of
+// permitting another read.
 async fn discard_payload(conn: &SharedConn, len: usize) -> io::Result<()> {
     let mut scratch = [0u8; 512];
     let mut remaining = len;
