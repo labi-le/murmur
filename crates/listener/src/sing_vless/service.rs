@@ -271,10 +271,17 @@ async fn read_addr_port(conn: &mut dyn Stream) -> Result<Socksaddr> {
     }
 }
 
+/// The response header prepended to the first application write: the version byte, then the
+/// reserved/addon-length byte.
+const RESPONSE_HEADER_LEN: usize = 2;
+
 pub struct ServerConn {
     extended_conn: Box<dyn CommonExtendedConn>,
     response_written: bool,
+    /// The response frame (header plus the caller's first buffer) and how many of its leading bytes
+    /// the wrapped conn has accepted so far.
     write_pending: Option<Vec<u8>>,
+    write_pending_sent: usize,
 }
 
 /// The wrapped conn is not printable, so it is skipped and only the response state is reported.
@@ -282,35 +289,63 @@ impl core::fmt::Debug for ServerConn {
     fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
         f.debug_struct("ServerConn")
             .field("response_written", &self.response_written)
-            .field("write_pending", &self.write_pending.as_ref().map(Vec::len))
+            .field("write_pending", &self.write_pending.as_ref().map(|data| (data.len(), self.write_pending_sent)))
             .finish_non_exhaustive()
     }
 }
 
 impl ServerConn {
     fn new(extended_conn: Box<dyn CommonExtendedConn>) -> Self {
-        Self { extended_conn, response_written: false, write_pending: None }
+        Self { extended_conn, response_written: false, write_pending: None, write_pending_sent: 0 }
     }
 
     /// The buffered-response half of the server conn's write path.
+    ///
+    /// One `poll_write` on the wrapped conn may accept only part of what it is handed — a socket
+    /// whose send buffer has little room, a `tokio::io::duplex` carrier capped at its channel
+    /// capacity — so the frame is resumed from `write_pending_sent` across polls instead of being
+    /// dropped. Only payload bytes the conn actually accepted are reported: the header is framing,
+    /// not caller data. Once the header is on the wire the leftover of `buf` is written from `buf`
+    /// itself, so a resumption can never replay a stale copy of an earlier buffer.
     fn poll_write_response(&mut self, cx: &mut Context<'_>, buf: &[u8]) -> Poll<io::Result<usize>> {
         if self.write_pending.is_none() {
-            let mut data = Vec::with_capacity(2 + buf.len());
+            let mut data = Vec::with_capacity(RESPONSE_HEADER_LEN + buf.len());
             data.push(vless::VERSION);
             data.push(0);
             data.extend_from_slice(buf);
             self.write_pending = Some(data);
+            self.write_pending_sent = 0;
         }
-        let Some(data) = self.write_pending.as_deref() else {
-            return Poll::Ready(Err(io::Error::other("vless: response header buffer missing")));
-        };
-        let result = match Pin::new(&mut self.extended_conn).poll_write(cx, data) {
-            Poll::Ready(Ok(_)) => Poll::Ready(Ok(buf.len())),
-            Poll::Ready(Err(err)) => Poll::Ready(Err(err)),
-            Poll::Pending => return Poll::Pending,
-        };
-        self.write_pending = None;
-        result
+        loop {
+            if self.write_pending_sent >= RESPONSE_HEADER_LEN {
+                let accepted = self.write_pending_sent - RESPONSE_HEADER_LEN;
+                self.write_pending = None;
+                self.write_pending_sent = 0;
+                self.response_written = true;
+                if accepted > 0 {
+                    return Poll::Ready(Ok(accepted));
+                }
+                return Pin::new(&mut self.extended_conn).poll_write(cx, buf);
+            }
+            let Some(data) = self.write_pending.as_deref() else {
+                return Poll::Ready(Err(io::Error::other("vless: response header buffer missing")));
+            };
+            let (_, unsent) = data.split_at(self.write_pending_sent);
+            match Pin::new(&mut self.extended_conn).poll_write(cx, unsent) {
+                Poll::Ready(Ok(0)) => {
+                    self.write_pending = None;
+                    self.write_pending_sent = 0;
+                    return Poll::Ready(Err(io::Error::new(io::ErrorKind::WriteZero, "vless: response write zero")));
+                }
+                Poll::Ready(Ok(sent)) => self.write_pending_sent += sent,
+                Poll::Ready(Err(err)) => {
+                    self.write_pending = None;
+                    self.write_pending_sent = 0;
+                    return Poll::Ready(Err(err));
+                }
+                Poll::Pending => return Poll::Pending,
+            }
+        }
     }
 }
 
@@ -324,11 +359,9 @@ impl AsyncWrite for ServerConn {
     fn poll_write(self: Pin<&mut Self>, cx: &mut Context<'_>, buf: &[u8]) -> Poll<io::Result<usize>> {
         let this = self.get_mut();
         if !this.response_written {
-            let result = this.poll_write_response(cx, buf);
-            if let Poll::Ready(Ok(_)) = &result {
-                this.response_written = true;
-            }
-            return result;
+            // The header transition is owned by `poll_write_response`, which sets
+            // `response_written` once the header is on the wire.
+            return this.poll_write_response(cx, buf);
         }
         Pin::new(&mut this.extended_conn).poll_write(cx, buf)
     }
@@ -584,7 +617,8 @@ impl NeedAdditionalReadDeadline for ServerPacketConn {
 
 #[cfg(test)]
 mod tests {
-    use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
+    use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
+    use std::sync::{Arc, Mutex};
 
     use tokio::io::AsyncWriteExt;
 
@@ -628,5 +662,127 @@ mod tests {
             read_addr_port(&mut *server).await.expect("0x03 is ipv6"),
             Socksaddr::from_ip(IpAddr::V6(Ipv6Addr::LOCALHOST), 53)
         );
+    }
+
+    /// A conn that accepts at most `per_write` bytes per `poll_write` and stops accepting after
+    /// `budget` bytes, standing in for a socket whose send buffer has only a little room. Every
+    /// accepted byte is recorded, so what actually reached the wire is observable. `park_on` names
+    /// the poll that returns `Pending` (waking immediately) instead of accepting anything.
+    #[derive(Debug)]
+    struct TrickleStream {
+        wire: Arc<Mutex<Vec<u8>>>,
+        per_write: usize,
+        budget: usize,
+        park_on: Option<usize>,
+        calls: usize,
+    }
+
+    impl TrickleStream {
+        fn new(per_write: usize, budget: usize) -> (Self, Arc<Mutex<Vec<u8>>>) {
+            let wire = Arc::new(Mutex::new(Vec::new()));
+            (Self { wire: Arc::clone(&wire), per_write, budget, park_on: None, calls: 0 }, wire)
+        }
+    }
+
+    impl AsyncRead for TrickleStream {
+        fn poll_read(self: Pin<&mut Self>, _cx: &mut Context<'_>, _buf: &mut ReadBuf<'_>) -> Poll<io::Result<()>> {
+            Poll::Ready(Ok(()))
+        }
+    }
+
+    impl AsyncWrite for TrickleStream {
+        fn poll_write(self: Pin<&mut Self>, cx: &mut Context<'_>, buf: &[u8]) -> Poll<io::Result<usize>> {
+            let this = self.get_mut();
+            let call = this.calls;
+            this.calls += 1;
+            if this.park_on == Some(call) {
+                cx.waker().wake_by_ref();
+                return Poll::Pending;
+            }
+            let accepted = buf.len().min(this.per_write).min(this.budget);
+            this.budget -= accepted;
+            this.wire.lock().expect("the wire is not poisoned").extend_from_slice(&buf[..accepted]);
+            Poll::Ready(Ok(accepted))
+        }
+
+        fn poll_flush(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+            Poll::Ready(Ok(()))
+        }
+
+        fn poll_shutdown(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+            Poll::Ready(Ok(()))
+        }
+    }
+
+    impl Stream for TrickleStream {
+        fn local_addr(&self) -> io::Result<SocketAddr> {
+            Ok(SocketAddr::from((Ipv4Addr::LOCALHOST, 0)))
+        }
+
+        fn peer_addr(&self) -> io::Result<SocketAddr> {
+            Ok(SocketAddr::from((Ipv4Addr::LOCALHOST, 0)))
+        }
+    }
+
+    fn conn_over_trickle_writer(per_write: usize, budget: usize) -> (ServerConn, Arc<Mutex<Vec<u8>>>) {
+        let (stream, wire) = TrickleStream::new(per_write, budget);
+        (ServerConn::new(new_extended_conn(stream)), wire)
+    }
+
+    /// A writer that accepts one byte per call must still carry the whole response frame; the
+    /// single-poll path wrote the first byte and reported the entire payload as sent.
+    #[tokio::test]
+    async fn a_writer_accepting_one_byte_per_call_receives_the_whole_response_frame() {
+        let (mut conn, wire) = conn_over_trickle_writer(1, usize::MAX);
+
+        conn.write_all(&[0xA1, 0xB2]).await.expect("the payload is written");
+
+        assert_eq!(*wire.lock().expect("the wire is not poisoned"), vec![vless::VERSION, 0, 0xA1, 0xB2]);
+    }
+
+    /// The byte a short write left unsent must be resumed from the caller's buffer, never replayed
+    /// from the buffered copy of an earlier one.
+    #[tokio::test]
+    async fn a_payload_interrupted_by_a_short_write_is_resumed_without_duplicating_bytes() {
+        let (mut conn, wire) = conn_over_trickle_writer(3, usize::MAX);
+
+        conn.write_all(&[0xA1, 0xB2, 0xC3, 0xD4]).await.expect("the payload is written");
+
+        assert_eq!(*wire.lock().expect("the wire is not poisoned"), vec![vless::VERSION, 0, 0xA1, 0xB2, 0xC3, 0xD4]);
+    }
+
+    /// A park between two bytes of the frame is not the end of the write: the offset survives it and
+    /// the caller is told nothing was accepted, so the header still lands exactly once.
+    #[tokio::test]
+    async fn a_frame_interrupted_by_a_park_resumes_where_it_left_off() {
+        let (stream, wire) = TrickleStream::new(1, usize::MAX);
+        let mut conn = ServerConn::new(new_extended_conn(TrickleStream { park_on: Some(1), ..stream }));
+
+        conn.write_all(&[0xA1, 0xB2]).await.expect("the payload is written");
+
+        assert_eq!(*wire.lock().expect("the wire is not poisoned"), vec![vless::VERSION, 0, 0xA1, 0xB2]);
+    }
+
+    /// The header is framing, not caller data: a writer that takes the two header bytes and then
+    /// stops must fail the write instead of reporting the payload as sent.
+    #[tokio::test]
+    async fn a_payload_refused_after_the_header_is_not_reported_as_success() {
+        let (mut conn, wire) = conn_over_trickle_writer(usize::MAX, 2);
+
+        let err = conn.write_all(&[0xA1, 0xB2, 0xC3]).await.expect_err("the payload never reaches the wire");
+
+        assert_eq!(err.kind(), io::ErrorKind::WriteZero);
+        assert_eq!(*wire.lock().expect("the wire is not poisoned"), vec![vless::VERSION, 0]);
+    }
+
+    /// `Ready(Ok(0))` on the first byte is a refusal, not a fully buffered write.
+    #[tokio::test]
+    async fn a_writer_refusing_the_first_byte_is_not_reported_as_success() {
+        let (mut conn, wire) = conn_over_trickle_writer(1, 0);
+
+        let err = conn.write_all(&[0xA1]).await.expect_err("no byte reaches the wire");
+
+        assert_eq!(err.kind(), io::ErrorKind::WriteZero);
+        assert!(wire.lock().expect("the wire is not poisoned").is_empty());
     }
 }
