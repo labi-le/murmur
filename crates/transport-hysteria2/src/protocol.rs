@@ -1,8 +1,9 @@
 //! The wire format: the stream and datagram framing, the authentication headers and the padding
 //! filler.
 //!
-//! These frames are read through an `AsyncRead` and written into a plain `Vec<u8>`, since every
-//! writer here builds a whole frame before handing it to QUIC.
+//! These frames are read through an `AsyncRead`; the writers here build the header of a stream's
+//! first frame and hand it to QUIC ahead of the payload it announces, which is why the two are
+//! separate.
 
 use anyhow::{anyhow, bail, Result};
 use bytes::BytesMut;
@@ -122,13 +123,13 @@ fn put_bytes_at<'a>(buf: &'a mut [u8], bytes: &[u8]) -> &'a mut [u8] {
     rest
 }
 
-/// Writes the request header followed by the first payload write.
+/// Writes the request header that precedes the first payload write.
 ///
 /// ```text
 /// 0x401 (QUIC varint) | address length (QUIC varint) | address | padding length | padding
 /// ```
 #[must_use]
-pub fn write_tcp_request(addr: &str, payload: &[u8]) -> BytesMut {
+pub fn write_tcp_request_header(addr: &str) -> BytesMut {
     let padding = tcp_request_padding();
     let addr_len = addr.len();
     let padding_len = padding.len();
@@ -137,16 +138,13 @@ pub fn write_tcp_request(addr: &str, payload: &[u8]) -> BytesMut {
         + addr_len
         + var_int_len(padding_len as u64)
         + padding_len;
-    let mut header = vec![0u8; header_len];
+    let mut header = BytesMut::zeroed(header_len);
     let rest = put_var_int_at(&mut header, FRAME_TYPE_TCP_REQUEST);
     let rest = put_var_int_at(rest, addr_len as u64);
     let rest = put_bytes_at(rest, addr.as_bytes());
     let rest = put_var_int_at(rest, padding_len as u64);
     put_bytes_at(rest, padding.as_bytes());
-    let mut buffer = BytesMut::with_capacity(header_len + payload.len());
-    buffer.extend_from_slice(&header);
-    buffer.extend_from_slice(payload);
-    buffer
+    header
 }
 
 /// Reads a TCP request, returning the destination address and consuming the filler.
@@ -166,26 +164,26 @@ pub async fn read_tcp_request<R: AsyncRead + Unpin + ?Sized>(reader: &mut R) -> 
     Ok(String::from_utf8(addr)?)
 }
 
+/// Writes the response header that precedes the first payload write.
 ///
 /// ```text
 /// status (byte, 0=ok, 1=error) | message length (QUIC varint) | message | padding length | padding
 /// ```
 #[must_use]
-pub fn write_tcp_response(ok: bool, message: &str, payload: &[u8]) -> BytesMut {
+pub fn write_tcp_response_header(ok: bool, message: &str) -> BytesMut {
     let padding = tcp_response_padding();
     let message_bytes = message.as_bytes();
     let message_len = message_bytes.len().min(MAX_MESSAGE_LENGTH_USIZE);
     let padding_len = padding.len();
     let header_len = 1 + var_int_len(message_len as u64) + message_len + var_int_len(padding_len as u64) + padding_len;
     let (message_head, _) = message_bytes.split_at(message_len);
-    let mut buffer = BytesMut::with_capacity(header_len + payload.len());
-    buffer.extend_from_slice(&[u8::from(!ok)]);
-    buffer.extend_from_slice(&var_int(message_len as u64));
-    buffer.extend_from_slice(message_head);
-    buffer.extend_from_slice(&var_int(padding_len as u64));
-    buffer.extend_from_slice(padding.as_bytes());
-    buffer.extend_from_slice(payload);
-    buffer
+    let mut header = BytesMut::with_capacity(header_len);
+    header.extend_from_slice(&[u8::from(!ok)]);
+    header.extend_from_slice(&var_int(message_len as u64));
+    header.extend_from_slice(message_head);
+    header.extend_from_slice(&var_int(padding_len as u64));
+    header.extend_from_slice(padding.as_bytes());
+    header
 }
 
 pub async fn read_tcp_response<R: AsyncRead + Unpin + ?Sized>(reader: &mut R) -> Result<(bool, String)> {
@@ -428,9 +426,8 @@ mod tests {
 
     #[tokio::test]
     async fn tcp_request_round_trips_with_payload() {
-        let mut stream = Vec::new();
-        let frame = write_tcp_request("example.com:443", b"hello");
-        stream.extend_from_slice(&frame);
+        let mut stream = write_tcp_request_header("example.com:443");
+        stream.extend_from_slice(b"hello");
         let mut cursor = std::io::Cursor::new(stream);
         assert_eq!(read_tcp_request(&mut cursor).await.unwrap(), "example.com:443");
         let mut rest = vec![0u8; 5];
@@ -457,8 +454,8 @@ mod tests {
 
     #[tokio::test]
     async fn tcp_response_round_trips() {
-        let mut stream = Vec::new();
-        stream.extend_from_slice(&write_tcp_response(true, "", b"payload"));
+        let mut stream = write_tcp_response_header(true, "");
+        stream.extend_from_slice(b"payload");
         let mut cursor = std::io::Cursor::new(stream);
         assert_eq!(read_tcp_response(&mut cursor).await.unwrap(), (true, String::new()));
         let mut rest = [0u8; 7];
@@ -468,8 +465,7 @@ mod tests {
 
     #[tokio::test]
     async fn tcp_response_carries_error_message() {
-        let mut stream = Vec::new();
-        stream.extend_from_slice(&write_tcp_response(false, "refused", b""));
+        let stream = write_tcp_response_header(false, "refused");
         let mut cursor = std::io::Cursor::new(stream);
         assert_eq!(read_tcp_response(&mut cursor).await.unwrap(), (false, String::from("refused")));
     }
@@ -486,12 +482,13 @@ mod tests {
     async fn tcp_request_padding_is_skipped_and_varint_width_varies() {
         // A 300-byte address forces the 2-byte length varint and a padding length in [64, 512).
         let addr = format!("{}:80", "a".repeat(290));
-        let frame = write_tcp_request(&addr, b"");
-        assert_eq!(frame[0], 0x44);
-        assert_eq!(frame[1], 0x01);
-        let mut cursor = std::io::Cursor::new(frame.to_vec());
+        let header = write_tcp_request_header(&addr);
+        assert_eq!(header[0], 0x44);
+        assert_eq!(header[1], 0x01);
+        let header_len = header.len();
+        let mut cursor = std::io::Cursor::new(header);
         assert_eq!(read_tcp_request(&mut cursor).await.unwrap(), addr);
-        assert_eq!(cursor.position() as usize, frame.len());
+        assert_eq!(cursor.position() as usize, header_len);
     }
 
     #[test]

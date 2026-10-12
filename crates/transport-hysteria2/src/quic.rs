@@ -20,9 +20,9 @@ use std::sync::Arc;
 use std::task::{Context, Poll};
 use std::time::Duration;
 
-use bytes::Bytes;
+use bytes::{Buf, Bytes, BytesMut};
 use parking_lot::Mutex;
-use tokio::io::ReadBuf;
+use tokio::io::{AsyncWrite, ReadBuf};
 use tokio_util::sync::CancellationToken;
 
 use murmur_common_net::io::old_addr_to_socket_addr;
@@ -364,6 +364,28 @@ impl QuicStream {
     pub fn send_stop(&self) {
         drop(self.send.stopped());
     }
+}
+
+/// Hands a protocol header to `send`, keeping whatever the send half did not take in `header`.
+///
+/// A write into [`quinn::SendStream`] carries only what the peer's flow-control window has room for,
+/// so a header taller than the window goes out a prefix at a time: `Poll::Ready(Ok(()))` once every
+/// byte is on the wire, `Poll::Pending` with the remainder still in `header` for the poll that
+/// follows. Quinn only reports a zero-byte write for an empty buffer, and the loop condition rules
+/// that out, so each poll that answers `Ready` has advanced.
+pub(crate) fn poll_write_header(
+    send: &mut quinn::SendStream,
+    cx: &mut Context<'_>,
+    header: &mut BytesMut,
+) -> Poll<io::Result<()>> {
+    while !header.is_empty() {
+        match AsyncWrite::poll_write(Pin::new(&mut *send), cx, &header[..]) {
+            Poll::Ready(Ok(written)) => header.advance(written),
+            Poll::Ready(Err(err)) => return Poll::Ready(Err(err)),
+            Poll::Pending => return Poll::Pending,
+        }
+    }
+    Poll::Ready(Ok(()))
 }
 
 /// The encoded width of a QUIC varint, whose top two bits select it.

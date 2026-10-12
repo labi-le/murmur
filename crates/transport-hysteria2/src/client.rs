@@ -20,7 +20,7 @@ use std::task::{Context, Poll};
 use std::time::Duration;
 
 use anyhow::{bail, Result};
-use bytes::Bytes;
+use bytes::{Bytes, BytesMut};
 use parking_lot::Mutex;
 use rand::Rng;
 use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
@@ -32,7 +32,9 @@ use murmur_std_compat::net::{Conn, PacketConn};
 use crate::obfs::Obfs;
 use crate::packet::{QuicDatagrams, UdpPacketConn};
 use crate::protocol::{self, AuthRequest, UdpMessage};
-use crate::quic::{transport_config, CongestionOption, PacketConnSocket, QuicConfig, QuicConn, QuicStream};
+use crate::quic::{
+    poll_write_header, transport_config, CongestionOption, PacketConnSocket, QuicConfig, QuicConn, QuicStream,
+};
 
 const MIN_HOP_INTERVAL: Duration = Duration::from_secs(5);
 const DEFAULT_HOP_INTERVAL: Duration = Duration::from_secs(30);
@@ -415,6 +417,9 @@ pub fn next_hop_interval(start: Duration, max: Duration) -> Duration {
 pub struct ClientStream {
     stream: QuicStream,
     destination: String,
+    /// The request header until the send half has taken every byte of it, empty before it is built
+    /// and once it is behind us.
+    request_header: BytesMut,
     request_written: bool,
     response_read: bool,
     prefix: Vec<u8>,
@@ -422,7 +427,14 @@ pub struct ClientStream {
 
 impl ClientStream {
     fn new(stream: QuicStream, destination: String) -> Self {
-        Self { stream, destination, request_written: false, response_read: false, prefix: Vec::new() }
+        Self {
+            stream,
+            destination,
+            request_header: BytesMut::new(),
+            request_written: false,
+            response_read: false,
+            prefix: Vec::new(),
+        }
     }
 
     /// Consumes the response header out of `prefix`, growing it from the stream until it parses.
@@ -489,23 +501,23 @@ impl AsyncRead for ClientStream {
 
 impl AsyncWrite for ClientStream {
     fn poll_write(mut self: Pin<&mut Self>, cx: &mut Context<'_>, buf: &[u8]) -> Poll<io::Result<usize>> {
-        if !self.request_written {
-            let frame = protocol::write_tcp_request(&self.destination, buf);
-            let frame_len = frame.len();
-            return match AsyncWrite::poll_write(Pin::new(&mut self.stream.send), cx, &frame) {
-                Poll::Ready(Ok(written)) if written == frame_len => {
-                    self.request_written = true;
-                    Poll::Ready(Ok(buf.len()))
+        let this = self.as_mut().get_mut();
+        if !this.request_written {
+            if this.request_header.is_empty() {
+                this.request_header = protocol::write_tcp_request_header(&this.destination);
+            }
+            // The header goes out whole before any payload byte can follow it; a window too small for
+            // it leaves the tail here for the next poll instead of failing the write.
+            match poll_write_header(&mut this.stream.send, cx, &mut this.request_header) {
+                Poll::Ready(Ok(())) => {
+                    this.request_written = true;
+                    this.request_header = BytesMut::new();
                 }
-                Poll::Ready(Ok(_)) => {
-                    Poll::Ready(Err(io::Error::other("hysteria2: short write of the stream request")))
-                }
-                Poll::Ready(Err(err)) => Poll::Ready(Err(err)),
-                // Nothing was accepted, so the header still has to go out on the next poll.
-                Poll::Pending => Poll::Pending,
-            };
+                Poll::Ready(Err(err)) => return Poll::Ready(Err(err)),
+                Poll::Pending => return Poll::Pending,
+            }
         }
-        AsyncWrite::poll_write(Pin::new(&mut self.stream.send), cx, buf)
+        AsyncWrite::poll_write(Pin::new(&mut this.stream.send), cx, buf)
     }
 
     fn poll_flush(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
@@ -574,6 +586,7 @@ mod tests {
     use base64::Engine as _;
     use murmur_component_ca::keypair::{new_random_tls_key_pair, KeyPairType};
     use rustls::pki_types::{CertificateDer, PrivateKeyDer, PrivatePkcs8KeyDer};
+    use tokio::io::AsyncWriteExt;
 
     use super::*;
 
@@ -887,5 +900,62 @@ mod tests {
             "a zero receive window leaves the first write unaccepted"
         );
         assert!(!stream.request_written, "nothing was accepted, so the next poll still has to send the request");
+    }
+
+    /// The server advertises a window smaller than the request header alone, so the send half can
+    /// only take a prefix of the first write; a short accept is progress, and the bytes it leaves
+    /// behind still have to reach the peer as exactly one request header followed by the payload.
+    #[tokio::test]
+    async fn a_short_first_write_still_carries_one_request_header() {
+        murmur_testsupport_probe::ensure_test_crypto_provider();
+
+        let mut transport = quinn::TransportConfig::default();
+        transport.stream_receive_window(quinn::VarInt::from_u32(64));
+        let crypto =
+            quinn::crypto::rustls::QuicServerConfig::try_from((*server_tls()).clone()).expect("quinn takes the config");
+        let mut server_config = quinn::ServerConfig::with_crypto(Arc::new(crypto));
+        server_config.transport_config(Arc::new(transport));
+        let endpoint = quinn::Endpoint::server(server_config, "127.0.0.1:0".parse().unwrap()).unwrap();
+        let addr = endpoint.local_addr().unwrap();
+
+        let client_endpoint = quinn::Endpoint::client("127.0.0.1:0".parse().unwrap()).unwrap();
+        let crypto =
+            quinn::crypto::rustls::QuicClientConfig::try_from((*client_tls()).clone()).expect("quinn takes the config");
+        let connecting = client_endpoint
+            .connect_with(quinn::ClientConfig::new(Arc::new(crypto)), addr, "localhost")
+            .expect("dial the server");
+        // The server answers the handshake only once the application takes the connection.
+        let accepting = async {
+            endpoint
+                .accept()
+                .await
+                .expect("the server endpoint is still accepting")
+                .await
+                .expect("the server handshake completes")
+        };
+        let (connection, server_connection) = futures::join!(connecting, accepting);
+        let connection = connection.expect("the client handshake completes");
+        let (send, recv) = connection.open_bi().await.expect("open a proxy stream");
+        let mut stream = ClientStream::new(QuicStream { send, recv }, "example.com:443".to_owned());
+        let payload = vec![0x5a; 4096];
+
+        // The peer reads while the client writes, which is what reopens the credit a short accept
+        // left closed.
+        let body_len = payload.len();
+        let reader = tokio::spawn(async move {
+            let (_, mut server_recv) = server_connection.accept_bi().await.expect("accept the proxy stream");
+            let destination = protocol::read_tcp_request(&mut server_recv).await.expect("the request header parses");
+            let mut body = vec![0u8; body_len];
+            server_recv.read_exact(&mut body).await.expect("the payload arrives whole");
+            (destination, body)
+        });
+
+        stream.write_all(&payload).await.expect("the first write completes once the peer reopens the window");
+        let parsed = tokio::time::timeout(Duration::from_secs(20), reader)
+            .await
+            .expect("the peer parses in time")
+            .expect("the peer task does not fail");
+        assert_eq!(parsed.0, "example.com:443", "exactly one request header precedes the payload");
+        assert_eq!(parsed.1, payload, "the payload arrives byte for byte");
     }
 }
