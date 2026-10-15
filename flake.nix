@@ -39,6 +39,31 @@
           RUSTFLAGS = "-Clink-arg=-fuse-ld=mold -Clink-arg=-B${pkgs.mold}/bin";
         };
 
+        aarch64-musl =
+          let
+            cross = pkgs.pkgsCross.aarch64-multiplatform-musl;
+            targetPrefix = cross.stdenv.cc.targetPrefix;
+          in
+          pkgs.mkShell {
+            packages = [
+              cross.buildPackages.rustc
+              cross.buildPackages.cargo
+              cross.stdenv.cc
+              pkgs.cmake
+              pkgs.perl
+              pkgs.pkg-config
+              pkgs.sccache
+            ];
+
+            CARGO_TARGET_AARCH64_UNKNOWN_LINUX_MUSL_LINKER = "${targetPrefix}gcc";
+            CC_aarch64_unknown_linux_musl = "${targetPrefix}gcc";
+            CXX_aarch64_unknown_linux_musl = "${targetPrefix}g++";
+            AR_aarch64_unknown_linux_musl = "${targetPrefix}ar";
+            CARGO_TARGET_AARCH64_UNKNOWN_LINUX_MUSL_RUSTFLAGS = "-C target-feature=+crt-static";
+            CARGO_INCREMENTAL = "0";
+            RUSTFLAGS = "-C target-feature=+crt-static";
+          };
+
         windows =
           let
             cross = pkgs.pkgsCross.mingwW64;

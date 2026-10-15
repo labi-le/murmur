@@ -28,6 +28,9 @@ use super::memory::{new_memory_store, MemoryStore};
 const OFFSET_KEY: &str = "key-offset-fake-ip";
 const CYCLE_KEY: &str = "key-cycle-fake-ip";
 
+// Reloaded pools share cachefile buckets but not their per-pool state mutex.
+static PERSISTENT_ALLOCATION: Mutex<()> = Mutex::new(());
+
 /// A closed enum, not a trait object: `Pool` only ever holds one of these two concrete backends,
 /// and every call site already matches on which one it needs.
 pub(crate) enum Store {
@@ -135,6 +138,16 @@ impl Pool {
             return ip;
         }
 
+        let _persistent_allocation = if matches!(&state.store, Store::Cachefile(_)) {
+            let guard = PERSISTENT_ALLOCATION.lock();
+            if let Some(ip) = state.store.by_host(&host) {
+                return ip;
+            }
+            Some(guard)
+        } else {
+            None
+        };
+
         let ip = get_locked(&mut state, self.first, self.last, &host);
         state.store.put_by_host(&host, ip);
         ip
@@ -165,21 +178,37 @@ impl Pool {
         self.ipnet
     }
 
-    /// clone cache from old pool.
+    /// Clone mappings and the allocation cursor from an old pool with the same prefix.
     pub fn clone_from(&self, o: &Self) {
-        let o_state = o.state.lock();
-        let p_state = self.state.lock();
+        if std::ptr::eq(self, o) || self.first != o.first || self.last != o.last {
+            return;
+        }
+
+        // Opposite-direction clones must acquire the pool locks in the same order.
+        let (mut p_state, o_state) = if std::ptr::from_ref(self) < std::ptr::from_ref(o) {
+            (self.state.lock(), o.state.lock())
+        } else {
+            let o_state = o.state.lock();
+            (self.state.lock(), o_state)
+        };
         o_state.store.clone_to(&p_state.store);
+        p_state.offset = o_state.offset;
+        p_state.cycle = o_state.cycle;
     }
 
     pub fn flush_fake_ip(&self) -> Result<()> {
         let mut state = self.state.lock();
-        flush_fake_ip_locked(&mut state, self.first)
+        let persistent_allocation = matches!(&state.store, Store::Cachefile(_)).then(|| PERSISTENT_ALLOCATION.lock());
+        let result = flush_fake_ip_locked(&mut state, self.first);
+        drop(persistent_allocation);
+        drop(state);
+        result
     }
 
     pub fn store_state(&self) {
         let state = self.state.lock();
         if let Store::Cachefile(s) = &state.store {
+            let _persistent_allocation = PERSISTENT_ALLOCATION.lock();
             s.put_by_host(OFFSET_KEY, state.offset);
             if state.cycle {
                 s.put_by_host(CYCLE_KEY, state.offset);
@@ -202,14 +231,21 @@ fn lower_host(host: &str) -> Cow<'_, str> {
 }
 
 fn get_locked(state: &mut PoolState, first: IpAddr, last: IpAddr, host: &str) -> IpAddr {
-    state.offset = addr_next(state.offset);
+    loop {
+        state.offset = addr_next(state.offset);
 
-    if !addr_less(state.offset, last) {
-        state.cycle = true;
-        state.offset = first;
+        if !addr_less(state.offset, last) {
+            state.cycle = true;
+            state.offset = first;
+        }
+
+        // Persistent mappings can be newer than a restored or copied cursor.
+        if state.cycle || !state.store.exist(state.offset) {
+            break;
+        }
     }
 
-    if state.cycle || state.store.exist(state.offset) {
+    if state.cycle {
         state.store.del_by_ip(state.offset);
     }
 
@@ -230,9 +266,9 @@ fn restore_state(ipnet: &IpNet, first: IpAddr, state: &mut PoolState) {
     let Store::Cachefile(store) = &state.store else {
         return;
     };
+    let _persistent_allocation = PERSISTENT_ALLOCATION.lock();
     let has_cycle = store.by_host(CYCLE_KEY).is_some();
     let offset_entry = store.by_host(OFFSET_KEY);
-    let first_exists = store.exist(first);
 
     if has_cycle {
         state.cycle = true;
@@ -243,9 +279,7 @@ fn restore_state(ipnet: &IpNet, first: IpAddr, state: &mut PoolState) {
         Some(_) => {
             let _ = flush_fake_ip_locked(state, first);
         }
-        None if first_exists => {
-            let _ = flush_fake_ip_locked(state, first);
-        }
+        // A live pool may have written mappings without saving its shutdown cursor yet.
         None => {}
     }
 }
@@ -339,11 +373,11 @@ mod tests {
 
     fn create_pools(options: Options) -> Result<(Vec<Pool>, PathBuf)> {
         let pool = new(options)?;
-        let (file_pool, tempfile) = create_cachefile_store(options)?;
+        let (file_pool, _, tempfile) = create_cachefile_store(options)?;
         Ok((vec![pool, file_pool], tempfile))
     }
 
-    fn create_cachefile_store(options: Options) -> Result<(Pool, PathBuf)> {
+    fn create_cachefile_store(options: Options) -> Result<(Pool, Arc<CacheFile>, PathBuf)> {
         let pool = new(options)?;
         let path = temp_file_path();
 
@@ -353,10 +387,9 @@ mod tests {
             &BoltOptions { timeout: Some(std::time::Duration::from_secs(1)), no_statistics: true },
         )?;
 
-        let mut state = pool.state.lock();
-        state.store = Store::Cachefile(new_cachefile_store(&Arc::new(CacheFile { db: Some(db) }), options.ip_net));
-        drop(state);
-        Ok((pool, path))
+        let cache = Arc::new(CacheFile { db: Some(db) });
+        pool.state.lock().store = Store::Cachefile(new_cachefile_store(&cache, options.ip_net));
+        Ok((pool, cache, path))
     }
 
     #[test]
@@ -495,6 +528,178 @@ mod tests {
         new_pool.clone_from(&pool);
         assert!(new_pool.look_back(first).is_some());
         assert!(new_pool.look_back(last).is_some());
+    }
+
+    #[test]
+    fn cloned_pool_preserves_active_destinations_when_allocating_new_hosts() {
+        let options = Options { ip_net: "192.0.2.0/24".parse().unwrap(), size: 64, persistence: false };
+        let pool = new(options).unwrap();
+        let hosts = ["one.example", "two.example", "three.example", "four.example"];
+        let addresses = hosts.map(|host| pool.lookup(host));
+
+        let reloaded = new(options).unwrap();
+        reloaded.clone_from(&pool);
+        for _ in 0..32 {
+            for (host, ip) in hosts.iter().zip(addresses) {
+                assert_eq!(reloaded.lookup(host), ip);
+            }
+        }
+
+        for host in ["new.example", "another.example"] {
+            let ip = reloaded.lookup(host);
+            assert!(!addresses.contains(&ip));
+            assert_eq!(reloaded.look_back(ip).as_deref(), Some(host));
+        }
+        for (host, ip) in hosts.iter().zip(addresses) {
+            assert_eq!(reloaded.lookup(host), ip);
+            assert_eq!(reloaded.look_back(ip).as_deref(), Some(*host));
+        }
+    }
+
+    #[test]
+    fn cloned_pool_continues_fifo_eviction_after_wrapping() {
+        let options = Options { ip_net: "192.0.2.0/29".parse().unwrap(), size: 64, persistence: false };
+        let pool = new(options).unwrap();
+        let first = pool.lookup("one.example");
+        let second = pool.lookup("two.example");
+        let third = pool.lookup("three.example");
+        assert_eq!(pool.lookup("four.example"), first);
+
+        let reloaded = new(options).unwrap();
+        reloaded.clone_from(&pool);
+        assert_eq!(reloaded.lookup("five.example"), second);
+        assert_eq!(reloaded.look_back(first).as_deref(), Some("four.example"));
+        assert_eq!(reloaded.look_back(second).as_deref(), Some("five.example"));
+        assert_eq!(reloaded.look_back(third).as_deref(), Some("three.example"));
+        assert_eq!(reloaded.lookup("four.example"), first);
+    }
+
+    #[test]
+    fn cloning_a_pool_into_itself_preserves_mappings() {
+        let pool = new(Options { ip_net: "192.0.2.0/24".parse().unwrap(), size: 64, persistence: false }).unwrap();
+        let ip = pool.lookup("active.example");
+        pool.clone_from(&pool);
+        assert_eq!(pool.lookup("active.example"), ip);
+        assert_eq!(pool.look_back(ip).as_deref(), Some("active.example"));
+        assert_ne!(pool.lookup("new.example"), ip);
+    }
+
+    #[test]
+    fn persistent_reload_preserves_destinations_with_missing_or_stale_cursor() {
+        let options = Options { ip_net: "192.0.2.0/24".parse().unwrap(), size: 64, persistence: false };
+        for save_stale_cursor in [false, true] {
+            let (pool, cache, tempfile) = create_cachefile_store(options).unwrap();
+            let _guard = TempFileGuard(tempfile);
+            let first = pool.lookup("one.example");
+            if save_stale_cursor {
+                pool.store_state();
+            }
+            let second = pool.lookup("two.example");
+            let third = pool.lookup("three.example");
+            let active = [("one.example", first), ("two.example", second), ("three.example", third)];
+
+            // Reconstruct against the same cache, as config parsing does before patch_from.
+            let reloaded = new(options).unwrap();
+            let mut state = reloaded.state.lock();
+            state.store = Store::Cachefile(new_cachefile_store(&cache, options.ip_net));
+            restore_state(&options.ip_net, reloaded.first, &mut state);
+            drop(state);
+
+            for (host, ip) in active {
+                assert_eq!(pool.look_back(ip).as_deref(), Some(host));
+            }
+            // A restart has no live pool to clone, so allocation must tolerate stale metadata.
+            let restart_ip = reloaded.lookup("restart.example");
+            assert!(!active.iter().any(|(_, ip)| *ip == restart_ip));
+            assert_eq!(reloaded.look_back(restart_ip).as_deref(), Some("restart.example"));
+
+            reloaded.clone_from(&pool);
+            // An in-flight old DNS request may allocate after the cursor snapshot was copied.
+            let late_ip = pool.lookup("late.example");
+            let new_ip = reloaded.lookup("four.example");
+            assert_ne!(new_ip, late_ip);
+            assert_ne!(new_ip, restart_ip);
+            assert_eq!(reloaded.look_back(late_ip).as_deref(), Some("late.example"));
+            assert_eq!(reloaded.look_back(new_ip).as_deref(), Some("four.example"));
+            for _ in 0..32 {
+                for (host, ip) in active {
+                    assert_eq!(reloaded.lookup(host), ip);
+                    assert_eq!(reloaded.look_back(ip).as_deref(), Some(host));
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn concurrent_persistent_pools_keep_both_mapping_directions() {
+        let options = Options { ip_net: "192.0.2.0/24".parse().unwrap(), size: 64, persistence: false };
+        let (pool, cache, tempfile) = create_cachefile_store(options).unwrap();
+        let _guard = TempFileGuard(tempfile);
+        let reloaded = new(options).unwrap();
+        reloaded.state.lock().store = Store::Cachefile(new_cachefile_store(&cache, options.ip_net));
+        reloaded.clone_from(&pool);
+        let barrier = std::sync::Barrier::new(2);
+
+        let (old_addresses, new_addresses) = std::thread::scope(|scope| {
+            let old = scope.spawn(|| {
+                (0..16)
+                    .map(|i| {
+                        barrier.wait();
+                        pool.lookup(&format!("old-{i}.example"))
+                    })
+                    .collect::<Vec<_>>()
+            });
+            let new = scope.spawn(|| {
+                (0..16)
+                    .map(|i| {
+                        barrier.wait();
+                        reloaded.lookup(&format!("new-{i}.example"))
+                    })
+                    .collect::<Vec<_>>()
+            });
+            (old.join().unwrap(), new.join().unwrap())
+        });
+
+        for (prefix, addresses) in [("old", old_addresses), ("new", new_addresses)] {
+            for (i, ip) in addresses.into_iter().enumerate() {
+                let host = format!("{prefix}-{i}.example");
+                assert_eq!(pool.lookup(&host), ip);
+                assert_eq!(reloaded.lookup(&host), ip);
+                assert_eq!(pool.look_back(ip).as_deref(), Some(host.as_str()));
+                assert_eq!(reloaded.look_back(ip).as_deref(), Some(host.as_str()));
+            }
+        }
+    }
+
+    #[test]
+    fn opposite_direction_clones_do_not_deadlock() {
+        let options = Options { ip_net: "192.0.2.0/24".parse().unwrap(), size: 64, persistence: false };
+        let a = new(options).unwrap();
+        let b = new(options).unwrap();
+        let ip = a.lookup("active.example");
+        assert_eq!(b.lookup("active.example"), ip);
+        let barrier = std::sync::Barrier::new(2);
+
+        std::thread::scope(|scope| {
+            scope.spawn(|| {
+                barrier.wait();
+                for _ in 0..100 {
+                    a.clone_from(&b);
+                }
+            });
+            scope.spawn(|| {
+                barrier.wait();
+                for _ in 0..100 {
+                    b.clone_from(&a);
+                }
+            });
+        });
+
+        for pool in [&a, &b] {
+            assert_eq!(pool.lookup("active.example"), ip);
+            assert_eq!(pool.look_back(ip).as_deref(), Some("active.example"));
+            assert_ne!(pool.lookup("new.example"), ip);
+        }
     }
 
     #[test]

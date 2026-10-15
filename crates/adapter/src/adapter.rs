@@ -279,7 +279,12 @@ impl Proxy {
         let is_https = parsed.scheme() == "https";
 
         let build_request = || -> Result<hyper::Request<Empty<Bytes>>> {
-            Ok(hyper::Request::builder().method(hyper::Method::HEAD).uri(url).body(Empty::<Bytes>::new())?)
+            // The connection already reaches the origin; the low-level client needs Host explicitly.
+            Ok(hyper::Request::builder()
+                .method(hyper::Method::HEAD)
+                .uri(&parsed[url::Position::BeforePath..url::Position::AfterQuery])
+                .header(hyper::header::HOST, &parsed[url::Position::BeforeHost..url::Position::AfterPort])
+                .body(Empty::<Bytes>::new())?)
         };
 
         let phase1 = async {
@@ -375,7 +380,9 @@ fn url_to_metadata(raw_url: &str) -> Result<Metadata> {
     };
 
     let mut addr = Metadata::default();
-    addr.set_remote_address(&join_host_port(parsed.host_str().unwrap_or_default(), &port))?;
+    let host = parsed.host_str().unwrap_or_default();
+    let host = host.strip_prefix('[').and_then(|host| host.strip_suffix(']')).unwrap_or(host);
+    addr.set_remote_address(&join_host_port(host, &port))?;
     Ok(addr)
 }
 
@@ -431,6 +438,8 @@ impl Stream for DeferClose {
 #[cfg(test)]
 mod tests {
     use chrono::TimeZone;
+    use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+    use tokio::net::{TcpListener, TcpStream};
 
     use super::*;
 
@@ -448,7 +457,10 @@ mod tests {
         }
     }
 
-    struct StubAdapter;
+    #[derive(Default)]
+    struct StubAdapter {
+        dial_addr: Option<std::net::SocketAddr>,
+    }
 
     #[async_trait]
     impl CProxyAdapter for StubAdapter {
@@ -477,7 +489,9 @@ mod tests {
         }
 
         async fn dial_context(&self, _ctx: &CancellationToken, _metadata: &mut Metadata) -> Result<Box<dyn CConn>> {
-            Err(anyhow!("the stub adapter never dials"))
+            let addr = self.dial_addr.ok_or_else(|| anyhow!("the stub adapter has no dial address"))?;
+            let stream = TcpStream::connect(addr).await?;
+            Ok(murmur_adapter_outbound::base::new_conn(Box::new(stream), self))
         }
 
         async fn listen_packet_context(
@@ -505,13 +519,75 @@ mod tests {
         }
     }
 
+    #[tokio::test]
+    async fn url_test_sends_origin_form_and_host_and_tracks_expected_status() {
+        tokio::time::timeout(Duration::from_secs(5), async {
+            for (authority, expected_host, target, expected_status, alive) in [
+                ("127.0.0.1:18081", "127.0.0.1:18081", "/probe?check=one%20two", "204", true),
+                ("probe.example:18081", "probe.example:18081", "/probe?check=one%20two", "204", true),
+                ("[::1]:18081", "[::1]:18081", "/probe?check=one%20two", "204", true),
+                ("user:password@probe.example", "probe.example", "/", "204", true),
+                ("127.0.0.1:18081", "127.0.0.1:18081", "/probe?check=one%20two", "200", false),
+            ] {
+                let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind health-check origin");
+                let addr = listener.local_addr().expect("health-check origin address");
+                let server = tokio::spawn(async move {
+                    let (stream, _) = listener.accept().await.expect("accept health check");
+                    let mut reader = BufReader::new(stream);
+                    let mut request_line = String::new();
+                    reader.read_line(&mut request_line).await.expect("read request line");
+                    let mut hosts = Vec::new();
+                    loop {
+                        let mut line = String::new();
+                        let count = reader.read_line(&mut line).await.expect("read request header");
+                        assert_ne!(count, 0, "health check ended before its headers");
+                        if line == "\r\n" {
+                            break;
+                        }
+                        if let Some((name, value)) = line.split_once(':') {
+                            if name.eq_ignore_ascii_case("host") {
+                                hosts.push(value.trim().to_owned());
+                            }
+                        }
+                    }
+                    let valid = request_line == format!("HEAD {target} HTTP/1.1\r\n") && hosts == [expected_host];
+                    let response = if valid {
+                        "HTTP/1.1 204 No Content\r\nConnection: close\r\n\r\n"
+                    } else {
+                        "HTTP/1.1 400 Bad Request\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
+                    };
+                    reader.get_mut().write_all(response.as_bytes()).await.expect("respond to health check");
+                    (request_line, hosts)
+                });
+
+                let proxy = Proxy::new(Arc::new(StubAdapter { dial_addr: Some(addr) }));
+                let url = format!("http://{authority}{target}#not-sent");
+                let expected =
+                    murmur_common::utils::ranges::new_unsigned_ranges(expected_status).expect("status range");
+                let delay = proxy.url_test(&CancellationToken::new(), &url, expected).await.expect("health check");
+                let (request_line, hosts) = server.await.expect("health-check origin");
+
+                assert_eq!(request_line, format!("HEAD {target} HTTP/1.1\r\n"), "{url}");
+                assert_eq!(hosts, [expected_host], "{url}");
+                assert!(proxy.alive.load(), "a status mismatch must not change transport liveness");
+                assert_eq!(proxy.alive_for_test_url(&url), alive, "{url}");
+                let state = proxy.extra_delay_histories().remove(&url).expect("per-URL state");
+                assert_eq!(state.alive, alive, "{url}");
+                assert_eq!(state.history.len(), 1);
+                assert_eq!(state.history[0].delay, if alive { delay } else { 0 });
+            }
+        })
+        .await
+        .expect("health-check wire regression timed out");
+    }
+
     /// The wrapper's own keys sort, while `history`/`extra` hold
     /// structs whose declaration order survives, so a `DelayHistory` stays `{"time":…,"delay":…}`.
     #[test]
     fn history_and_extra_keep_the_field_order() {
         let time = Utc.with_ymd_and_hms(2026, 9, 24, 13, 0, 0).unwrap();
         let url = "http://192.0.2.1/";
-        let proxy = Proxy::new(Arc::new(StubAdapter));
+        let proxy = Proxy::new(Arc::new(StubAdapter::default()));
         proxy.put_history_for_test(DelayHistory { time, delay: 42 });
         proxy.put_extra_history_for_test(
             url,
@@ -535,7 +611,7 @@ mod tests {
         let url = "http://192.0.2.1/";
         let other = "http://192.0.2.2/";
         let time = Utc.with_ymd_and_hms(2026, 9, 24, 13, 0, 0).unwrap();
-        let proxy = Proxy::new(Arc::new(StubAdapter));
+        let proxy = Proxy::new(Arc::new(StubAdapter::default()));
         proxy.put_extra_history_for_test(
             url,
             ProxyState { alive: true, history: vec![DelayHistory { time, delay: 12 }] },

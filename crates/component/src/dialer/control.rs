@@ -468,7 +468,8 @@ fn kernel_version_at_least(want_major: u32, want_minor: u32) -> bool {
     if unsafe { libc::uname(&raw mut name) } != 0 {
         return false;
     }
-    let release: Vec<u8> = name.release.iter().take_while(|&&c| c != 0).map(|&c| c.cast_unsigned()).collect();
+    let release: Vec<u8> =
+        name.release.iter().take_while(|&&c| c != 0).map(|&c| u8::from_ne_bytes(c.to_ne_bytes())).collect();
     let release = String::from_utf8_lossy(&release);
     let mut parts = release.split(|c: char| !c.is_ascii_digit()).filter(|s| !s.is_empty());
     let major: u32 = parts.next().and_then(|s| s.parse().ok()).unwrap_or(0);

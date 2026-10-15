@@ -1,10 +1,8 @@
 //!
 //! Keeps a vehicle's contents up to date in the background.
 //!
-//! The fetcher is shared across the pull loop and the file watcher callback, which need an
-//! explicit owner for that background work, so `new_fetcher` returns `Arc<Fetcher<V>>` and every
-//! method that starts background work takes `self: &Arc<Self>`/`self: Arc<Self>` instead of
-//! `&self`.
+//! Background tasks own `Arc<Fetcher<V>>`; the watcher callback keeps only a weak reference
+//! to avoid a cycle with the watcher stored in the fetcher, and schedules onto its captured runtime.
 //!
 //! The `BundleFile` factory's return type has exactly three methods and no crate equivalent, so
 //! [`BundleFileHandle`] below covers it entirely: a read-position-carrying read, the `mod_time`
@@ -229,16 +227,27 @@ impl<V: Clone + Default + Send + Sync + 'static> Fetcher<V> {
 
     fn start_pull_loop(self: &Arc<Self>, force_update: bool) -> Result<()> {
         if self.vehicle.type_() == VehicleType::FILE {
-            let path = self.vehicle.path();
-            let handler_self = Arc::clone(self);
-            let mut watcher = notify::recommended_watcher(move |_event: notify::Result<notify::Event>| {
-                let task_self = Arc::clone(&handler_self);
+            let path = std::path::absolute(self.vehicle.path())?;
+            let parent =
+                path.parent().ok_or_else(|| anyhow::anyhow!("file provider path has no parent: {}", path.display()))?;
+            let target = path.clone();
+            // notify invokes this callback on its own thread, outside the Tokio context.
+            let runtime = tokio::runtime::Handle::current();
+            let handler_self = Arc::downgrade(self);
+            let mut watcher = notify::recommended_watcher(move |event: notify::Result<notify::Event>| {
+                if !file_event_needs_update(&event, &target) {
+                    return;
+                }
+                let Some(task_self) = handler_self.upgrade() else {
+                    return;
+                };
                 let path = task_self.vehicle.path();
-                tokio::spawn(async move {
+                runtime.spawn(async move {
                     task_self.update_callback(&path).await;
                 });
             })?;
-            watcher.watch(std::path::Path::new(&path), notify::RecursiveMode::NonRecursive)?;
+            // Editors and rule updaters replace the inode; its parent watch survives those renames.
+            watcher.watch(parent, notify::RecursiveMode::NonRecursive)?;
             *self.watcher.write() = Some(watcher);
         } else if self.interval > Duration::ZERO {
             tokio::spawn(Arc::clone(self).pull_loop(force_update));
@@ -263,6 +272,20 @@ impl<V: Clone + Default + Send + Sync + 'static> Fetcher<V> {
                 }
             }
         }
+    }
+}
+
+fn file_event_needs_update(event: &notify::Result<notify::Event>, target: &std::path::Path) -> bool {
+    use notify::event::{AccessKind, AccessMode};
+
+    // Do not let our own reads trigger more reads; retain write-close notifications.
+    match event {
+        Ok(event) => {
+            (event.paths.is_empty() || event.paths.iter().any(|path| path == target))
+                && (!event.kind.is_access()
+                    || matches!(event.kind, notify::EventKind::Access(AccessKind::Close(AccessMode::Write))))
+        }
+        Err(_) => true,
     }
 }
 
@@ -298,4 +321,162 @@ pub fn new_fetcher<V: Clone + Default + Send + Sync + 'static>(
         load_buf_mutex: SyncMutex::new(()),
         backoff: Backoff { factor: 2.0, jitter: false, min: min_backoff, max: interval, ..Backoff::default() },
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::vehicle::FileVehicle;
+
+    struct TestFile(std::path::PathBuf);
+
+    impl TestFile {
+        fn new() -> Self {
+            static NEXT_ID: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+            let id = NEXT_ID.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            let stamp = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).expect("clock").as_nanos();
+            let dir = std::env::temp_dir().join(format!("murmur-file-watcher-{}-{stamp}-{id}", std::process::id()));
+            std::fs::create_dir(&dir).expect("create isolated provider directory");
+            Self(dir.join("provider.txt"))
+        }
+    }
+
+    impl Drop for TestFile {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(self.0.parent().expect("provider directory"));
+        }
+    }
+
+    #[test]
+    fn file_watcher_ignores_reads_but_refreshes_after_writes() {
+        use notify::event::{AccessKind, AccessMode, CreateKind, DataChange, ModifyKind, RemoveKind};
+        use notify::{Event, EventKind};
+        let target = std::path::Path::new("provider.txt");
+
+        for kind in [
+            EventKind::Access(AccessKind::Read),
+            EventKind::Access(AccessKind::Open(AccessMode::Any)),
+            EventKind::Access(AccessKind::Open(AccessMode::Read)),
+            EventKind::Access(AccessKind::Close(AccessMode::Read)),
+        ] {
+            assert!(
+                !file_event_needs_update(&Ok(Event::new(kind).add_path(target.to_path_buf())), target),
+                "ignore {kind:?}",
+            );
+        }
+        for kind in [
+            EventKind::Access(AccessKind::Close(AccessMode::Write)),
+            EventKind::Modify(ModifyKind::Data(DataChange::Content)),
+            EventKind::Create(CreateKind::File),
+            EventKind::Remove(RemoveKind::File),
+            EventKind::Any,
+            EventKind::Other,
+        ] {
+            assert!(
+                file_event_needs_update(&Ok(Event::new(kind).add_path(target.to_path_buf())), target),
+                "refresh on {kind:?}",
+            );
+            assert!(
+                !file_event_needs_update(&Ok(Event::new(kind).add_path("sibling.txt".into())), target),
+                "ignore sibling {kind:?}",
+            );
+        }
+        assert!(file_event_needs_update(&Err(notify::Error::generic("watch error")), target));
+        assert!(file_event_needs_update(&Ok(Event::new(EventKind::Other)), target));
+    }
+
+    #[tokio::test]
+    async fn file_watcher_publishes_parsed_changes_from_notify_thread() {
+        let file = TestFile::new();
+        std::fs::write(&file.0, b"17").expect("write initial provider");
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+        let fetcher = new_fetcher(
+            "file-watcher-regression",
+            Duration::ZERO,
+            Arc::new(FileVehicle::new(file.0.to_str().expect("UTF-8 temporary path"))),
+            None,
+            Arc::new(|buf| Ok(std::str::from_utf8(buf)?.parse::<u32>()?)),
+            Some(Arc::new(move |value| {
+                let _ = tx.send(value);
+            })),
+        );
+
+        assert_eq!(fetcher.initial().await.expect("load and watch provider"), 17);
+        assert_eq!(
+            tokio::time::timeout(Duration::from_secs(5), rx.recv()).await.expect("initial parsed content published"),
+            Some(17),
+        );
+
+        std::fs::write(&file.0, b"42").expect("rewrite watched provider");
+        assert_eq!(
+            tokio::time::timeout(Duration::from_secs(5), rx.recv()).await.expect("notify publishes changed content"),
+            Some(42),
+        );
+
+        fetcher.close().expect("close live watcher");
+        fetcher.close().expect("close is idempotent");
+        let weak = Arc::downgrade(&fetcher);
+        drop(fetcher);
+        tokio::time::timeout(Duration::from_secs(5), async {
+            while weak.strong_count() != 0 {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("in-flight updates release the closed fetcher");
+    }
+
+    #[tokio::test]
+    async fn file_watcher_survives_successive_atomic_replacements() {
+        let file = TestFile::new();
+        std::fs::write(&file.0, b"17").expect("write initial provider");
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+        let fetcher = new_fetcher(
+            "file-watcher-replacement",
+            Duration::ZERO,
+            Arc::new(FileVehicle::new(file.0.to_str().expect("UTF-8 temporary path"))),
+            None,
+            Arc::new(|buf| Ok(std::str::from_utf8(buf)?.parse::<u32>()?)),
+            Some(Arc::new(move |value| {
+                let _ = tx.send(value);
+            })),
+        );
+        assert_eq!(fetcher.initial().await.expect("load and watch provider"), 17);
+        assert_eq!(
+            tokio::time::timeout(Duration::from_secs(5), rx.recv()).await.expect("initial parsed content published"),
+            Some(17),
+        );
+
+        let replacement = file.0.with_extension("replacement");
+        for (bytes, expected) in [(b"42", 42), (b"99", 99), (b"17", 17)] {
+            std::fs::write(&replacement, bytes).expect("write replacement provider");
+            std::fs::rename(&replacement, &file.0).expect("atomically replace watched provider");
+            assert_eq!(
+                tokio::time::timeout(Duration::from_secs(5), rx.recv())
+                    .await
+                    .expect("notify publishes replacement content"),
+                Some(expected),
+            );
+        }
+        fetcher.close().expect("close replacement watcher");
+    }
+
+    #[tokio::test]
+    async fn dropping_file_fetcher_releases_its_watcher_without_close() {
+        let file = TestFile::new();
+        std::fs::write(&file.0, b"17").expect("write initial provider");
+        let fetcher = new_fetcher(
+            "file-watcher-drop",
+            Duration::ZERO,
+            Arc::new(FileVehicle::new(file.0.to_str().expect("UTF-8 temporary path"))),
+            None,
+            Arc::new(|buf| Ok(std::str::from_utf8(buf)?.parse::<u32>()?)),
+            None,
+        );
+        assert_eq!(fetcher.initial().await.expect("load and watch provider"), 17);
+
+        let weak = Arc::downgrade(&fetcher);
+        drop(fetcher);
+        assert!(weak.upgrade().is_none(), "watcher callback must not own the fetcher that owns it");
+    }
 }

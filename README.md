@@ -48,6 +48,51 @@ validates a config, then exits without starting the proxy — `crates/hub/src/ex
 carries the `e2e_supported.yaml` fixture that exercises every supported protocol family in that
 mode. `-v` prints version and build metadata.
 
+### ARM64 OpenWrt builds
+
+The `aarch64-musl` shell supplies the cross compiler and target standard library for
+64-bit ARM routers. On the shared hosts, keep compilation inside a remote slot:
+
+```bash
+CARGO_TARGET_DIR=openwrt-aarch64-musl \
+CARGO_PROFILE_RELEASE_STRIP=symbols \
+tools/cargo-slot bash -c 'nix develop .#aarch64-musl --command cargo build -j 2 --locked --release -p murmur --bin murmur --target aarch64-unknown-linux-musl'
+```
+
+The artifact is on `pc` at
+`/home/labile/.cache/cargo-pc/openwrt-aarch64-musl/aarch64-unknown-linux-musl/release/murmur`.
+Check it with `file` and `readelf -l -d` before installing: a portable static build
+must not require a `/nix/store` interpreter or shared libraries. The shell sets
+`RUSTFLAGS` explicitly because an inherited empty value overrides Cargo's
+target-specific static-link flags.
+
+OpenWrt integration needs separate firewall and service configuration. Keep
+`iptables.enable: false` when fw4/nftables owns interception, install the
+`kmod-nft-tproxy` kernel package and configure both the capture fwmark's policy
+route and a different outbound `routing-mark`. Forward dnsmasq to murmur's DNS
+listener with caching disabled for fake-IP answers. Seed every rule provider
+before exposing DNS; file providers can carry the same entries in `payload` to
+make their rules available before asynchronous file loading. Bind the controller
+to loopback and restrict proxy/DNS ports to the intended client network. An
+IPv4-only policy also needs an explicit IPv6 forwarding policy.
+
+Health checks send HEAD requests to the configured origin, with an origin-form
+path/query and a `Host` header carrying its authority, including a nondefault
+port or bracketed IPv6 literal. An HTTP response outside `expected-status` can
+still produce a measured delay, but its per-URL health state is unhealthy; use
+that state rather than a nonzero delay alone to validate node availability.
+
+File-provider watchers schedule updates on their owning Tokio runtime, not on
+notify's OS thread. They watch the provider's parent directory and filter by
+path, so successive atomic replacements keep working. Read/open events do not
+trigger refreshes; content changes and write-close events do. Dropping the
+provider releases its watcher without requiring a separate close call.
+
+Fake-IP reloads preserve the allocator cursor alongside mappings. A persistent
+pool skips occupied addresses when its saved cursor is stale or absent, and
+serializes misses across old and new pools that share a cachefile. Existing
+destinations remain assigned to their original names until normal pool reuse.
+
 The common recipes are `make` targets: `check`, `fmt`, `fmt-check`, `clippy`,
 `test`, `nextest`, `test-heavy`, `gate` (`fmt-check nextest clippy hygiene`), `gate-full`,
 `hygiene`, `deny`, `machete`, `audit`, `typos`, `lint`, `act-test`, `test-windows`,

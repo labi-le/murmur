@@ -19,14 +19,13 @@ use super::{Cleanup, Device, TunAddresses};
 
 /// `linux/if_tun.h`. `IFF_NO_PI` is what makes a read a bare IP packet rather than one behind a
 /// four-byte flags header every packet would then have to be stripped of.
-const TUNSETIFF: libc::c_ulong = 0x4004_54ca;
-const TUNGETIFF: libc::c_ulong = 0x8004_54d2;
 const IFF_TUN: libc::c_short = 0x0001;
 const IFF_NO_PI: libc::c_short = 0x1000;
 
-const SIOCGIFFLAGS: libc::c_ulong = 0x8913;
-const SIOCSIFFLAGS: libc::c_ulong = 0x8914;
-const SIOCSIFMTU: libc::c_ulong = 0x8922;
+// libc's SIOC constants use c_ulong, but ioctl takes c_int on musl.
+const SIOCGIFFLAGS: libc::Ioctl = 0x8913;
+const SIOCSIFFLAGS: libc::Ioctl = 0x8914;
+const SIOCSIFMTU: libc::Ioctl = 0x8922;
 const IFF_UP: libc::c_short = 0x1;
 const IFF_RUNNING: libc::c_short = 0x40;
 
@@ -175,7 +174,7 @@ fn tun_set_iff(fd: RawFd, requested: &str) -> io::Result<String> {
         let mut ifr: libc::ifreq = std::mem::zeroed();
         write_ifreq_name(&mut ifr, requested)?;
         ifr.ifr_ifru.ifru_flags = IFF_TUN | IFF_NO_PI;
-        if libc::ioctl(fd, TUNSETIFF, &raw mut ifr) < 0 {
+        if libc::ioctl(fd, libc::TUNSETIFF, &raw mut ifr) < 0 {
             return Err(io::Error::last_os_error());
         }
         read_ifreq_name(&ifr)
@@ -187,7 +186,7 @@ fn tun_name(fd: RawFd) -> io::Result<String> {
     // Safety: the kernel writes the interface name into `ifr_name` of a live local `ifreq`.
     unsafe {
         let mut ifr: libc::ifreq = std::mem::zeroed();
-        if libc::ioctl(fd, TUNGETIFF, &raw mut ifr) < 0 {
+        if libc::ioctl(fd, libc::TUNGETIFF, &raw mut ifr) < 0 {
             return Err(io::Error::last_os_error());
         }
         read_ifreq_name(&ifr)
@@ -195,7 +194,7 @@ fn tun_name(fd: RawFd) -> io::Result<String> {
 }
 
 fn read_ifreq_name(ifr: &libc::ifreq) -> io::Result<String> {
-    let name = ifr.ifr_name.map(libc::c_char::cast_unsigned);
+    let name = ifr.ifr_name.map(|c| u8::from_ne_bytes(c.to_ne_bytes()));
     let name = name.split(|b| *b == 0).next().unwrap_or(&[]);
     let name = std::str::from_utf8(name).map(str::to_owned);
     match name {
@@ -255,7 +254,7 @@ fn write_ifreq_name(ifr: &mut libc::ifreq, name: &str) -> io::Result<()> {
     if name.len() >= libc::IF_NAMESIZE {
         return Err(io::Error::new(io::ErrorKind::InvalidInput, format!("interface name {name} is too long")));
     }
-    ifr.ifr_name.iter_mut().zip(name.as_bytes()).for_each(|(dst, &src)| *dst = src.cast_signed());
+    ifr.ifr_name.iter_mut().zip(name.as_bytes()).for_each(|(dst, &src)| *dst = libc::c_char::from_ne_bytes([src]));
     Ok(())
 }
 
@@ -300,18 +299,21 @@ mod tests {
     #[test]
     fn write_touches_only_the_name() {
         let mut ifr = zeroed_ifreq();
-        ifr.ifr_name = [-1; libc::IF_NAMESIZE];
+        ifr.ifr_name = [libc::c_char::from_ne_bytes([0xff]); libc::IF_NAMESIZE];
         write_ifreq_name(&mut ifr, "tun0").expect("write name");
-        assert_eq!(ifr.ifr_name[..4], b"tun0".map(|b| b.cast_signed()));
-        assert!(ifr.ifr_name[4..].iter().all(|&b| b == -1), "the write must not reach past the name");
+        assert_eq!(ifr.ifr_name[..4], b"tun0".map(|b| libc::c_char::from_ne_bytes([b])));
+        assert!(
+            ifr.ifr_name[4..].iter().all(|&b| b == libc::c_char::from_ne_bytes([0xff])),
+            "the write must not reach past the name"
+        );
     }
 
     #[test]
     fn read_stops_at_the_nul_even_over_a_dirty_field() {
         let mut ifr = zeroed_ifreq();
         write_ifreq_name(&mut ifr, "eth1").expect("write name");
-        ifr.ifr_name[10] = -1;
-        ifr.ifr_name[11] = -1;
+        ifr.ifr_name[10] = libc::c_char::from_ne_bytes([0xff]);
+        ifr.ifr_name[11] = libc::c_char::from_ne_bytes([0xff]);
         assert_eq!(read_ifreq_name(&ifr).expect("read name"), "eth1");
     }
 
