@@ -1,10 +1,27 @@
 use std::sync::Arc;
 
 use anyhow::Result;
+use tokio::sync::{Mutex as AsyncMutex, MutexGuard as AsyncMutexGuard};
 
 use crate::executor::executor as executor_mod;
 use crate::route::server as route_server;
 use murmur_config::config::Config;
+
+/// Serialises a whole configuration operation.
+///
+/// Parsing is not side-effect free: `config::config::parse_raw_config` calls the general-update
+/// hook, which writes the live general globals for the duration of the parse and rolls them back
+/// through a `Drop` guard when it returns. An API update running inside that window (`PUT` and
+/// `PATCH /configs` mutate the same globals and listeners) would be undone by the rollback, so
+/// every entry point that parses or mutates the running configuration takes this lock for its whole
+/// operation, parse and apply included.
+static CONFIG_OPERATION: AsyncMutex<()> = AsyncMutex::const_new(());
+
+/// Holds [`CONFIG_OPERATION`] for one parse-and-apply, or for one API update.
+#[must_use]
+pub async fn lock_config_operation() -> AsyncMutexGuard<'static, ()> {
+    CONFIG_OPERATION.lock().await
+}
 
 /// A callback that mutates a [`Config`]. In this module std's `Option` is spelled in full.
 pub type Option = Box<dyn Fn(&mut Config) + Send + Sync>;
@@ -65,9 +82,13 @@ pub fn with_secret(secret: &str) -> Option {
 }
 
 /// Dispatches the configuration to all parts, including the external controller.
-pub async fn apply_config(cfg: Config) {
+///
+/// The caller holds [`CONFIG_OPERATION`] ([`parse`] takes it). A failure means the configuration
+/// reached every part but at least one of them could not do what it asked, so the running state is
+/// the partially applied one.
+pub async fn apply_config(cfg: Config) -> Result<()> {
     apply_route(&cfg).await;
-    executor_mod::apply_config(cfg, true).await;
+    executor_mod::apply_config(cfg, true).await
 }
 
 async fn apply_route(cfg: &Config) {
@@ -100,8 +121,13 @@ async fn apply_route(cfg: &Config) {
     .await;
 }
 
-/// Parses the configuration at startup.
+/// Parses the configuration at startup, or again on a reload.
+///
+/// Holds [`CONFIG_OPERATION`] across the parse and the apply, so an API update cannot interleave
+/// with the parse-time general update and be rolled back by it.
 pub async fn parse(config_bytes: &[u8], options: &[Option]) -> Result<()> {
+    let _operation = lock_config_operation().await;
+
     let mut cfg = if config_bytes.is_empty() {
         executor_mod::parse().await?
     } else {
@@ -113,6 +139,5 @@ pub async fn parse(config_bytes: &[u8], options: &[Option]) -> Result<()> {
     }
 
     // Boxed: the config-apply chain is by far the largest future awaited here.
-    Box::pin(apply_config(cfg)).await;
-    Ok(())
+    Box::pin(apply_config(cfg)).await
 }

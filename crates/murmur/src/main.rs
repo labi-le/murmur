@@ -31,8 +31,9 @@
 
 use std::collections::HashMap;
 use std::io::Read as _;
+use std::path::{Path, PathBuf};
 
-use anyhow::Result;
+use anyhow::{bail, Result};
 use base64::engine::general_purpose::STANDARD;
 use base64::Engine as _;
 
@@ -47,8 +48,8 @@ use murmur_constant_features as features;
 use murmur_dns::system as dns_system;
 use murmur_hub::executor::executor as hub_executor;
 use murmur_hub::hub;
-use murmur_log::errorln;
-use murmur_log::fatalln;
+use murmur_hub::watch as hub_watch;
+use murmur_log::{debugln, errorln, fatalln, infoln};
 use murmur_rules::provider::mrs_converter;
 
 #[derive(Clone)]
@@ -272,7 +273,7 @@ fn get_int_env(key: &str) -> i32 {
 
 /// Joins a relative `path` onto the current directory.
 fn resolve_relative(path: &str) -> String {
-    if std::path::Path::new(path).is_absolute() {
+    if Path::new(path).is_absolute() {
         return path.to_owned();
     }
     let current_dir = std::env::current_dir().unwrap_or_default();
@@ -347,14 +348,53 @@ fn define_flags() -> Vec<FlagDef> {
             "set post-down script",
             FlagValue::Str(std::env::var("CLASH_POST_DOWN").unwrap_or_default()),
         ),
+        FlagDef::new(
+            "watch-config",
+            "watch the configuration file and reload it after every change (default: off)",
+            FlagValue::Bool(false),
+        ),
         FlagDef::new("m", "set geodata mode", FlagValue::Bool(false)),
         FlagDef::new("v", "show current version of murmur", FlagValue::Bool(false)),
         FlagDef::new("t", "test configuration and exit", FlagValue::Bool(false)),
     ]
 }
 
+/// Resolves after the watched file has stopped changing, returning its path.
+///
+/// Never resolves without a watcher, so the arm it backs is inert unless `--watch-config` is on.
+///
+/// cancel-safe: a queued tick stays in the channel and the quiet period restarts, so a cancelled
+/// wait loses no change.
+async fn watched_change(watch: &mut Option<hub_watch::ConfigWatcher>) -> PathBuf {
+    match watch {
+        Some(watch) => {
+            watch.settled().await;
+            watch.target().to_path_buf()
+        }
+        None => std::future::pending().await,
+    }
+}
+
+/// Applies the watched file and reports what happened to it.
+async fn reload_watched(target: &Path, options: &[hub::Option], applied: &mut Option<Vec<u8>>, force: bool) {
+    match hub_watch::reload_from_disk(target, options, applied, force).await {
+        hub_watch::Reload::Applied => infoln!("configuration file {} reloaded", target.display()),
+        hub_watch::Reload::Unchanged => {
+            debugln!("configuration file {} is unchanged; nothing to reload", target.display());
+        }
+        hub_watch::Reload::Failed(err) => {
+            errorln!("configuration file {} was not applied: {err}", target.display());
+        }
+    }
+}
+
 #[cfg(unix)]
-async fn wait_for_signal_or_reload(config_bytes: &[u8], options: &[hub::Option]) {
+async fn wait_for_signal_or_reload(
+    config_bytes: &[u8],
+    options: &[hub::Option],
+    mut watch: Option<hub_watch::ConfigWatcher>,
+    mut applied: Option<Vec<u8>>,
+) {
     use tokio::signal::unix::{signal, SignalKind};
 
     let mut sigint = match signal(SignalKind::interrupt()) {
@@ -379,25 +419,54 @@ async fn wait_for_signal_or_reload(config_bytes: &[u8], options: &[hub::Option])
         }
     };
 
+    let watched = watch.as_ref().map(|watch| watch.target().to_path_buf());
+
     loop {
         tokio::select! {
             _ = sigint.recv() => return,
             _ = sigterm.recv() => return,
             _ = sighup.recv() => {
-                if let Err(err) = hub::parse(config_bytes, options).await {
-                    errorln!("Parse config error: {err}");
+                match watched.as_deref() {
+                    // Forced: an operator's SIGHUP reapplies the file even when it did not change,
+                    // which is also what undoes a change made over the API.
+                    Some(target) => reload_watched(target, options, &mut applied, true).await,
+                    None => {
+                        if let Err(err) = hub::parse(config_bytes, options).await {
+                            errorln!("Parse config error: {err}");
+                        }
+                    }
                 }
+            }
+            path = watched_change(&mut watch) => {
+                infoln!("configuration file {} changed", path.display());
+                reload_watched(&path, options, &mut applied, false).await;
             }
         }
     }
 }
 
 /// Windows has no `SIGHUP`-equivalent config-reload signal reachable without extra dependencies
-/// beyond this crate's pinned dependency set; only the interrupt path is implemented here
-/// (deviation).
+/// beyond this crate's pinned dependency set, so the automatic watcher is the only reload path
+/// here (deviation).
 #[cfg(not(unix))]
-async fn wait_for_signal_or_reload(_config_bytes: &[u8], _options: &[hub::Option]) {
-    let _ = tokio::signal::ctrl_c().await;
+async fn wait_for_signal_or_reload(
+    _config_bytes: &[u8],
+    options: &[hub::Option],
+    mut watch: Option<hub_watch::ConfigWatcher>,
+    mut applied: Option<Vec<u8>>,
+) {
+    let interrupt = tokio::signal::ctrl_c();
+    tokio::pin!(interrupt);
+
+    loop {
+        tokio::select! {
+            _ = &mut interrupt => return,
+            path = watched_change(&mut watch) => {
+                infoln!("configuration file {} changed", path.display());
+                reload_watched(&path, options, &mut applied, false).await;
+            }
+        }
+    }
 }
 
 #[expect(clippy::print_stdout, reason = "the version banner is this CLI's user interface")]
@@ -475,7 +544,7 @@ fn initial_config_bytes(flags: &[FlagDef]) -> Option<Vec<u8>> {
         return Some(buf);
     }
     if config_file.is_empty() {
-        config_file = std::path::Path::new(&PATH.home_dir()).join(PATH.config()).to_string_lossy().into_owned();
+        config_file = Path::new(&PATH.home_dir()).join(PATH.config()).to_string_lossy().into_owned();
     } else {
         config_file = resolve_relative(&config_file);
     }
@@ -537,6 +606,24 @@ fn hub_options(flags: &[FlagDef]) -> Vec<hub::Option> {
     options
 }
 
+/// Whether `--watch-config` was asked for and its startup source can be watched.
+///
+/// The watched file is the one `-f` resolves at startup (`PATH.config()`), never a fixed file name.
+/// `-f -` and `--config` carry the configuration in the process arguments, so there is nothing on
+/// disk to watch: watch mode is refused for them instead of falling back to the default path. This
+/// runs before the source is read, because `-f -` would otherwise wait for stdin to close.
+fn watch_requested(flags: &[FlagDef]) -> Result<bool> {
+    if !flag_bool(flags, "watch-config") {
+        return Ok(false);
+    }
+    if !flag_str(flags, "config").is_empty() || flag_str(flags, "f") == "-" {
+        bail!(
+            "--watch-config needs a configuration file on disk; `-f -` and `--config` keep the configuration in the process arguments"
+        );
+    }
+    Ok(true)
+}
+
 #[tokio::main]
 async fn main() -> Result<()> {
     dns_system::init();
@@ -559,6 +646,21 @@ async fn main() -> Result<()> {
 
     apply_early_flags(&flags);
 
+    // A watch mode whose source has no file is refused before that source is read: `-f -` would
+    // otherwise wait for stdin to close. `-t` never starts a watcher, so it keeps the plain
+    // "read the configuration, then exit" behaviour.
+    let watching = if flag_bool(&flags, "t") {
+        false
+    } else {
+        match watch_requested(&flags) {
+            Ok(watching) => watching,
+            Err(err) => {
+                fatalln!("watch mode error: {err}");
+                return Ok(());
+            }
+        }
+    };
+
     let Some(config_bytes) = initial_config_bytes(&flags) else {
         return Ok(());
     };
@@ -568,7 +670,39 @@ async fn main() -> Result<()> {
         return Ok(());
     }
 
+    // Watch mode reads the file itself and hands those exact bytes to the first parse, so the
+    // reload loop starts holding the configuration that is already running: a byte-identical save
+    // is then skipped as unchanged instead of replacing a change made over the API. Reading the
+    // file after the parse instead would race with an edit.
+    let (config_bytes, applied) = if watching {
+        match tokio::fs::read(PATH.config()).await {
+            Ok(bytes) => {
+                let applied = Some(bytes.clone());
+                (bytes, applied)
+            }
+            Err(err) => {
+                fatalln!("Initial configuration error: cannot read {}: {err}", PATH.config());
+                return Ok(());
+            }
+        }
+    } else {
+        (config_bytes, None)
+    };
+
     let options = hub_options(&flags);
+
+    // Watching starts before the first parse, so a change written during startup is not missed.
+    let watch = if watching {
+        match hub_watch::ConfigWatcher::new(&PATH.config()).await {
+            Ok(watcher) => Some(watcher),
+            Err(err) => {
+                fatalln!("watch mode error: {err}");
+                return Ok(());
+            }
+        }
+    } else {
+        None
+    };
 
     if let Err(err) = hub::parse(&config_bytes, &options).await {
         fatalln!("Parse config error: {err}");
@@ -587,7 +721,7 @@ async fn main() -> Result<()> {
         }
     }
 
-    wait_for_signal_or_reload(&config_bytes, &options).await;
+    wait_for_signal_or_reload(&config_bytes, &options, watch, applied).await;
 
     hub_executor::shutdown().await;
 
@@ -654,5 +788,19 @@ mod tests {
     fn parsing_stops_at_the_first_non_flag_argument() {
         assert!(!flag_bool(&parse(&["convert-ruleset", "-v"]), "v"));
         assert!(!flag_bool(&parse(&["--", "-v"]), "v"));
+    }
+
+    /// `--watch-config` is refused for the startup sources that keep the configuration in the
+    /// process arguments, and stays off unless it is asked for.
+    #[test]
+    fn watch_mode_is_refused_without_a_configuration_file() {
+        assert!(!watch_requested(&parse(&[])).expect("watch mode defaults to off"));
+
+        for args in [&["-f", "-", "--watch-config"][..], &["--config", "Z2VuZXJhbDoge30=", "--watch-config"][..]] {
+            assert!(watch_requested(&parse(args)).is_err(), "{args:?} has no file to watch");
+        }
+
+        let file = parse(&["-f", "/tmp/murmur-config.yaml", "--watch-config"]);
+        assert!(watch_requested(&file).expect("a file path is watchable"));
     }
 }

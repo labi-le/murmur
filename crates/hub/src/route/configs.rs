@@ -48,8 +48,18 @@ pub(crate) async fn route(req: Req, segs: &[&str]) -> Option<Response<RespBody>>
     match segs {
         [] => match *req.method() {
             Method::GET => Some(get_configs().await),
-            Method::PUT if !embed_mode() => Some(update_configs(req).await),
-            Method::PATCH if !embed_mode() => Some(patch_configs(req).await),
+            // Both mutating methods take the same lock a parse-and-apply takes: they write the
+            // listeners and the general globals that a concurrent parse writes and rolls back.
+            // The handlers themselves take nothing, so a caller that does not come through here
+            // (a test) has to serialise itself.
+            Method::PUT if !embed_mode() => {
+                let _operation = crate::hub::lock_config_operation().await;
+                Some(update_configs(req).await)
+            }
+            Method::PATCH if !embed_mode() => {
+                let _operation = crate::hub::lock_config_operation().await;
+                Some(patch_configs(req).await)
+            }
             _ => Some(status_only(StatusCode::METHOD_NOT_ALLOWED)),
         },
         ["geo"] if !embed_mode() => {
@@ -715,18 +725,31 @@ async fn patch_configs(req: Req) -> Response<RespBody> {
     let ports = get_ports().await;
 
     let tunnel = tunnel_arc();
-    re_create_http(general.port.unwrap_or(ports.port), Arc::clone(&tunnel)).await;
-    re_create_socks(general.socks_port.unwrap_or(ports.socks_port), Arc::clone(&tunnel)).await;
-    re_create_redir(general.redir_port.unwrap_or(ports.redir_port), Arc::clone(&tunnel)).await;
-    re_create_tproxy(general.tproxy_port.unwrap_or(ports.tproxy_port), Arc::clone(&tunnel)).await;
-    re_create_mixed(general.mixed_port.unwrap_or(ports.mixed_port), Arc::clone(&tunnel)).await;
-    if let Some(tun_patch) = general.tun {
-        re_create_tun(merge_tun_schema(&get_tun_conf(), tun_patch), Arc::clone(&tunnel)).await;
+    let mut failures = Vec::new();
+    for result in [
+        re_create_http(general.port.unwrap_or(ports.port), Arc::clone(&tunnel)).await,
+        re_create_socks(general.socks_port.unwrap_or(ports.socks_port), Arc::clone(&tunnel)).await,
+        re_create_redir(general.redir_port.unwrap_or(ports.redir_port), Arc::clone(&tunnel)).await,
+        re_create_tproxy(general.tproxy_port.unwrap_or(ports.tproxy_port), Arc::clone(&tunnel)).await,
+        re_create_mixed(general.mixed_port.unwrap_or(ports.mixed_port), Arc::clone(&tunnel)).await,
+        re_create_shadow_socks(&general.shadow_socks_config.unwrap_or(ports.shadow_socks_config), Arc::clone(&tunnel))
+            .await,
+        re_create_vmess(&general.vmess_config.unwrap_or(ports.vmess_config), Arc::clone(&tunnel)).await,
+        re_create_tuic(pointer_or_default_tuic_server(general.tuic_server, last_tuic_conf().await), tunnel).await,
+    ] {
+        if let Err(err) = result {
+            failures.push(err);
+        }
     }
-    re_create_shadow_socks(&general.shadow_socks_config.unwrap_or(ports.shadow_socks_config), Arc::clone(&tunnel))
-        .await;
-    re_create_vmess(&general.vmess_config.unwrap_or(ports.vmess_config), Arc::clone(&tunnel)).await;
-    re_create_tuic(pointer_or_default_tuic_server(general.tuic_server, last_tuic_conf().await), tunnel).await;
+    if let Some(tun_patch) = general.tun {
+        re_create_tun(merge_tun_schema(&get_tun_conf(), tun_patch), tunnel_arc()).await;
+    }
+    if !failures.is_empty() {
+        // Each listener logged its own bind error; this line says the request left the running
+        // configuration incomplete rather than conforming to it.
+        let joined = failures.iter().map(ToString::to_string).collect::<Vec<_>>().join("; ");
+        errorln!("PATCH /configs left the running configuration incomplete: {joined}");
+    }
 
     if let Some(mode) = general.mode {
         murmur_tunnel::tunnel::set_mode(mode);
@@ -815,7 +838,11 @@ async fn update_configs(req: Req) -> Response<RespBody> {
         }
     };
 
-    apply_config(cfg, force).await;
+    if let Err(err) = apply_config(cfg, force).await {
+        // The request still carries the configuration it was given; this says the running state
+        // does not match it yet, which a 204 alone would hide.
+        errorln!("PUT /configs left the running configuration incomplete: {err}");
+    }
     no_content()
 }
 
@@ -838,14 +865,13 @@ pub(crate) async fn update_geo_databases() -> Response<RespBody> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::test_support::TUNNEL_STATE_LOCK;
     use murmur_component_process::find_process_mode::FindProcessMode;
     use murmur_config::config::{General, Inbound};
     use murmur_listener::listener::{get_tuic_conf, set_tun_conf};
     use murmur_listener_config::tuic::TuicServer;
     use murmur_listener_config::tun::Tun;
     use murmur_log::LogLevel;
-
-    use crate::test_support::TUNNEL_STATE_LOCK;
 
     fn default_tun_for_test() -> Tun {
         Tun {
@@ -1210,7 +1236,9 @@ mod tests {
     async fn patch_configs_merges_tuic_server_onto_last_stored_conf() {
         let _tunnel_state = TUNNEL_STATE_LOCK.lock().await;
         let _restore = TunnelStateGuard::save();
-        re_create_tuic(
+        // The listener may or may not bind in the test process; what the test reads back is the
+        // conf this call stores, which is stored either way.
+        let _ = re_create_tuic(
             TuicServer { listen: ":10443".to_owned(), certificate: "example.crt".to_owned(), ..TuicServer::default() },
             tunnel_arc(),
         )

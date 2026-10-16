@@ -1504,6 +1504,13 @@ pub(crate) mod test_http {
     }
 }
 
+/// `re_create_server` keeps the listeners in process-wide statics, and the next call closes
+/// whatever the previous one installed — including the transports the new config does not name —
+/// so no two callers may interleave. Every test that drives it holds this for its whole body: the
+/// controller tests below, and the config-watch reload tests that run a full `hub::parse`.
+#[cfg(test)]
+pub(crate) static CONTROLLER_LISTENERS: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+
 #[cfg(test)]
 mod tests {
     use super::test_http::{exchange, RawResponse};
@@ -1857,11 +1864,6 @@ mod tests {
         .await;
         assert_eq!(get.status, StatusCode::METHOD_NOT_ALLOWED);
     }
-
-    /// `re_create_server` keeps the listeners in process-wide statics, and the next call closes
-    /// whatever the previous one installed — including the transports the new config does not
-    /// name — so the tests that reload the controller may not interleave.
-    static CONTROLLER_LISTENERS: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
 
     /// One raw `GET` on an established connection: the status code and the whole response.
     async fn get_on<S>(stream: &mut S, target: &str, secret: Option<&str>) -> (u16, String)
