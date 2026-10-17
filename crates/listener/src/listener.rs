@@ -1021,42 +1021,48 @@ mod tests {
     async fn a_failed_redir_udp_bind_is_retried_on_the_next_re_create() {
         let logs = murmur_log::subscribe().await.expect("a log subscription");
         // The port has to be free for TCP and held for UDP. Its number comes from an ephemeral UDP
-        // bind (no other way to name a UDP port), so the TCP side is probed and, because a parallel
-        // test binary can take it between the probe and the bind, the re-create is retried on the
-        // same port instead of asserting on the first attempt. That collision is how this test
+        // bind (there is no other way to name a UDP port), so the TCP side is probed, and when a
+        // parallel test binary takes it between the probe and the bind the probe is repeated on a
+        // fresh number instead of asserting on the first attempt. That collision is how this test
         // failed the workspace gate while passing in the crate's own run.
-        let mut probes = 0;
-        let (port, holder) = loop {
-            probes += 1;
-            assert!(probes < 200, "no ephemeral port was free for the TCP half");
-            let holder = std::net::UdpSocket::bind((std::net::Ipv4Addr::LOCALHOST, 0)).expect("a held UDP port");
-            let port = holder.local_addr().expect("the held address").port();
-            if std::net::TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, port)).is_ok() {
-                break (i32::from(port), holder);
-            }
-        };
-
-        let mut tcp_bound = false;
         for _ in 0..20 {
+            let (holder, port) = {
+                let mut probed = None;
+                for _ in 0..200 {
+                    let holder =
+                        std::net::UdpSocket::bind((std::net::Ipv4Addr::LOCALHOST, 0)).expect("a held UDP port");
+                    let port = holder.local_addr().expect("the held address").port();
+                    if std::net::TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, port)).is_ok() {
+                        probed = Some((holder, i32::from(port)));
+                        break;
+                    }
+                }
+                probed.expect("an ephemeral port free for both halves")
+            };
+
             let _ = re_create_redir(port, null_tunnel()).await;
-            if redir_state(port).await.0 {
-                tcp_bound = true;
-                break;
+            if !redir_state(port).await.0 {
+                // The TCP side was taken between the probe and the bind; try a different number.
+                drop(holder);
+                close_redir().await;
+                tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+                continue;
             }
-            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+
+            assert!(!redir_state(port).await.1, "the held UDP port cannot be bound");
+            assert!(redir_udp_warnings(&logs, 1).await >= 1);
+
+            drop(holder);
+            let _ = re_create_redir(port, null_tunnel()).await;
+
+            if !redir_state(port).await.1 {
+                assert_eq!(redir_udp_warnings(&logs, 1).await, 1, "the retry must reach the UDP bind");
+            }
+
+            close_redir().await;
+            murmur_log::un_subscribe(logs).await;
+            return;
         }
-        assert!(tcp_bound, "the TCP half takes the address the held UDP port leaves free");
-        assert!(!redir_state(port).await.1, "the held UDP port cannot be bound");
-        assert!(redir_udp_warnings(&logs, 1).await >= 1);
-
-        drop(holder);
-        let _ = re_create_redir(port, null_tunnel()).await;
-
-        if !redir_state(port).await.1 {
-            assert_eq!(redir_udp_warnings(&logs, 1).await, 1, "the retry must reach the UDP bind");
-        }
-
-        close_redir().await;
-        murmur_log::un_subscribe(logs).await;
+        panic!("no probed port stayed free for the TCP half");
     }
 }
