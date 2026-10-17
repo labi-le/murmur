@@ -62,11 +62,13 @@ file itself, so atomic replacement by an editor or a configuration generator, a 
 and a file deleted then recreated all reload, while sibling files, reads and opens do not. The
 bytes the process applied at startup count as applied, so saving that same file again is skipped
 instead of reapplying it over a runtime change made through the API. A truncated, malformed or
-unreadable file is not applied, and neither is a configuration whose listeners or external
-controller could not bind: the specific error is logged and the cache of applied content is
-cleared, because a failed apply may already have closed or replaced listeners. Restoring the last
-good file therefore reapplies it, and the same bytes are retried once the cause is gone. A
-completed reload means the file parsed and every part it named applied; the apply steps that can
+unreadable file is not applied and leaves that cache of applied content alone: nothing ran, so the
+running configuration still matches it and a later save of those same bytes is still skipped. A
+configuration that parsed but whose listeners or external controller could not bind is also not
+applied, but it clears the cache, because the failed apply may already have closed or replaced
+listeners; restoring the last good file therefore reapplies it. In both cases the specific error is
+logged, and saving the bytes again retries them once the cause is gone. A completed reload means the
+file parsed and every part it named applied; the apply steps that can
 report a failure (inbound listeners, tunnels and the controller transports) report it to the
 caller, while a `tun` section the device refuses stays the documented degradation that clears
 `enable` in the stored conf. Because the watcher follows the canonical path, replacing the symlink itself is
