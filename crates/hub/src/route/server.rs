@@ -36,6 +36,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::SystemTime;
 
+use anyhow::anyhow;
 use chrono::{DateTime, NaiveDateTime, Utc};
 use futures::StreamExt as _;
 use http_body_util::{BodyExt, StreamBody};
@@ -177,17 +178,29 @@ impl Cors {
     }
 }
 
-#[expect(
-    clippy::unused_async,
-    reason = "the exported entry point is awaited by `hub::apply_route` and by the integration test; the body only spawns the four listeners"
-)]
-pub async fn re_create_server(cfg: Arc<Config>) {
-    tokio::spawn(start(Arc::clone(&cfg)));
-    tokio::spawn(start_tls(Arc::clone(&cfg)));
-    tokio::spawn(start_unix(Arc::clone(&cfg)));
-    if SUPPORT_NAMED_PIPE {
-        tokio::spawn(start_pipe(cfg));
+/// Replaces every controller transport with the one `cfg` names.
+///
+/// The starts are awaited rather than spawned: a caller that reports the outcome of a configuration
+/// application has to see a transport that could not bind, otherwise it records a partial apply as
+/// a completed one and skips the retry.
+pub async fn re_create_server(cfg: Arc<Config>) -> anyhow::Result<()> {
+    let mut failures = Vec::new();
+    for result in [start(Arc::clone(&cfg)).await, start_tls(Arc::clone(&cfg)).await, start_unix(Arc::clone(&cfg)).await]
+    {
+        if let Err(err) = result {
+            failures.push(err);
+        }
     }
+    if SUPPORT_NAMED_PIPE {
+        if let Err(err) = start_pipe(cfg).await {
+            failures.push(err);
+        }
+    }
+    if failures.is_empty() {
+        return Ok(());
+    }
+    let joined = failures.iter().map(ToString::to_string).collect::<Vec<_>>().join("; ");
+    Err(anyhow!("{joined}"))
 }
 
 struct RunningServer {
@@ -1169,14 +1182,14 @@ async fn accept_loop(
     }
 }
 
-async fn start(cfg: Arc<Config>) {
+async fn start(cfg: Arc<Config>) -> anyhow::Result<()> {
     let old = HTTP_SERVER.lock().take();
     if let Some(server) = old {
         server.close().await;
     }
 
     if cfg.addr.is_empty() {
-        return;
+        return Ok(());
     }
 
     let mut lc = new_listen_config();
@@ -1186,7 +1199,7 @@ async fn start(cfg: Arc<Config>) {
         Ok(l) => l,
         Err(err) => {
             errorln!("External controller listen error: {}", err);
-            return;
+            return Err(anyhow!("external controller cannot bind {}: {err}", cfg.addr));
         }
     };
     infoln!("RESTful API listening at: {}", l.addr().map(|a| a.string()).unwrap_or_default());
@@ -1203,6 +1216,7 @@ async fn start(cfg: Arc<Config>) {
         "External controller serve error",
     ));
     *HTTP_SERVER.lock() = Some(RunningServer { listener, closed, task });
+    Ok(())
 }
 
 // cancel-safe: `TlsRunningServer::close` sets `closed` and then aborts, so a drop at the pending
@@ -1224,21 +1238,21 @@ async fn tls_accept_loop(listener: Arc<dyn Acceptor>, closed: Arc<AtomicBool>, s
     }
 }
 
-async fn start_tls(cfg: Arc<Config>) {
+async fn start_tls(cfg: Arc<Config>) -> anyhow::Result<()> {
     let old = TLS_SERVER.lock().take();
     if let Some(server) = old {
         server.close().await;
     }
 
     if cfg.tls_addr.is_empty() {
-        return;
+        return Ok(());
     }
 
     let cert_loader = match new_tls_key_pair_loader(&cfg.certificate, &cfg.private_key) {
         Ok(loader) => loader,
         Err(err) => {
             errorln!("External controller tls listen error: {}", err);
-            return;
+            return Err(anyhow!("external controller tls material is unusable: {err}"));
         }
     };
 
@@ -1249,13 +1263,13 @@ async fn start_tls(cfg: Arc<Config>) {
         Ok(l) => l,
         Err(err) => {
             errorln!("External controller tls listen error: {}", err);
-            return;
+            return Err(anyhow!("external controller cannot bind tls {}: {err}", cfg.tls_addr));
         }
     };
     infoln!("RESTful API tls listening at: {}", l.addr().map(|a| a.string()).unwrap_or_default());
 
     let Some(tls_config) = tls_config_for(&cfg, &cert_loader) else {
-        return;
+        return Err(anyhow!("external controller tls configuration is incomplete"));
     };
 
     let tls_listener: Arc<dyn Acceptor> =
@@ -1265,6 +1279,7 @@ async fn start_tls(cfg: Arc<Config>) {
     let state = Arc::new(RouterState::from_config(&cfg));
     let task = tokio::spawn(tls_accept_loop(Arc::clone(&tls_listener), Arc::clone(&closed), state));
     *TLS_SERVER.lock() = Some(TlsRunningServer { listener: tls_listener, closed, task });
+    Ok(())
 }
 
 /// The controller's TLS config: the defaults plus the certificate loader, the client-auth mode and
@@ -1346,14 +1361,14 @@ fn tls_config_for(cfg: &Config, cert_loader: &KeyPairLoader) -> Option<TlsConfig
     Some(tls_config)
 }
 
-async fn start_unix(cfg: Arc<Config>) {
+async fn start_unix(cfg: Arc<Config>) -> anyhow::Result<()> {
     let old = UNIX_SERVER.lock().take();
     if let Some(server) = old {
         server.close().await;
     }
 
     if cfg.unix_addr.is_empty() {
-        return;
+        return Ok(());
     }
 
     let addr = PATH.resolve(&cfg.unix_addr);
@@ -1361,7 +1376,7 @@ async fn start_unix(cfg: Arc<Config>) {
         if tokio::fs::metadata(dir).await.is_err() {
             if let Err(err) = tokio::fs::create_dir_all(dir).await {
                 errorln!("External controller unix listen error: {}", err);
-                return;
+                return Err(anyhow!("external controller cannot create the unix socket directory: {err}"));
             }
         }
     }
@@ -1375,7 +1390,7 @@ async fn start_unix(cfg: Arc<Config>) {
         Ok(l) => l,
         Err(err) => {
             errorln!("External controller unix listen error: {}", err);
-            return;
+            return Err(anyhow!("external controller cannot bind unix {}: {err}", cfg.unix_addr));
         }
     };
     #[cfg(unix)]
@@ -1397,28 +1412,29 @@ async fn start_unix(cfg: Arc<Config>) {
         "External controller unix serve error",
     ));
     *UNIX_SERVER.lock() = Some(RunningServer { listener, closed, task });
+    Ok(())
 }
 
-async fn start_pipe(cfg: Arc<Config>) {
+async fn start_pipe(cfg: Arc<Config>) -> anyhow::Result<()> {
     let old = PIPE_SERVER.lock().take();
     if let Some(server) = old {
         server.close().await;
     }
 
     if cfg.pipe_addr.is_empty() {
-        return;
+        return Ok(());
     }
 
     if !cfg.pipe_addr.starts_with(r"\\.\pipe\") {
         errorln!(r#"External controller pipe listen error: windows namedpipe must start with "\\.\pipe\""#);
-        return;
+        return Err(anyhow!("external controller pipe address is not a named pipe"));
     }
 
     let l = match listen_named_pipe(&cfg.pipe_addr) {
         Ok(l) => l,
         Err(err) => {
             errorln!("External controller pipe listen error: {}", err);
-            return;
+            return Err(anyhow!("external controller cannot open the pipe: {err}"));
         }
     };
     infoln!("RESTful API pipe listening at: {}", l.addr().map(|a| a.string()).unwrap_or_default());
@@ -1435,6 +1451,7 @@ async fn start_pipe(cfg: Arc<Config>) {
         "External controller pipe serve error",
     ));
     *PIPE_SERVER.lock() = Some(RunningServer { listener, closed, task });
+    Ok(())
 }
 
 /// Drives handlers over a real HTTP/1.1 connection: `Req` wraps `hyper::body::Incoming`, which
@@ -1503,6 +1520,13 @@ pub(crate) mod test_http {
         RawResponse { status, headers, body: raw[split + 4..].to_vec() }
     }
 }
+
+/// `re_create_server` keeps the listeners in process-wide statics, and the next call closes
+/// whatever the previous one installed — including the transports the new config does not name —
+/// so no two callers may interleave. Every test that drives it holds this for its whole body: the
+/// controller tests below, and the config-watch reload tests that run a full `hub::parse`.
+#[cfg(test)]
+pub(crate) static CONTROLLER_LISTENERS: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
 
 #[cfg(test)]
 mod tests {
@@ -1858,11 +1882,6 @@ mod tests {
         assert_eq!(get.status, StatusCode::METHOD_NOT_ALLOWED);
     }
 
-    /// `re_create_server` keeps the listeners in process-wide statics, and the next call closes
-    /// whatever the previous one installed — including the transports the new config does not
-    /// name — so the tests that reload the controller may not interleave.
-    static CONTROLLER_LISTENERS: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
-
     /// One raw `GET` on an established connection: the status code and the whole response.
     async fn get_on<S>(stream: &mut S, target: &str, secret: Option<&str>) -> (u16, String)
     where
@@ -1919,13 +1938,15 @@ mod tests {
         let addr = probe.local_addr().expect("probe local address").to_string();
         drop(probe);
 
-        re_create_server(Arc::new(Config { addr: addr.clone(), ..Config::default() })).await;
+        re_create_server(Arc::new(Config { addr: addr.clone(), ..Config::default() }))
+            .await
+            .expect("the test controller must start");
         let (status, body) = controller_response(&addr, "/version", None).await;
         assert_eq!(status, 200, "the first server did not answer: {body}");
         assert!(body.contains("\"version\""), "unexpected /version body: {body}");
 
         let cfg = Arc::new(Config { addr: addr.clone(), secret: "reload-secret".to_owned(), ..Config::default() });
-        re_create_server(cfg).await;
+        re_create_server(cfg).await.expect("the reloaded test controller must start");
 
         let (status, body) = controller_response(&addr, "/version", None).await;
         assert_eq!(status, 401, "something other than the reloaded server is listening: {body}");
@@ -1945,12 +1966,16 @@ mod tests {
         let addr = probe.local_addr().expect("probe local address").to_string();
         drop(probe);
 
-        re_create_server(Arc::new(Config { addr: addr.clone(), ui_path: ui_root, ..Config::default() })).await;
+        re_create_server(Arc::new(Config { addr: addr.clone(), ui_path: ui_root, ..Config::default() }))
+            .await
+            .expect("the test controller must start");
         let (status, body) = controller_response(&addr, "/ui/", None).await;
         assert_eq!(status, 200, "the configured ui root did not serve: {body}");
         assert!(body.ends_with("ROOT_INDEX"), "unexpected /ui/ body: {body}");
 
-        re_create_server(Arc::new(Config { addr: addr.clone(), ..Config::default() })).await;
+        re_create_server(Arc::new(Config { addr: addr.clone(), ..Config::default() }))
+            .await
+            .expect("the test controller must start");
         let (status, body) = controller_response(&addr, "/ui/", None).await;
         assert_eq!(status, 404, "the reloaded config still serves the root it dropped: {body}");
         assert!(body.ends_with("404 page not found\n"), "unexpected /ui/ body: {body}");

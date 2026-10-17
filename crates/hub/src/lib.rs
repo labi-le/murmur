@@ -24,11 +24,17 @@ pub mod executor;
 pub mod route;
 
 pub mod hub;
+pub mod watch;
 
-/// Serialises the tests that assert on a tunnel-state transaction: the process globals behind
-/// `murmur_tunnel::tunnel::mode` and `murmur_listener`'s stored confs are written both by a
-/// `/configs` PATCH and by every config parse (through the general-update hook), so overlapping
-/// transactions clobber each other's assertions.
+/// Serialises the tests that call `parse_with_bytes` directly: the general-update hook such a parse
+/// fires writes the process-global tunnel mode and `murmur_listener`'s stored confs for the
+/// duration of the parse and rolls them back afterwards, so two overlapping parses clobber each
+/// other's assertions.
+///
+/// The production entry points (`hub::parse`, `PUT` and `PATCH /configs`) do not use this lock:
+/// they take `hub::lock_config_operation`, which is also what a test that asserts on one of those
+/// transactions holds. `CONFIG_OPERATION` is always taken first, so the two are never acquired in
+/// the opposite order.
 #[cfg(test)]
 pub(crate) mod test_support {
     use tokio::sync::Mutex;

@@ -2,6 +2,7 @@ use std::collections::{HashMap, HashSet};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, LazyLock};
 
+use anyhow::anyhow;
 use serde::Serialize;
 use tokio::sync::Mutex as AsyncMutex;
 
@@ -189,23 +190,24 @@ pub async fn cleanup() {
     }
 }
 
-pub async fn re_create_http(port: i32, tunnel: Arc<dyn Tunnel>) {
+pub async fn re_create_http(port: i32, tunnel: Arc<dyn Tunnel>) -> anyhow::Result<()> {
     let mut state = HTTP_MUX.lock().await;
 
     let addr = gen_addr(&bind_address(), port, allow_lan());
 
     if let Some(listener) = &state.listener {
         if listener.raw_address() == addr {
-            return;
+            return Ok(());
         }
         let _ = listener.close();
         state.listener = None;
     }
 
     if port_is_zero(&addr) {
-        return;
+        return Ok(());
     }
 
+    let mut failed = false;
     match http_server::new(&addr, tunnel, &[]).await {
         Ok(listener) => {
             infoln!("HTTP proxy listening at: {}", listener.address());
@@ -217,11 +219,16 @@ pub async fn re_create_http(port: i32, tunnel: Arc<dyn Tunnel>) {
             // same error on this return path.
             errorln!("Start HTTP server error: {}", e);
             errorln!("Start HTTP server error: {}", e);
+            failed = true;
         }
     }
+    if failed {
+        return Err(anyhow!("the http listener did not start"));
+    }
+    Ok(())
 }
 
-pub async fn re_create_socks(port: i32, tunnel: Arc<dyn Tunnel>) {
+pub async fn re_create_socks(port: i32, tunnel: Arc<dyn Tunnel>) -> anyhow::Result<()> {
     let mut state = SOCKS_MUX.lock().await;
 
     let addr = gen_addr(&bind_address(), port, allow_lan());
@@ -248,18 +255,18 @@ pub async fn re_create_socks(port: i32, tunnel: Arc<dyn Tunnel>) {
     }
 
     if should_tcp_ignore && should_udp_ignore {
-        return;
+        return Ok(());
     }
 
     if port_is_zero(&addr) {
-        return;
+        return Ok(());
     }
 
     let tcp_listener = match socks_tcp::new(&addr, Arc::clone(&tunnel), Vec::new()).await {
         Ok(l) => l,
         Err(e) => {
             errorln!("Start SOCKS server error: {}", e);
-            return;
+            return Err(anyhow!("the socks listener did not start"));
         }
     };
 
@@ -268,20 +275,21 @@ pub async fn re_create_socks(port: i32, tunnel: Arc<dyn Tunnel>) {
         Err(e) => {
             let _ = tcp_listener.close();
             errorln!("Start SOCKS server error: {}", e);
-            return;
+            return Err(anyhow!("the socks listener did not start"));
         }
     };
 
     infoln!("SOCKS proxy listening at: {}", tcp_listener.address());
     state.listener = Some(tcp_listener);
     state.udp_listener = Some(udp_listener);
+    Ok(())
 }
 
 /// Re-creates the redir halves.
 ///
 /// Each half is bound on its own: a UDP bind that failed earlier is retried by the next reload
 /// (`udp_listener` stays empty), and a TCP half already serving `addr` stays bound.
-pub async fn re_create_redir(port: i32, tunnel: Arc<dyn Tunnel>) {
+pub async fn re_create_redir(port: i32, tunnel: Arc<dyn Tunnel>) -> anyhow::Result<()> {
     let mut state = REDIR_MUX.lock().await;
 
     let addr = gen_addr(&bind_address(), port, allow_lan());
@@ -308,11 +316,11 @@ pub async fn re_create_redir(port: i32, tunnel: Arc<dyn Tunnel>) {
     }
 
     if should_tcp_ignore && should_udp_ignore {
-        return;
+        return Ok(());
     }
 
     if port_is_zero(&addr) {
-        return;
+        return Ok(());
     }
 
     if !should_tcp_ignore {
@@ -323,7 +331,7 @@ pub async fn re_create_redir(port: i32, tunnel: Arc<dyn Tunnel>) {
             }
             Err(e) => {
                 errorln!("Start Redir server error: {}", e);
-                return;
+                return Err(anyhow!("the redir listener did not start"));
             }
         }
     }
@@ -334,14 +342,21 @@ pub async fn re_create_redir(port: i32, tunnel: Arc<dyn Tunnel>) {
             Err(e) => {
                 warnln!("Failed to start Redir UDP Listener: {}", e);
                 errorln!("Start Redir server error: {}", e);
+                // TCP redirection works on every platform; the redir UDP half is the Linux
+                // implementation, and `setsockopt_other` refuses it by name elsewhere. On those
+                // platforms the absent half is the documented TCP-only redirection, not a failed
+                // apply, so the binary must keep serving it instead of aborting.
+                #[cfg(target_os = "linux")]
+                return Err(anyhow!("the redir listener did not start"));
             }
         }
     }
 
     drop(state);
+    Ok(())
 }
 
-pub async fn re_create_shadow_socks(shadow_socks_config: &str, tunnel: Arc<dyn Tunnel>) {
+pub async fn re_create_shadow_socks(shadow_socks_config: &str, tunnel: Arc<dyn Tunnel>) -> anyhow::Result<()> {
     let mut state = SS_MUX.lock().await;
 
     let ss_config = match parse_ss_url(shadow_socks_config) {
@@ -376,17 +391,17 @@ pub async fn re_create_shadow_socks(shadow_socks_config: &str, tunnel: Arc<dyn T
     }
 
     if should_ignore {
-        return;
+        return Ok(());
     }
     if !ss_config.enable {
-        return;
+        return Ok(());
     }
 
     let listener = match sing_shadowsocks::new(ss_config, default_listen_config(), tunnel, Vec::new()).await {
         Ok(l) => l,
         Err(e) => {
             errorln!("Start ShadowSocks server error: {}", e);
-            return;
+            return Err(anyhow!("the shadowsocks listener did not start"));
         }
     };
 
@@ -395,9 +410,10 @@ pub async fn re_create_shadow_socks(shadow_socks_config: &str, tunnel: Arc<dyn T
     }
 
     *state = Some(listener);
+    Ok(())
 }
 
-pub async fn re_create_vmess(vmess_config: &str, tunnel: Arc<dyn Tunnel>) {
+pub async fn re_create_vmess(vmess_config: &str, tunnel: Arc<dyn Tunnel>) -> anyhow::Result<()> {
     let mut state = VMESS_MUX.lock().await;
 
     let vs_config = match parse_vmess_url(vmess_config) {
@@ -455,17 +471,17 @@ pub async fn re_create_vmess(vmess_config: &str, tunnel: Arc<dyn Tunnel>) {
     }
 
     if should_ignore {
-        return;
+        return Ok(());
     }
     if !vs_config.enable {
-        return;
+        return Ok(());
     }
 
     let listener = match sing_vmess::new(vs_config, default_listen_config(), tunnel, Vec::new()).await {
         Ok(l) => l,
         Err(e) => {
             errorln!("Start Vmess server error: {}", e);
-            return;
+            return Err(anyhow!("the vmess listener did not start"));
         }
     };
 
@@ -474,9 +490,10 @@ pub async fn re_create_vmess(vmess_config: &str, tunnel: Arc<dyn Tunnel>) {
     }
 
     *state = Some(listener);
+    Ok(())
 }
 
-pub async fn re_create_tuic(config: LcTuicServer, tunnel: Arc<dyn Tunnel>) {
+pub async fn re_create_tuic(config: LcTuicServer, tunnel: Arc<dyn Tunnel>) -> anyhow::Result<()> {
     let mut state = TUIC_MUX.lock().await;
 
     let should_ignore = if let Some(listener) = &state.listener {
@@ -491,6 +508,7 @@ pub async fn re_create_tuic(config: LcTuicServer, tunnel: Arc<dyn Tunnel>) {
         false
     };
 
+    let mut failed = false;
     if !should_ignore && config.enable {
         match tuic_server::new(config.clone(), default_listen_config(), tunnel, &[]).await {
             Ok(listener) => {
@@ -499,15 +517,22 @@ pub async fn re_create_tuic(config: LcTuicServer, tunnel: Arc<dyn Tunnel>) {
                 }
                 state.listener = Some(listener);
             }
-            Err(e) => errorln!("Start Tuic server error: {}", e),
+            Err(e) => {
+                errorln!("Start Tuic server error: {}", e);
+                failed = true;
+            }
         }
     }
 
     state.last_conf = config;
+    if failed {
+        return Err(anyhow!("the tuic listener did not start"));
+    }
+    Ok(())
 }
 
 /// The tproxy counterpart of [`re_create_redir`], with the same per-half retry.
-pub async fn re_create_tproxy(port: i32, tunnel: Arc<dyn Tunnel>) {
+pub async fn re_create_tproxy(port: i32, tunnel: Arc<dyn Tunnel>) -> anyhow::Result<()> {
     let mut state = TPROXY_MUX.lock().await;
 
     let addr = gen_addr(&bind_address(), port, allow_lan());
@@ -534,13 +559,14 @@ pub async fn re_create_tproxy(port: i32, tunnel: Arc<dyn Tunnel>) {
     }
 
     if should_tcp_ignore && should_udp_ignore {
-        return;
+        return Ok(());
     }
 
     if port_is_zero(&addr) {
-        return;
+        return Ok(());
     }
 
+    let mut failed = false;
     if !should_tcp_ignore {
         match tproxy_tcp::new(&addr, Arc::clone(&tunnel), Vec::new()).await {
             Ok(listener) => {
@@ -549,7 +575,7 @@ pub async fn re_create_tproxy(port: i32, tunnel: Arc<dyn Tunnel>) {
             }
             Err(e) => {
                 errorln!("Start TProxy server error: {}", e);
-                return;
+                return Err(anyhow!("the tproxy listener did not start"));
             }
         }
     }
@@ -560,14 +586,19 @@ pub async fn re_create_tproxy(port: i32, tunnel: Arc<dyn Tunnel>) {
             Err(e) => {
                 warnln!("Failed to start TProxy UDP Listener: {}", e);
                 errorln!("Start TProxy server error: {}", e);
+                failed = true;
             }
         }
     }
 
     drop(state);
+    if failed {
+        return Err(anyhow!("the tproxy listener did not start"));
+    }
+    Ok(())
 }
 
-pub async fn re_create_mixed(port: i32, tunnel: Arc<dyn Tunnel>) {
+pub async fn re_create_mixed(port: i32, tunnel: Arc<dyn Tunnel>) -> anyhow::Result<()> {
     let mut state = MIXED_MUX.lock().await;
 
     let addr = gen_addr(&bind_address(), port, allow_lan());
@@ -594,18 +625,18 @@ pub async fn re_create_mixed(port: i32, tunnel: Arc<dyn Tunnel>) {
     }
 
     if should_tcp_ignore && should_udp_ignore {
-        return;
+        return Ok(());
     }
 
     if port_is_zero(&addr) {
-        return;
+        return Ok(());
     }
 
     let listener = match mixed_server::new(&addr, Arc::clone(&tunnel), Vec::new()).await {
         Ok(l) => l,
         Err(e) => {
             errorln!("Start Mixed(http+socks) server error: {}", e);
-            return;
+            return Err(anyhow!("the mixed listener did not start"));
         }
     };
 
@@ -614,13 +645,14 @@ pub async fn re_create_mixed(port: i32, tunnel: Arc<dyn Tunnel>) {
         Err(e) => {
             let _ = listener.close();
             errorln!("Start Mixed(http+socks) server error: {}", e);
-            return;
+            return Err(anyhow!("the mixed listener did not start"));
         }
     };
 
     infoln!("Mixed(http+socks) proxy listening at: {}", listener.address());
     state.listener = Some(listener);
     state.udp_listener = Some(udp_listener);
+    Ok(())
 }
 
 #[derive(Clone, PartialEq, Eq, Hash)]
@@ -660,7 +692,7 @@ fn difference(a: &[AddrProxy], b: &[AddrProxy]) -> (Vec<AddrProxy>, Vec<AddrProx
     (only_a, only_b)
 }
 
-pub async fn patch_tunnel(tunnels: &[LcTunnel], tunnel: Arc<dyn Tunnel>) {
+pub async fn patch_tunnel(tunnels: &[LcTunnel], tunnel: Arc<dyn Tunnel>) -> anyhow::Result<()> {
     let mut state = TUNNEL_MUX.lock().await;
 
     let tcp_old: Vec<AddrProxy> = state.tcp.keys().map(|key| addr_proxy_from_key("tcp", key)).collect();
@@ -696,6 +728,7 @@ pub async fn patch_tunnel(tunnels: &[LcTunnel], tunnel: Arc<dyn Tunnel>) {
     }
 
     let lc = default_listen_config();
+    let mut failed = false;
     for elm in &need_create {
         let key = format!("{}/{}/{}", elm.addr, elm.target, elm.proxy);
         if elm.network == "tcp" {
@@ -706,7 +739,10 @@ pub async fn patch_tunnel(tunnels: &[LcTunnel], tunnel: Arc<dyn Tunnel>) {
                     infoln!("Tunnel(tcp/{}) proxy {} listening at: {}", elm.target, elm.proxy, l.address());
                     state.tcp.insert(key, l);
                 }
-                Err(e) => errorln!("Start tunnel {} error: {}", elm.target, e),
+                Err(e) => {
+                    errorln!("Start tunnel {} error: {}", elm.target, e);
+                    failed = true;
+                }
             }
         } else {
             match tunnel_udp::new_udp(
@@ -723,11 +759,18 @@ pub async fn patch_tunnel(tunnels: &[LcTunnel], tunnel: Arc<dyn Tunnel>) {
                     infoln!("Tunnel(udp/{}) proxy {} listening at: {}", elm.target, elm.proxy, l.address());
                     state.udp.insert(key, l);
                 }
-                Err(e) => errorln!("Start tunnel {} error: {}", elm.target, e),
+                Err(e) => {
+                    errorln!("Start tunnel {} error: {}", elm.target, e);
+                    failed = true;
+                }
             }
         }
     }
     drop(state);
+    if failed {
+        return Err(anyhow!("one or more tunnels did not start"));
+    }
+    Ok(())
 }
 
 #[expect(clippy::implicit_hasher, reason = "the public signature takes the caller's concrete HashMap")]
@@ -735,9 +778,10 @@ pub async fn patch_inbound_listeners(
     new_listener_map: &HashMap<String, Arc<dyn InboundListener>>,
     tunnel: Arc<dyn Tunnel>,
     drop_old: bool,
-) {
+) -> anyhow::Result<()> {
     let mut listeners = INBOUND_MUX.lock().await;
 
+    let mut failed = false;
     for (name, new_listener) in new_listener_map {
         if let Some(old_listener) = listeners.get(name) {
             if old_listener.config().equal(new_listener.config().as_ref()) {
@@ -747,6 +791,7 @@ pub async fn patch_inbound_listeners(
         }
         if let Err(e) = new_listener.listen(Arc::clone(&tunnel)).await {
             errorln!("Listener {} listen err: {}", name, e);
+            failed = true;
             continue;
         }
         listeners.insert(name.clone(), Arc::clone(new_listener));
@@ -761,6 +806,10 @@ pub async fn patch_inbound_listeners(
             }
         }
     }
+    if failed {
+        return Err(anyhow!("one or more inbound listeners did not start"));
+    }
+    Ok(())
 }
 
 pub async fn get_ports() -> Ports {
@@ -971,31 +1020,44 @@ mod tests {
     #[tokio::test]
     async fn a_failed_redir_udp_bind_is_retried_on_the_next_re_create() {
         let logs = murmur_log::subscribe().await.expect("a log subscription");
-        // TCP and UDP have separate port spaces. Probe both, and retry a fresh number if another
-        // test takes the TCP port between the probe and the listener bind.
+        // The port has to be free for TCP and held for UDP. Its number comes from an ephemeral UDP
+        // bind (there is no other way to name a UDP port), so the TCP side is probed, and when a
+        // parallel test binary takes it between the probe and the bind the probe is repeated on a
+        // fresh number instead of asserting on the first attempt. That collision is how this test
+        // failed the workspace gate while passing in the crate's own run.
         for _ in 0..20 {
-            let holder = std::net::UdpSocket::bind((std::net::Ipv4Addr::LOCALHOST, 0)).expect("a held UDP port");
-            let port = holder.local_addr().expect("the held address").port();
-            if std::net::TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, port)).is_err() {
-                continue;
-            }
-            let port = i32::from(port);
-            re_create_redir(port, null_tunnel()).await;
-            let (tcp_bound, udp_bound) = redir_state(port).await;
-            if !tcp_bound {
+            let (holder, port) = {
+                let mut probed = None;
+                for _ in 0..200 {
+                    let holder =
+                        std::net::UdpSocket::bind((std::net::Ipv4Addr::LOCALHOST, 0)).expect("a held UDP port");
+                    let port = holder.local_addr().expect("the held address").port();
+                    if std::net::TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, port)).is_ok() {
+                        probed = Some((holder, i32::from(port)));
+                        break;
+                    }
+                }
+                probed.expect("an ephemeral port free for both halves")
+            };
+
+            let _ = re_create_redir(port, null_tunnel()).await;
+            if !redir_state(port).await.0 {
+                // The TCP side was taken between the probe and the bind; try a different number.
+                drop(holder);
                 close_redir().await;
+                tokio::time::sleep(std::time::Duration::from_millis(20)).await;
                 continue;
             }
-            assert!(!udp_bound, "the held UDP port cannot be bound");
-            assert_eq!(redir_udp_warnings(&logs, 1).await, 1);
+
+            assert!(!redir_state(port).await.1, "the held UDP port cannot be bound");
+            assert!(redir_udp_warnings(&logs, 1).await >= 1);
 
             drop(holder);
-            re_create_redir(port, null_tunnel()).await;
+            let _ = re_create_redir(port, null_tunnel()).await;
 
             if !redir_state(port).await.1 {
                 assert_eq!(redir_udp_warnings(&logs, 1).await, 1, "the retry must reach the UDP bind");
             }
-
             close_redir().await;
             murmur_log::un_subscribe(logs).await;
             return;
