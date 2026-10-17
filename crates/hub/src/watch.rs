@@ -130,21 +130,22 @@ pub enum Reload {
     /// The bytes matched the last successfully applied file, so nothing ran.
     Unchanged,
     /// The file could not be read, its configuration did not parse, or applying it reported a
-    /// failure. The running configuration is the previous one, or the partially applied new one,
-    /// and the bytes are not recorded as applied.
+    /// failure. A read or parse failure leaves the running configuration untouched; an apply
+    /// failure may have left it partially applied, which is what clears the cache of applied
+    /// content.
     Failed(anyhow::Error),
 }
 
 /// Reads `path` and applies it through [`crate::hub::parse`], the reload path a `SIGHUP` takes.
 ///
-/// `last_applied` holds the bytes of the last file that applied successfully; identical contents
-/// are skipped, and a file that fails at any step (unreadable, rejected by the parser, or applied
-/// with a reported failure such as a listener that could not bind) leaves it unset, so the same
-/// bytes are retried on the next change instead of being skipped as already applied. A failed apply
-/// clears it even when it held the previous good file: the failure may already have closed or
-/// replaced listeners, so restoring that file has to reapply it. `force` bypasses the equality
-/// check: an operator's `SIGHUP` reapplies the disk state even when the file did not change, which
-/// is also what undoes an API-only change.
+/// `last_applied` holds the bytes of the last file that applied successfully. Identical contents
+/// are skipped. A file that cannot be read or does not parse leaves the cache alone: nothing ran,
+/// so the running configuration is still what the cache remembers. A file whose parse succeeded
+/// and whose apply then reported a failure (a listener that could not bind, a controller that could
+/// not) clears the cache, because that apply may already have closed or replaced parts: restoring
+/// the last-known-good file has to reapply it. `force` bypasses the equality check: an operator's
+/// `SIGHUP` reapplies the disk state even when the file did not change, which is also what undoes
+/// an API-only change.
 #[must_use]
 pub async fn reload_from_disk(
     path: &Path,
@@ -164,10 +165,15 @@ pub async fn reload_from_disk(
             *last_applied = Some(bytes);
             Reload::Applied
         }
-        Err(err) => {
-            // The parse may have mutated globals and closed or replaced listeners before it
-            // reported the failure, so the running state is no longer the file `last_applied`
-            // remembers. Forget it: restoring the last-known-good file has to reapply it.
+        Err(hub::ReloadError::Rejected(err)) => {
+            // Nothing was applied: the running configuration still matches `last_applied`, so the
+            // cache stays and a later save of those same bytes is still skipped.
+            Reload::Failed(err)
+        }
+        Err(hub::ReloadError::PartiallyApplied(err)) => {
+            // The apply may already have closed or replaced listeners before it reported the
+            // failure, so the running state is no longer the file `last_applied` remembers.
+            // Forget it: restoring the last-known-good file has to reapply it.
             *last_applied = None;
             Reload::Failed(err)
         }
@@ -337,7 +343,11 @@ mod tests {
         write_atomically(&target, "mode: [\n");
         timeout(EVENT_WINDOW, watch.settled()).await.expect("the broken replacement must be reported");
         assert!(matches!(reload_from_disk(watch.target(), &[], &mut applied, false).await, Reload::Failed(_)));
-        assert!(applied.is_none(), "a failed apply must forget the cached content");
+        assert_eq!(
+            applied.as_deref(),
+            Some(second.as_bytes()),
+            "a rejected file leaves the running configuration and the cache alone"
+        );
 
         let third = config_with("third");
         write_atomically(&target, &third);

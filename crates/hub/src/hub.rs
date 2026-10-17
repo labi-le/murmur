@@ -131,17 +131,51 @@ async fn apply_route(cfg: &Config) -> Result<()> {
     .await
 }
 
+/// The stage at which a parse-and-apply failed.
+///
+/// The distinction is what a file watcher needs: a rejected read or parse leaves the running
+/// configuration exactly as it was, while an apply that reported a failure may already have closed
+/// or replaced listeners before it gave up.
+#[derive(Debug)]
+pub enum ReloadError {
+    /// Reading or parsing failed: nothing was applied, so the running configuration is untouched.
+    Rejected(anyhow::Error),
+    /// The parse succeeded and the apply ran: at least one part of the running configuration could
+    /// not be applied, so it may be the partially applied one.
+    PartiallyApplied(anyhow::Error),
+}
+
+impl std::fmt::Display for ReloadError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Rejected(err) | Self::PartiallyApplied(err) => err.fmt(f),
+        }
+    }
+}
+
+impl std::error::Error for ReloadError {
+    fn source(&self) -> std::option::Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            Self::Rejected(err) | Self::PartiallyApplied(err) => err.source(),
+        }
+    }
+}
+
 /// Parses the configuration at startup, or again on a reload.
 ///
 /// Holds [`CONFIG_OPERATION`] across the parse and the apply, so an API update cannot interleave
-/// with the parse-time general update and be rolled back by it.
-pub async fn parse(config_bytes: &[u8], options: &[Option]) -> Result<()> {
+/// with the parse-time general update and be rolled back by it. The error names the stage that
+/// failed (see [`ReloadError`]).
+pub async fn parse(config_bytes: &[u8], options: &[Option]) -> Result<(), ReloadError> {
     let _operation = lock_config_operation().await;
 
-    let mut cfg = if config_bytes.is_empty() {
-        executor_mod::parse().await?
+    let mut cfg = match if config_bytes.is_empty() {
+        executor_mod::parse().await
     } else {
-        executor_mod::parse_with_bytes(config_bytes).await?
+        executor_mod::parse_with_bytes(config_bytes).await
+    } {
+        Ok(cfg) => cfg,
+        Err(err) => return Err(ReloadError::Rejected(err)),
     };
 
     for option in options {
@@ -149,5 +183,5 @@ pub async fn parse(config_bytes: &[u8], options: &[Option]) -> Result<()> {
     }
 
     // Boxed: the config-apply chain is by far the largest future awaited here.
-    Box::pin(apply_config(cfg)).await
+    Box::pin(apply_config(cfg)).await.map_err(ReloadError::PartiallyApplied)
 }
