@@ -65,9 +65,9 @@ impl ConfigWatcher {
             .to_path_buf();
 
         let (ticks_tx, ticks) = mpsc::channel(TICK_QUEUE);
-        let watched = target.clone();
+        let callback_target = target.clone();
         let mut watcher = notify::recommended_watcher(move |event: notify::Result<notify::Event>| {
-            if !target_changed(&event, &watched) {
+            if !target_changed(&event, &callback_target) {
                 return;
             }
             // notify calls this on its own thread, outside any Tokio context; the queue is the

@@ -27,8 +27,9 @@ gate flags, so the exemption is visible where it applies.
 
 ## Gate repair verification, 2026-10-17 (#171)
 
-Verified on `pc` with the pinned rustc 1.97.1 / Cargo 1.97.0, on the repair tree based on
-`37bccfd`. The first full run exposed the redir fixture's independent TCP/UDP port race;
+Verified on `pc` with the pinned rustc 1.97.1 / Cargo 1.97.0, on the separate repair
+commit `d8d2565` based on `37bccfd`, before integrating watcher PR #170. The first full run
+exposed the redir fixture's independent TCP/UDP port race;
 the test now probes both port spaces and retries a fresh number if the TCP probe loses
 its reservation. Snell cancellation is arranged with one poll rather than a zero-duration
 timer. Both retain their payload/retry assertions. Hysteria2 releases its stream guard
@@ -46,7 +47,9 @@ Cargo-deny's duplicate-version and unmatched-license-allowance warnings remain i
 under the existing policy. The audit scanned 752 dependencies against 1,338 advisories,
 database commit `999ec89d5d3f10f20be14750ec8c2d8b44e0ac9b`; it found no unaccepted
 vulnerabilities or informational warnings. The two advisory exceptions below are unchanged.
-The lockfile SHA-256 is `da135e862846a06c936a62f756e2878a4285c520ed29445bc1db47f36cebdfaa`.
+That historical repair commit's lockfile SHA-256 was
+`da135e862846a06c936a62f756e2878a4285c520ed29445bc1db47f36cebdfaa`;
+it does not identify the integrated watcher tree's lockfile.
 
 A separate targeted lib-test run passed 561 tests across common, config, updater, Snell,
 Hysteria2 and EasyTier. A default-feature binary built and passed real loopback smoke:
@@ -65,6 +68,40 @@ The test process and staging files were removed; production PID 3350, configurat
 were unchanged. The cross-build emitted existing deprecated `libc::time_t` / `suseconds_t`
 warnings in `ntp/time_unix.rs`; this is not an ARM clippy-clean claim. Native macOS/FreeBSD,
 Windows linting and the ignored timer soaks were not part of this gate run.
+
+## Integrated watcher verification, 2026-10-18 (#170 / #172)
+
+The integrated tree combines watcher merge `56cb139` and gate repair `d8d2565` through
+`a2e41ff`, plus the subsequent lint-only integration fixes. Those fixes release five listener
+guards after their final mutation, rename the watch callback's path binding, consume the
+failure vector during aggregation and remove a redundant async `must_use` annotation.
+No lint allowances or advisory exceptions were added.
+
+```sh
+timeout 1200 env CARGO_TARGET_DIR=issue169-watch-config CARGO_BUILD_JOBS=2 \
+  tools/cargo-slot bash -c 'make gate && make lint && cargo build -p murmur --bin murmur'
+```
+
+All three stages completed successfully: **3,224 nextest tests passed**, the two documented
+soaks were skipped, all-targets/all-features clippy with `-D warnings` and formatting passed,
+and blocking deny/machete/audit/spelling checks passed. The integrated lockfile SHA-256 is
+`8e953411ce9462e847e0373c08225f80d147ff29139fbc56ac24b6b6571c09af`.
+This is the dependency graph verified after watcher integration; the earlier digest belongs
+only to the separate repair commit. Advisory policy and database revision are unchanged.
+
+Real default-feature binary smoke passed four atomic replacements, in-place editing,
+malformed-file retention, missing-file recreation, stable fake-IP mappings and distinct new
+allocations. An incomplete authenticated PATCH body did not block automatic reloads.
+A controller port change released the old endpoint; new connections accepted the CLI secret
+and rejected the different file secret, verifying override precedence across watched reloads.
+The PID remained unchanged. The throwaway HTTP probe initially sent a mismatched Host header;
+correcting that probe to match its absolute request target produced the passing runtime result.
+
+The final static AArch64-musl binary, SHA-256
+`1b1dedfadb23bc3e58b4d6fefb4f0b21766b66b820dcfdc708301ccbc400d762`, passed the real OpenWrt
+watcher/edit/rename/delete-recreate, proxy and fake-IP smoke again. Temporary process and files
+were removed; production PID 3350 and deployment were unchanged. Platform and live-tailnet
+limits from the preceding verification entry still apply.
 
 ## What the lints cannot see, and what the tree does about it
 

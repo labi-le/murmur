@@ -308,7 +308,7 @@ fn step_outcome(step: &str, failures: Vec<anyhow::Error>) -> Result<()> {
     if failures.is_empty() {
         return Ok(());
     }
-    let joined = failures.iter().map(ToString::to_string).collect::<Vec<_>>().join("; ");
+    let joined = failures.into_iter().map(|error| error.to_string()).collect::<Vec<_>>().join("; ");
     if step.is_empty() {
         return Err(anyhow!("{joined}"));
     }

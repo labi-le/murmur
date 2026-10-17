@@ -18,7 +18,6 @@ use murmur_config::config::Config;
 static CONFIG_OPERATION: AsyncMutex<()> = AsyncMutex::const_new(());
 
 /// Holds [`CONFIG_OPERATION`] for one parse-and-apply, or for one API update.
-#[must_use]
 pub async fn lock_config_operation() -> AsyncMutexGuard<'static, ()> {
     CONFIG_OPERATION.lock().await
 }
