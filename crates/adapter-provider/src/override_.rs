@@ -11,7 +11,7 @@ use anyhow::{anyhow, Context, Result};
 use fancy_regex::Regex;
 use serde::de::{Deserializer, Visitor};
 use serde::Deserialize;
-use serde_yaml::{Mapping, Number, Value};
+use yaml_serde::{Mapping, Number, Value};
 
 use murmur_common::structure::structure::TEXT_UNMARSHALER;
 

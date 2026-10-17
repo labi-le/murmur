@@ -110,7 +110,7 @@
 //! Expression text is a raw byte sequence: identifiers are classified byte-by-byte through the
 //! `unicode` classifiers, so only Latin-1 code points classify correctly; lexing over bytes with
 //! a lossy UTF-8 reassembly leaves documented (effectively ASCII) syntax unchanged. The
-//! `map[string]any` graph is represented here as `serde_yaml::Value` / `serde_yaml::Mapping`,
+//! `map[string]any` graph is represented here as `yaml_serde::Value` / `yaml_serde::Mapping`,
 //! which (unlike `serde_json::Value`) can hold the `+Inf`/`-Inf`/`NaN` floats that
 //! `evaluate_override_numbers` can legitimately produce, matching the `float64`.
 
@@ -120,8 +120,8 @@ use std::fmt::Write as _;
 use anyhow::{anyhow, bail, Result};
 use serde::de::Visitor;
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
-use serde_yaml::value::{Tag, TaggedValue};
-use serde_yaml::{Mapping, Value};
+use yaml_serde::value::{Tag, TaggedValue};
+use yaml_serde::{Mapping, Value};
 
 use murmur_common::structure::structure::TEXT_UNMARSHALER;
 use murmur_common::yaml::yaml;
@@ -1654,7 +1654,7 @@ impl StringExpr {
 }
 
 /// A YAML mapping has no defined iteration order, and the output this module must match sorts a
-/// map's keys when serializing it. `serde_yaml::Mapping` preserves insertion order instead, so
+/// map's keys when serializing it. `yaml_serde::Mapping` preserves insertion order instead, so
 /// every `yaml::marshal` call in this module marshals this sorted copy to match the output text.
 fn sorted_for_marshal(value: &Value) -> Value {
     match value {
@@ -3004,7 +3004,7 @@ mod tests {
     }
 
     fn yaml_mapping(text: &str) -> Mapping {
-        serde_yaml::from_str(text).expect("parse test yaml mapping")
+        yaml_serde::from_str(text).expect("parse test yaml mapping")
     }
 
     fn get<'a>(mapping: &'a Mapping, key: &str) -> &'a Value {
@@ -3293,7 +3293,7 @@ options: {b: 2, a: 1}
             let mut mapping = yaml_mapping(&format!("value: {}", case.input));
             let exprs = must_override_exprs(&[case.expr]);
             apply_all(&exprs, &mut mapping).unwrap_or_else(|e| panic!("{}: {e}", case.name));
-            let expected: Value = serde_yaml::from_str(case.expected).expect("parse expected");
+            let expected: Value = yaml_serde::from_str(case.expected).expect("parse expected");
             assert_eq!(get(&mapping, "value"), &expected, "case {}", case.name);
         }
 
@@ -3457,7 +3457,7 @@ servers:
             let exprs = must_override_exprs(&[case.expr]);
             apply_all(&exprs, &mut mapping).unwrap_or_else(|e| panic!("{}: {e}", case.name));
             assert!(mapping.contains_key("result"), "case {}", case.name);
-            let expected: Value = serde_yaml::from_str(case.expected).expect("parse expected");
+            let expected: Value = yaml_serde::from_str(case.expected).expect("parse expected");
             assert_eq!(get(&mapping, "result"), &expected, "case {}", case.name);
         }
 

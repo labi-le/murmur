@@ -971,24 +971,35 @@ mod tests {
     #[tokio::test]
     async fn a_failed_redir_udp_bind_is_retried_on_the_next_re_create() {
         let logs = murmur_log::subscribe().await.expect("a log subscription");
-        let holder = std::net::UdpSocket::bind((std::net::Ipv4Addr::LOCALHOST, 0)).expect("a held UDP port");
-        let port = i32::from(holder.local_addr().expect("the held address").port());
+        // TCP and UDP have separate port spaces. Probe both, and retry a fresh number if another
+        // test takes the TCP port between the probe and the listener bind.
+        for _ in 0..20 {
+            let holder = std::net::UdpSocket::bind((std::net::Ipv4Addr::LOCALHOST, 0)).expect("a held UDP port");
+            let port = holder.local_addr().expect("the held address").port();
+            if std::net::TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, port)).is_err() {
+                continue;
+            }
+            let port = i32::from(port);
+            re_create_redir(port, null_tunnel()).await;
+            let (tcp_bound, udp_bound) = redir_state(port).await;
+            if !tcp_bound {
+                close_redir().await;
+                continue;
+            }
+            assert!(!udp_bound, "the held UDP port cannot be bound");
+            assert_eq!(redir_udp_warnings(&logs, 1).await, 1);
 
-        re_create_redir(port, null_tunnel()).await;
+            drop(holder);
+            re_create_redir(port, null_tunnel()).await;
 
-        let (tcp_bound, udp_bound) = redir_state(port).await;
-        assert!(tcp_bound, "the TCP half takes the address the held UDP port leaves free");
-        assert!(!udp_bound, "the held UDP port cannot be bound");
-        assert_eq!(redir_udp_warnings(&logs, 1).await, 1);
+            if !redir_state(port).await.1 {
+                assert_eq!(redir_udp_warnings(&logs, 1).await, 1, "the retry must reach the UDP bind");
+            }
 
-        drop(holder);
-        re_create_redir(port, null_tunnel()).await;
-
-        if !redir_state(port).await.1 {
-            assert_eq!(redir_udp_warnings(&logs, 1).await, 1, "the retry must reach the UDP bind");
+            close_redir().await;
+            murmur_log::un_subscribe(logs).await;
+            return;
         }
-
-        close_redir().await;
-        murmur_log::un_subscribe(logs).await;
+        panic!("no probed port stayed free for the TCP half");
     }
 }

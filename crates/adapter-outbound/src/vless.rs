@@ -1746,20 +1746,20 @@ mod jls_option_tests {
 
     fn new_err(extra: &str) -> String {
         let yaml = format!("{HEAD}tls: true\n{extra}");
-        let option: VlessOption = serde_yaml::from_str(&yaml).expect("option decodes");
+        let option: VlessOption = yaml_serde::from_str(&yaml).expect("option decodes");
         Vless::new(option).err().map(|err| err.to_string()).expect("rejected")
     }
 
     #[test]
     fn credentials_select_jls_while_empty_ones_select_nothing() {
         let yaml = format!("{HEAD}tls: true\n{JLS}");
-        let option: VlessOption = serde_yaml::from_str(&yaml).expect("option decodes");
+        let option: VlessOption = yaml_serde::from_str(&yaml).expect("option decodes");
         let vless = Vless::new(option).expect("accepted");
         let config = vless.jls_config.as_ref().expect("JLS selected");
         assert_eq!((config.user.username.as_str(), config.user.password.as_str()), ("user", "pass"));
 
         let yaml = format!("{HEAD}tls: true\njls-opts:\n  username: \"\"\n  password: \"\"\n");
-        let option: VlessOption = serde_yaml::from_str(&yaml).expect("option decodes");
+        let option: VlessOption = yaml_serde::from_str(&yaml).expect("option decodes");
         assert!(Vless::new(option).expect("accepted").jls_config.is_none());
 
         // The credential has to be present and empty: a block that leaves it out already fails to
@@ -1776,7 +1776,7 @@ mod jls_option_tests {
     #[test]
     fn jls_requires_tls() {
         let yaml = format!("{HEAD}tls: false\n{JLS}");
-        let option: VlessOption = serde_yaml::from_str(&yaml).expect("option decodes");
+        let option: VlessOption = yaml_serde::from_str(&yaml).expect("option decodes");
         let err = Vless::new(option).err().map(|err| err.to_string()).expect("rejected");
         assert_eq!(err, "JLS requires TLS");
     }
@@ -1796,7 +1796,7 @@ mod jls_option_tests {
         );
 
         let yaml = format!("{HEAD}tls: true\nnetwork: xhttp\n{JLS}{download}");
-        let option: VlessOption = serde_yaml::from_str(&yaml).expect("option decodes");
+        let option: VlessOption = yaml_serde::from_str(&yaml).expect("option decodes");
         assert!(Vless::new(option).expect("accepted").xhttp_client.is_some());
     }
 }
@@ -1812,7 +1812,7 @@ mod restls_option_tests {
 
     fn new_err(extra: &str) -> String {
         let yaml = format!("{HEAD}tls: true\n{extra}");
-        let option: VlessOption = serde_yaml::from_str(&yaml).expect("option decodes");
+        let option: VlessOption = yaml_serde::from_str(&yaml).expect("option decodes");
         Vless::new(option).err().map(|err| err.to_string()).expect("rejected")
     }
 
@@ -1825,7 +1825,7 @@ mod restls_option_tests {
         assert_eq!(new_err(&format!("{RESTLS}{JLS}")), "security modes are mutually exclusive: Restls, JLS");
 
         let yaml = format!("{HEAD}tls: false\n{RESTLS}");
-        let option: VlessOption = serde_yaml::from_str(&yaml).expect("option decodes");
+        let option: VlessOption = yaml_serde::from_str(&yaml).expect("option decodes");
         let err = Vless::new(option).err().map(|err| err.to_string()).expect("rejected");
         assert_eq!(err, "Restls requires TLS");
     }
@@ -1835,7 +1835,7 @@ mod restls_option_tests {
     #[test]
     fn the_restls_server_name_is_the_configured_servername() {
         let yaml = format!("{HEAD}tls: true\nservername: sni.example\n{RESTLS}");
-        let option: VlessOption = serde_yaml::from_str(&yaml).expect("option decodes");
+        let option: VlessOption = yaml_serde::from_str(&yaml).expect("option decodes");
         let vless = Vless::new(option).expect("accepted");
         let config = vless.restls_config.as_ref().expect("Restls selected");
         assert_eq!(config.server_name, "sni.example");
@@ -1844,7 +1844,7 @@ mod restls_option_tests {
     #[test]
     fn an_empty_block_leaves_the_security_mode_field_alone() {
         let yaml = format!("{HEAD}tls: true\nrestls-opts:\n  password: \"\"\n  version-hint: \"\"\n");
-        let option: VlessOption = serde_yaml::from_str(&yaml).expect("option decodes");
+        let option: VlessOption = yaml_serde::from_str(&yaml).expect("option decodes");
         assert!(Vless::new(option).expect("accepted").restls_config.is_none());
     }
 }

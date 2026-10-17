@@ -205,7 +205,7 @@ fn unzip(data: &[u8], dest: &Path) -> Result<()> {
 
     for i in 0..archive.len() {
         let mut entry = archive.by_index(i).map_err(|err| anyhow!("{err}"))?;
-        let name = entry.name().to_owned();
+        let name = entry.name().map_err(|err| anyhow!("zip file name: {err}"))?.into_owned();
         let fpath = dest.join(&name);
 
         if !in_dest(&fpath, dest) {

@@ -14,7 +14,7 @@ use anyhow::{anyhow, Result};
 use base64::engine::general_purpose::URL_SAFE_NO_PAD;
 use base64::Engine as _;
 use serde::Deserialize;
-use serde_yaml::{Mapping, Value};
+use yaml_serde::{Mapping, Value};
 
 use crate::inbound::anytls::{AnyTLS, AnyTLSOption};
 use crate::inbound::auth::AuthUser;
@@ -1974,14 +1974,14 @@ mod tests {
     #[test]
     fn parse_listener_accepts_integer_port() {
         let yaml = "name: socks5-in-1\ntype: socks\nport: 10808\n";
-        let mapping: Mapping = serde_yaml::from_str(yaml).expect("parse yaml");
+        let mapping: Mapping = yaml_serde::from_str(yaml).expect("parse yaml");
         parse_listener(&mapping).expect("integer port should coerce like the WeaklyTypedInput");
     }
 
     #[test]
     fn parse_listener_applies_hysteria2_realm_defaults() {
         let yaml = "name: realm-in\ntype: hysteria2-realm\ntoken: secret\nport: 8443\n";
-        let mapping: Mapping = serde_yaml::from_str(yaml).expect("parse yaml");
+        let mapping: Mapping = yaml_serde::from_str(yaml).expect("parse yaml");
         let listener = parse_listener(&mapping).expect("hysteria2-realm listener parses");
         let option: serde_json::Value =
             serde_json::from_str(&listener.config().option_to_string()).expect("option json");
@@ -1995,7 +1995,7 @@ mod tests {
     #[test]
     fn parse_listener_requires_a_hysteria2_realm_token() {
         let yaml = "name: realm-in\ntype: hysteria2-realm\nport: 8443\n";
-        let mapping: Mapping = serde_yaml::from_str(yaml).expect("parse yaml");
+        let mapping: Mapping = yaml_serde::from_str(yaml).expect("parse yaml");
         let Err(err) = parse_listener(&mapping) else {
             panic!("a hysteria2-realm listener without a token must be rejected");
         };

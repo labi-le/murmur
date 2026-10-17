@@ -4,7 +4,7 @@ use std::time::Duration;
 
 use anyhow::{anyhow, Result};
 use serde::Deserialize;
-use serde_yaml::Mapping;
+use yaml_serde::Mapping;
 
 use murmur_common::structure::structure::{new_decoder, Decoder as StructureDecoder, Option as StructureOption};
 use murmur_common::utils::ranges::new_unsigned_ranges;

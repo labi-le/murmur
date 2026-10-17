@@ -50,8 +50,8 @@ mod tests {
         jls_opts: JlsOptions,
     }
 
-    fn parse(yaml: &str) -> Result<Holder, serde_yaml::Error> {
-        serde_yaml::from_str(yaml)
+    fn parse(yaml: &str) -> Result<Holder, yaml_serde::Error> {
+        yaml_serde::from_str(yaml)
     }
 
     #[test]

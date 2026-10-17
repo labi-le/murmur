@@ -1837,7 +1837,7 @@ mod tests {
     }
 
     fn build(body: &str) -> Result<Arc<ZeroTier>> {
-        ZeroTier::new(serde_yaml::from_str(&option_yaml(body)).expect("option decodes"))
+        ZeroTier::new(yaml_serde::from_str(&option_yaml(body)).expect("option decodes"))
     }
 
     fn failure(body: &str) -> String {
@@ -1850,7 +1850,7 @@ mod tests {
     /// Every tag an operator may write, including the ones the engine refuses to honor.
     #[test]
     fn option_decodes_every_wire_name() {
-        let option: ZeroTierOption = serde_yaml::from_str(
+        let option: ZeroTierOption = yaml_serde::from_str(
             "name: zt\n\
              network: 8056c2e21c000001\n\
              state-dir: zt-state\n\
@@ -1942,7 +1942,7 @@ mod tests {
     fn default_state_dir_follows_the_outbound_name() {
         let first = build("").expect("valid");
         let second =
-            ZeroTier::new(serde_yaml::from_str(&format!("name: zt-two\nnetwork: {NETWORK}\n")).expect("decode"))
+            ZeroTier::new(yaml_serde::from_str(&format!("name: zt-two\nnetwork: {NETWORK}\n")).expect("decode"))
                 .expect("valid");
         assert_ne!(first.state_dir, second.state_dir);
     }

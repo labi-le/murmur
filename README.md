@@ -36,7 +36,7 @@ commands bypass the slot limit.
 
 The workspace floor is `[workspace.package] rust-version = "1.94"` with
 `edition = "2021"`, inherited by every crate. It moved from 1.89 to 1.94 for one
-reason: the Tailscale engine is `geiserx_tailscale` 0.57.2 (`tsnet` feature), whose
+reason: the Tailscale engine is `geiserx_tailscale` 0.57.7 (`tsnet` feature), whose
 own manifest declares `rust-version = "1.94.1"` and `edition = "2024"`. The dev
 shell that actually compiles the workspace — the toolchain `flake.lock` pins — is
 `rustc 1.97.1` / `cargo 1.97.0`, so an API stabilised after 1.94 but at or before
@@ -411,7 +411,7 @@ config file before deploying it:
   `low-bandwidth`, `encrypted-hello` and `remote-trace-target` are refused in `ZeroTier::new`
   rather than run without them.
 - **Tailscale:** the engine is in. `crates/adapter-outbound/src/tailscale.rs` drives
-  `geiserx_tailscale` 0.57.2 (`tsnet` feature) — `tsnet::Server` for the node lifecycle and the
+  `geiserx_tailscale` 0.57.7 (`tsnet` feature) - `tsnet::Server` for the node lifecycle and the
   crate's `Device` for the client calls the module needs — and the module doc maps each step onto
   the call it became. Adopting it is the one reason the workspace floor is 1.94 rather than 1.89:
   the crate declares `rust-version = "1.94.1"` and `edition = "2024"`. What the engine has no
@@ -828,18 +828,17 @@ compiles now with 31 route tests added (`route::server` 20, `route::pprof` 11); 
 recorded below, and now completes in 53 s warm with its tests passing. The three failures that
 sweep recorded — the REALITY/gun ALPN rejection, the mekya ALPN routing test and that same hang —
 are each fixed in-tree and re-run green on their own targets, so they are recorded under "Known,
-open defects" as closed rather than open. No workspace-wide sweep has been re-run since those
-fixes, and the toolchain-dependent harnesses that accounted for most of the 26 `#[ignore]`d tests
-have since been removed from the tree, so read those totals as the state of that sweep, not of the
-tree today. Today the only `#[ignore]`d tests are the two real-timer soaks that `make test-heavy` runs.
+open defects" as closed rather than open. The toolchain-dependent harnesses that accounted for
+most of the 26 ignored tests have since been removed, so those totals describe that sweep, not
+the current tree. Dated gate runs appear in `docs/guidelines-review.md`. The two remaining
+ignored tests are real-timer soaks, run separately by `make test-heavy`.
 
-A lint campaign ran over the whole workspace: at its start `cargo clippy`
-reported 6,576 diagnostics (5,587 in production code, 989 in test targets) under the manifest's
-`[workspace.lints]` levels; it now reports none, `cargo clippy --all-targets --all-features -- -D
-warnings` exits 0, `cargo fmt --all -- --check` is clean, and `cargo deny check` (advisories, bans,
-licenses, sources), `cargo machete`, `cargo audit` (752 lockfile entries, 666 unique package names)
-and `typos` all
-report nothing. The rewrite that removed the panicking operations was audited differentially, hunk
+A lint campaign ran over the whole workspace: at its start `cargo clippy` reported 6,576
+diagnostics (5,587 in production code, 989 in test targets) under the manifest's
+`[workspace.lints]` levels. That campaign reached a clean lint and dependency gate;
+`docs/guidelines-review.md` records both the historical audit and dated verification of
+later repairs. Advisory results depend on the database revision, not just the lockfile.
+The rewrite that removed the panicking operations was audited differentially, hunk
 by hunk, against `git show HEAD:` and the reference implementation: about 4,600 changed hunks over 60 crates,
 of which every hunk that replaced an index or slice with a checked form was reconstructed
 symbolically and compared with the expression it replaced. That audit, together with the
@@ -1130,11 +1129,11 @@ by the unit test suite.
   `transport_sudoku::obfs::sudoku::conn::tests::test_conn_map_miss_resets_hint_group`; a peer that
   speaks with a different table is now reported as an ordinary read error.
 
-- **`cargo audit` has never been run against this crate.** Closed. The advisory database is
-  reachable from the build host now, and `cargo audit` scans the 752 lockfile entries without a
-  finding; `cargo deny check advisories` agrees, with the RUSTSEC entries it deliberately ignores
-  (Marvin timing attack on `rsa`, the `wasmtime` advisories, the unmaintained
-  `instant`/`rustls-pemfile`) recorded in `deny.toml` together with the reason each is accepted.
+- **`cargo audit` has never been run against this crate.** Closed. Dependency checks run on the
+  build host. `deny.toml` and `.cargo/audit.toml` document the two retained exceptions: the RSA
+  Marvin timing attack (the affected decryption operation is not used here) and unmaintained
+  `rustls-pemfile` reached through the Tailscale engine. Wasmtime advisories and unmaintained
+  `instant` are not accepted exceptions. See `docs/guidelines-review.md` for dated verification.
 
 - **`/proxies` and `/group` lost the wrapper fields.** Closed. Every built-in proxy is wrapped so
   each entry carries `history`, `extra`, `alive`, `udp`, `xudp`, `tfo`, `mptcp`, `smux`, `interface`,

@@ -1,11 +1,10 @@
 # Guidelines review: the lint posture this workspace actually enforces
 
-This is the review `RUST_GUIDELINES.md` asks for at the end of a pass: which of
-its rules the toolchain can enforce, which are prose only, and what the current
-tree does about each. It is written against the tree as of the commit that made
-the workspace lint-clean, and every number in it was measured on that tree.
+This review records which rules `RUST_GUIDELINES.md` enforces through tools and which
+need source inspection. The original audit measurements refer to the tree that first
+became lint-clean. Later verification entries are dated separately.
 
-## Gate state
+## Original gate audit
 
 | Check | Command | Result |
 | --- | --- | --- |
@@ -25,6 +24,47 @@ in `clippy.toml`; supply-chain policy in `deny.toml` and `.cargo/audit.toml`.
 Test code is exempt at the source (`#![cfg_attr(test, allow(...))]` in every
 crate root, `#![allow(...)]` in `crates/*/tests/*.rs`) rather than through the
 gate flags, so the exemption is visible where it applies.
+
+## Gate repair verification, 2026-10-17 (#171)
+
+Verified on `pc` with the pinned rustc 1.97.1 / Cargo 1.97.0, on the repair tree based on
+`37bccfd`. The first full run exposed the redir fixture's independent TCP/UDP port race;
+the test now probes both port spaces and retries a fresh number if the TCP probe loses
+its reservation. Snell cancellation is arranged with one poll rather than a zero-duration
+timer. Both retain their payload/retry assertions. Hysteria2 releases its stream guard
+immediately after reset.
+
+```sh
+timeout 1200 env CARGO_TARGET_DIR=issue169-watch-config CARGO_BUILD_JOBS=2 \
+  tools/cargo-slot bash -c 'cargo fmt --all && cargo test -p murmur-listener --lib a_failed_redir_udp_bind_is_retried_on_the_next_re_create && make -k gate && make lint'
+```
+
+This command exited 0. Workspace all-features nextest ran **3,208 tests: all passed**;
+the two documented real-timer soaks were skipped. Formatting and all-targets/all-features
+clippy passed with `-D warnings`. Blocking deny, machete, audit and spelling checks passed.
+Cargo-deny's duplicate-version and unmatched-license-allowance warnings remain informational
+under the existing policy. The audit scanned 752 dependencies against 1,338 advisories,
+database commit `999ec89d5d3f10f20be14750ec8c2d8b44e0ac9b`; it found no unaccepted
+vulnerabilities or informational warnings. The two advisory exceptions below are unchanged.
+The lockfile SHA-256 is `da135e862846a06c936a62f756e2878a4285c520ed29445bc1db47f36cebdfaa`.
+
+A separate targeted lib-test run passed 561 tests across common, config, updater, Snell,
+Hysteria2 and EasyTier. A default-feature binary built and passed real loopback smoke:
+YAML anchors/aliases, authenticated config reload, malformed-file rejection with the live
+proxy preserved, DIRECT/REJECT routing, stable fake-IP mappings with distinct new allocations,
+UI ZIP download/extraction and certificate-verified Trojan streams over TLS 1.2 and 1.3.
+Another process compiled/instantiated the embedded EasyTier WASM core and returned its configured
+`10.126.126.126` through the management-RPC-backed DNS resolver. The existing Tailscale
+engine-startup test passed in the full sweep; authenticated live-tailnet traffic was not exercised.
+
+The static AArch64-musl release also built and ran in an isolated OpenWrt process: config-test
+with YAML aliases, HTTP DIRECT/REJECT/recovery and fake-IP preservation passed without changing
+the PID. `readelf` showed no interpreter or dynamic section. The binary SHA-256 was
+`c12a1b51cf451d033548ed578c679bd589438f8d18d8830c116de9c82a1d44d4` on both hosts.
+The test process and staging files were removed; production PID 3350, configuration and firewall
+were unchanged. The cross-build emitted existing deprecated `libc::time_t` / `suseconds_t`
+warnings in `ntp/time_unix.rs`; this is not an ARM clippy-clean claim. Native macOS/FreeBSD,
+Windows linting and the ignored timer soaks were not part of this gate run.
 
 ## What the lints cannot see, and what the tree does about it
 
@@ -129,9 +169,10 @@ both files, because the two tools read different configs):
   `geiserx_tailscale` -> `geiserx_ts_control`; nothing in this workspace names it
   in a manifest or calls it (`cargo tree -i rustls-pemfile` confirms the path).
 
-The advisories this tree used to carry on `wasmtime` 45.0.3, `instant` and `lru`
-are gone from the lockfile rather than ignored: `wasmtime` is 49.0.1 and
-`instant`/`lru` no longer appear.
+Wasmtime is 49.0.3; `instant` and `lru` do not appear in the lockfile. The #171 dependency repair
+also uses rustls 0.23.46, zip 9.0.5 and geiserx_tailscale 0.57.7 (ruzstd 0.9.1).
+YAML consumers use the maintained `yaml_serde` 0.10.7 with `libyaml-rs` 0.3.0 instead of
+`serde_yaml` and unmaintained `unsafe-libyaml`. Existing advisory exceptions are unchanged.
 
 ## Per-change checklist
 

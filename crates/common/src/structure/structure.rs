@@ -24,7 +24,7 @@ use std::collections::HashMap;
 use std::sync::LazyLock;
 
 use serde::de::DeserializeOwned;
-use serde_yaml::{Mapping, Value};
+use yaml_serde::{Mapping, Value};
 
 /// The newtype-struct name a type passes to `Deserializer::deserialize_newtype_struct` to be
 /// decoded through the text-unmarshaller path.
@@ -149,7 +149,7 @@ impl Decoder {
         self.decode_source(de::Source::Mapping(src))
     }
 
-    /// `decode_value` is `decode` for a source that is already a `serde_yaml::Value`.
+    /// `decode_value` is `decode` for a source that is already a `yaml_serde::Value`.
     pub fn decode_value<T: DeserializeOwned>(&self, src: &Value) -> anyhow::Result<T> {
         self.decode_source(de::Source::Value(src))
     }
@@ -187,7 +187,7 @@ mod de {
 
     use serde::de::value::BorrowedStrDeserializer;
     use serde::de::{self, DeserializeOwned, DeserializeSeed, IntoDeserializer, MapAccess, SeqAccess, Visitor};
-    use serde_yaml::{Mapping, Number, Value};
+    use yaml_serde::{Mapping, Number, Value};
 
     #[derive(Debug)]
     pub(super) struct Error(String);
@@ -685,7 +685,7 @@ mod de {
     }
 
     struct MappingAccess<'de> {
-        iter: Option<serde_yaml::mapping::Iter<'de>>,
+        iter: Option<yaml_serde::mapping::Iter<'de>>,
         pending: Option<(&'de Value, String)>,
         path: String,
         parent: &'de super::Option,
@@ -1153,7 +1153,7 @@ mod tests {
     use std::fmt;
 
     use serde::Deserialize;
-    use serde_yaml::Number;
+    use yaml_serde::Number;
 
     use super::*;
     // `super::*` brings the decoder's `Option` into scope, so the prelude one is named explicitly.

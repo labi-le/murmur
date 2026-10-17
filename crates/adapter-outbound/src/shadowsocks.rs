@@ -91,7 +91,7 @@ pub struct ShadowSocksOption {
     #[serde(rename = "plugin", default)]
     pub plugin: String,
     #[serde(rename = "plugin-opts", default)]
-    pub plugin_opts: serde_yaml::Mapping,
+    pub plugin_opts: yaml_serde::Mapping,
     #[serde(rename = "udp-over-tcp", default)]
     pub udp_over_tcp: bool,
     #[serde(rename = "udp-over-tcp-version", default)]
@@ -1203,7 +1203,7 @@ mod restls_tests {
             server: "localhost".into(),
             port: 443,
             plugin: "restls".into(),
-            plugin_opts: serde_yaml::from_str("host: localhost\npassword: secret\nversion-hint: tls13").unwrap(),
+            plugin_opts: yaml_serde::from_str("host: localhost\npassword: secret\nversion-hint: tls13").unwrap(),
             ..Default::default()
         })
         .unwrap();
@@ -1327,7 +1327,7 @@ mod restls_tests {
             server: "127.0.0.1".into(),
             port: i32::from(restls_addr.port()),
             plugin: "restls".into(),
-            plugin_opts: serde_yaml::from_str(&format!(
+            plugin_opts: yaml_serde::from_str(&format!(
                 "host: {CAMOUFLAGE_NAME}\npassword: {PASSWORD}\nversion-hint: tls13\nskip-cert-verify: true"
             ))
             .expect("parse restls plugin opts"),

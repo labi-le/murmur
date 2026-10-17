@@ -170,7 +170,7 @@ fn outbound(peer: SocketAddr, client_private: [u8; 32], peer_public: &[u8; 32]) 
         credential(&client_private),
         credential(peer_public),
     );
-    WireGuard::new(serde_yaml::from_str(&yaml).expect("wireguard option")).expect("wireguard outbound")
+    WireGuard::new(yaml_serde::from_str(&yaml).expect("wireguard option")).expect("wireguard outbound")
 }
 
 fn tcp_metadata() -> Metadata {

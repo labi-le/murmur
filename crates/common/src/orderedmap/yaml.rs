@@ -6,7 +6,7 @@
 //! parses the key's text; `decode_key` covers both.
 
 use serde::de::{self, DeserializeOwned};
-use serde_yaml::Value;
+use yaml_serde::Value;
 
 /// Decodes one map key into `K`.
 ///
@@ -19,11 +19,11 @@ where
     E: de::Error,
 {
     if let Value::String(text) = &value {
-        return serde_yaml::from_value::<K>(Value::String(text.clone()))
-            .or_else(|_| serde_yaml::from_str::<K>(text))
+        return yaml_serde::from_value::<K>(Value::String(text.clone()))
+            .or_else(|_| yaml_serde::from_str::<K>(text))
             .map_err(|_| E::custom(unsupported_key_message::<K>()));
     }
-    serde_yaml::from_value::<K>(value).map_err(|_| E::custom(unsupported_key_message::<K>()))
+    yaml_serde::from_value::<K>(value).map_err(|_| E::custom(unsupported_key_message::<K>()))
 }
 
 fn unsupported_key_message<K>() -> String {
@@ -76,7 +76,7 @@ pub(crate) mod tests {
         om.set(8, json!("baz"));
         om.set(9, json!("Lorem ipsum dolor sit amet, consectetur adipiscing elit. Quisque auctor augue accumsan mi maximus, quis viverra massa pretium. Phasellus imperdiet sapien a interdum sollicitudin. Duis at commodo lectus, a lacinia sem."));
 
-        let b = serde_yaml::to_string(&om).unwrap();
+        let b = yaml_serde::to_string(&om).unwrap();
 
         let expected = "\
 1: bar
@@ -98,7 +98,7 @@ pub(crate) mod tests {
         om.set("test".to_owned(), json!("bar"));
         om.set("abc".to_owned(), json!(true));
 
-        let b = serde_yaml::to_string(&om).unwrap();
+        let b = yaml_serde::to_string(&om).unwrap();
 
         let expected = "\
 test: bar
@@ -113,7 +113,7 @@ abc: true
         om.set(MyString("test".to_owned()), json!("bar"));
         om.set(MyString("abc".to_owned()), json!(true));
 
-        let b = serde_yaml::to_string(&om).unwrap();
+        let b = yaml_serde::to_string(&om).unwrap();
 
         let expected = "\
 test: bar
@@ -131,7 +131,7 @@ abc: true
         om.set(MyInt(3), json!(100));
         om.set(MyInt(4), json!("baz"));
 
-        let b = serde_yaml::to_string(&om).unwrap();
+        let b = yaml_serde::to_string(&om).unwrap();
 
         let expected = "\
 1: bar
@@ -149,7 +149,7 @@ abc: true
         om.set(Marshallable(1), json!("bar"));
         om.set(Marshallable(28), json!(true));
 
-        let b = serde_yaml::to_string(&om).unwrap();
+        let b = yaml_serde::to_string(&om).unwrap();
 
         let expected = "\
 '#1#': bar
@@ -163,12 +163,12 @@ abc: true
         // the zero-valued `&OrderedMap[string, string]{}` has no in-memory counterpart here.
         let om = OrderedMap::<String, serde_json::Value>::new();
 
-        let b = serde_yaml::to_string(&om).unwrap();
+        let b = yaml_serde::to_string(&om).unwrap();
         assert_eq!("{}\n", b);
 
         let om = OrderedMap::<String, String>::new();
 
-        let b = serde_yaml::to_string(&om).unwrap();
+        let b = yaml_serde::to_string(&om).unwrap();
         assert_eq!("{}\n", b);
     }
 
@@ -185,7 +185,7 @@ abc: true
 8: baz
 ";
 
-        let om: OrderedMap<i32, serde_json::Value> = serde_yaml::from_str(data).unwrap();
+        let om: OrderedMap<i32, serde_json::Value> = yaml_serde::from_str(data).unwrap();
 
         assert_ordered_pairs_equal(
             &om,
@@ -198,7 +198,7 @@ abc: true
     fn test_unmarshal_yaml_string_key() {
         let data = r#"{"test":"bar","abc":true}"#;
 
-        let om: OrderedMap<String, serde_json::Value> = serde_yaml::from_str(data).unwrap();
+        let om: OrderedMap<String, serde_json::Value> = yaml_serde::from_str(data).unwrap();
 
         assert_ordered_pairs_equal(&om, &key_strings(["test", "abc"]), &[json!("bar"), json!(true)]);
     }
@@ -207,7 +207,7 @@ abc: true
     fn test_unmarshal_yaml_typed_string_key() {
         let data = r#"{"test":"bar","abc":true}"#;
 
-        let om: OrderedMap<MyString, serde_json::Value> = serde_yaml::from_str(data).unwrap();
+        let om: OrderedMap<MyString, serde_json::Value> = yaml_serde::from_str(data).unwrap();
 
         assert_ordered_pairs_equal(
             &om,
@@ -229,7 +229,7 @@ abc: true
 8: baz
 ";
 
-        let om: OrderedMap<MyInt, serde_json::Value> = serde_yaml::from_str(data).unwrap();
+        let om: OrderedMap<MyInt, serde_json::Value> = yaml_serde::from_str(data).unwrap();
 
         assert_ordered_pairs_equal(
             &om,
@@ -242,7 +242,7 @@ abc: true
     fn test_unmarshal_yaml_text_unmarshaler_key() {
         let data = r##"{"#1#":"bar","#28#":true}"##;
 
-        let om: OrderedMap<Marshallable, serde_json::Value> = serde_yaml::from_str(data).unwrap();
+        let om: OrderedMap<Marshallable, serde_json::Value> = yaml_serde::from_str(data).unwrap();
 
         assert_ordered_pairs_equal(&om, &[Marshallable(1), Marshallable(28)], &[json!("bar"), json!(true)]);
     }
@@ -250,7 +250,7 @@ abc: true
     #[test]
     fn test_unmarshal_yaml_not_an_object() {
         for data in ["true", r#"["foo"]"#, "42", r#""foo""#] {
-            let om = serde_yaml::from_str::<OrderedMap<i32, serde_json::Value>>(data);
+            let om = yaml_serde::from_str::<OrderedMap<i32, serde_json::Value>>(data);
             assert!(om.is_err(), "expected an error for {data}");
         }
     }
@@ -259,7 +259,7 @@ abc: true
     fn test_unmarshal_yaml_empty_map() {
         let data = "{}";
 
-        let om: OrderedMap<i32, serde_json::Value> = serde_yaml::from_str(data).unwrap();
+        let om: OrderedMap<i32, serde_json::Value> = yaml_serde::from_str(data).unwrap();
 
         assert_len_equal(&om, 0);
     }
@@ -268,22 +268,22 @@ abc: true
     fn test_yaml_special_characters() {
         let baseline_map =
             std::collections::BTreeMap::from([(SPECIAL_CHARACTERS.to_owned(), SPECIAL_CHARACTERS.to_owned())]);
-        let baseline_data = serde_yaml::to_string(&baseline_map).unwrap();
+        let baseline_data = yaml_serde::to_string(&baseline_map).unwrap();
 
         let mut om = OrderedMap::<String, serde_json::Value>::new();
         om.set(SPECIAL_CHARACTERS.to_owned(), json!(SPECIAL_CHARACTERS));
-        let b = serde_yaml::to_string(&om).unwrap();
+        let b = yaml_serde::to_string(&om).unwrap();
         assert_eq!(baseline_data, b);
 
         let mut om2 = OrderedMap::<MyString, MyString>::new();
         om2.set(MyString(SPECIAL_CHARACTERS.to_owned()), MyString(SPECIAL_CHARACTERS.to_owned()));
-        let b = serde_yaml::to_string(&om2).unwrap();
+        let b = yaml_serde::to_string(&om2).unwrap();
         assert_eq!(baseline_data, b);
 
-        let om: OrderedMap<String, serde_json::Value> = serde_yaml::from_str(&baseline_data).unwrap();
+        let om: OrderedMap<String, serde_json::Value> = yaml_serde::from_str(&baseline_data).unwrap();
         assert_ordered_pairs_equal(&om, &key_strings([SPECIAL_CHARACTERS]), &[json!(SPECIAL_CHARACTERS)]);
 
-        let om2: OrderedMap<MyString, MyString> = serde_yaml::from_str(&baseline_data).unwrap();
+        let om2: OrderedMap<MyString, MyString> = yaml_serde::from_str(&baseline_data).unwrap();
         assert_ordered_pairs_equal(
             &om2,
             &[MyString(SPECIAL_CHARACTERS.to_owned())],
@@ -293,7 +293,7 @@ abc: true
 
     #[test]
     fn test_yaml_round_trip() {
-        // serde_yaml's emitter differs, so the round trip is checked structurally.
+        // The emitter differs, so the round trip is checked structurally.
         let nested_input = "\
 x: 28
 m:
@@ -325,20 +325,20 @@ m:
             h: 6
 ";
 
-        let target: NestedMaps = serde_yaml::from_str(nested_input).unwrap();
-        let out = serde_yaml::to_string(&target).unwrap();
+        let target: NestedMaps = yaml_serde::from_str(nested_input).unwrap();
+        let out = yaml_serde::to_string(&target).unwrap();
 
-        let expected: serde_yaml::Value = serde_yaml::from_str(nested_input).unwrap();
-        let actual: serde_yaml::Value = serde_yaml::from_str(&out).unwrap();
+        let expected: yaml_serde::Value = yaml_serde::from_str(nested_input).unwrap();
+        let actual: yaml_serde::Value = yaml_serde::from_str(&out).unwrap();
         assert_eq!(expected, actual);
 
-        let target: OrderedMap<String, serde_json::Value> = serde_yaml::from_str("{}\n").unwrap();
-        let out = serde_yaml::to_string(&target).unwrap();
+        let target: OrderedMap<String, serde_json::Value> = yaml_serde::from_str("{}\n").unwrap();
+        let out = yaml_serde::to_string(&target).unwrap();
         assert_eq!("{}\n", out);
 
         let special_input = "�: 0\n";
-        let target: OrderedMap<String, i32> = serde_yaml::from_str(special_input).unwrap();
-        let out = serde_yaml::to_string(&target).unwrap();
+        let target: OrderedMap<String, i32> = yaml_serde::from_str(special_input).unwrap();
+        let out = yaml_serde::to_string(&target).unwrap();
         assert_eq!(special_input, out);
     }
 
@@ -356,13 +356,13 @@ m:
         V: DeserializeOwned + Serialize + PartialEq + Debug,
     {
         for data in YAML_CORPUS {
-            let Ok(v1) = serde_yaml::from_str::<OrderedMap<K, V>>(data) else {
+            let Ok(v1) = yaml_serde::from_str::<OrderedMap<K, V>>(data) else {
                 continue;
             };
 
-            let yaml_data = serde_yaml::to_string(&v1).unwrap();
+            let yaml_data = yaml_serde::to_string(&v1).unwrap();
 
-            let v2: OrderedMap<K, V> = serde_yaml::from_str(&yaml_data).unwrap();
+            let v2: OrderedMap<K, V> = yaml_serde::from_str(&yaml_data).unwrap();
 
             assert!(assert_ordered_maps_equal(&v1, &v2), "failed with input data {data:?}");
         }
@@ -370,13 +370,13 @@ m:
 
     fn round_trip_yaml_structs() {
         for data in YAML_CORPUS {
-            let Ok(v1) = serde_yaml::from_str::<TestFuzzStruct>(data) else {
+            let Ok(v1) = yaml_serde::from_str::<TestFuzzStruct>(data) else {
                 continue;
             };
 
-            let yaml_data = serde_yaml::to_string(&v1).unwrap();
+            let yaml_data = yaml_serde::to_string(&v1).unwrap();
 
-            let v2: TestFuzzStruct = serde_yaml::from_str(&yaml_data).unwrap();
+            let v2: TestFuzzStruct = yaml_serde::from_str(&yaml_data).unwrap();
 
             assert!(assert_test_fuzz_struct_equal(&v1, &v2), "failed with input data {data:?}");
         }

@@ -14,7 +14,7 @@ anyhow.workspace = true
 if-addrs.workspace = true
 ipnet.workspace = true
 serde.workspace = true
-serde_yaml.workspace = true
+yaml_serde.workspace = true
 url.workspace = true
 murmur-adapter = { path = "../adapter" }
 murmur-adapter-outbound = { path = "../adapter-outbound" }

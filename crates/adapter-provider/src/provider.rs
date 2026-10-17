@@ -15,7 +15,7 @@ use chrono::{DateTime, Utc};
 use fancy_regex::Regex;
 use parking_lot::{Mutex, RwLock};
 use serde::{Deserialize, Serialize};
-use serde_yaml::{Mapping, Value};
+use yaml_serde::{Mapping, Value};
 
 use murmur_adapter::parser::{parse_proxy, with_provider_name, with_tunnel_for_api};
 use murmur_common::time::zero_time;
@@ -662,8 +662,8 @@ pub(crate) fn new_proxies_parser(
                 Ok(proxies) => {
                     let converted: Vec<Mapping> = proxies
                         .into_iter()
-                        .map(|proxy| serde_yaml::from_value(serde_yaml::to_value(proxy)?))
-                        .collect::<std::result::Result<Vec<Mapping>, serde_yaml::Error>>()?;
+                        .map(|proxy| yaml_serde::from_value(yaml_serde::to_value(proxy)?))
+                        .collect::<std::result::Result<Vec<Mapping>, yaml_serde::Error>>()?;
                     schema.proxies = Some(converted);
                 }
                 Err(err1) => return Err(anyhow!("{unmarshal_err}, {err1}")),

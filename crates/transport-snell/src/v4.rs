@@ -1103,11 +1103,11 @@ mod tests {
         let mut sink = ChunkedWriter { chunk: 8, buf: Vec::new(), polls: 0 };
         let mut writer = new_v4_writer(b"password").expect("v4 writer");
 
-        // `timeout` polls its future once and drops it on the deadline, which is the abandonment.
+        // Poll once: the sink accepts a prefix, then parks. Do not let a timer race its wakes.
         let abandoned = vec![0x11u8; FIRST];
-        let first_write = poll_fn(|cx| writer.poll_write(&mut sink, cx, &abandoned));
-        let stalled = tokio::time::timeout(Duration::ZERO, first_write).await;
-        assert!(stalled.is_err(), "the first write must stall mid-frame for this probe");
+        let stalled = poll_fn(|cx| Poll::Ready(writer.poll_write(&mut sink, cx, &abandoned))).await;
+        assert!(stalled.is_pending(), "the first write must stall mid-frame for this probe");
+        assert!(writer.frame_offset > 0 && writer.frame_offset < writer.frame.len(), "a frame must be partly written");
 
         let second = vec![0x22u8; SECOND];
         let written = writer.write(&mut sink, &second).await.expect("second write");

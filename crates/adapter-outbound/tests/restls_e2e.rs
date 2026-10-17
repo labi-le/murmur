@@ -110,16 +110,16 @@ impl Adapter {
     fn build(dialer: Dialer, yaml: &str) -> Self {
         match dialer {
             Dialer::Trojan => {
-                Adapter::Trojan(Trojan::new(serde_yaml::from_str(yaml).expect("trojan option")).expect("trojan"))
+                Adapter::Trojan(Trojan::new(yaml_serde::from_str(yaml).expect("trojan option")).expect("trojan"))
             }
             Dialer::Vless => {
-                Adapter::Vless(Vless::new(serde_yaml::from_str(yaml).expect("vless option")).expect("vless"))
+                Adapter::Vless(Vless::new(yaml_serde::from_str(yaml).expect("vless option")).expect("vless"))
             }
             Dialer::Vmess => {
-                Adapter::Vmess(Vmess::new(serde_yaml::from_str(yaml).expect("vmess option")).expect("vmess"))
+                Adapter::Vmess(Vmess::new(yaml_serde::from_str(yaml).expect("vmess option")).expect("vmess"))
             }
             Dialer::AnyTls => {
-                Adapter::AnyTls(AnyTLS::new(serde_yaml::from_str(yaml).expect("anytls option")).expect("anytls"))
+                Adapter::AnyTls(AnyTLS::new(yaml_serde::from_str(yaml).expect("anytls option")).expect("anytls"))
             }
         }
     }

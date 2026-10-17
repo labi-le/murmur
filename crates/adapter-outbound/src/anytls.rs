@@ -278,7 +278,7 @@ mod jls_option_tests {
 
     fn new_err(extra: &str) -> String {
         let yaml = format!("{HEAD}{extra}");
-        let option: AnyTLSOption = serde_yaml::from_str(&yaml).expect("option decodes");
+        let option: AnyTLSOption = yaml_serde::from_str(&yaml).expect("option decodes");
         AnyTLS::new(option).err().map(|err| err.to_string()).expect("rejected")
     }
 
@@ -295,13 +295,13 @@ mod jls_option_tests {
         let yaml = format!(
             "{HEAD}shadow-tls-opts:\n  password: p\n  version: 3\njls-opts:\n  username: \"\"\n  password: \"\"\n"
         );
-        let option: AnyTLSOption = serde_yaml::from_str(&yaml).expect("option decodes");
+        let option: AnyTLSOption = yaml_serde::from_str(&yaml).expect("option decodes");
         assert!(AnyTLS::new(option).is_ok());
 
         // The credential has to be present and empty: a block that leaves it out already fails to
         // decode (see `crate::jls`), so only this reaches the JLS config parse.
         let yaml = format!("{HEAD}jls-opts:\n  username: \"\"\n  password: pass\n");
-        let option: AnyTLSOption = serde_yaml::from_str(&yaml).expect("option decodes");
+        let option: AnyTLSOption = yaml_serde::from_str(&yaml).expect("option decodes");
         let err = AnyTLS::new(option).err().map(|err| err.to_string()).expect("rejected");
         assert_eq!(err, "jls: username is required");
     }
@@ -318,7 +318,7 @@ mod restls_option_tests {
 
     fn new_err(extra: &str) -> String {
         let yaml = format!("{HEAD}{extra}");
-        let option: AnyTLSOption = serde_yaml::from_str(&yaml).expect("option decodes");
+        let option: AnyTLSOption = yaml_serde::from_str(&yaml).expect("option decodes");
         AnyTLS::new(option).err().map(|err| err.to_string()).expect("rejected")
     }
 
@@ -335,7 +335,7 @@ mod restls_option_tests {
     #[tokio::test]
     async fn an_empty_block_leaves_the_security_mode_field_alone() {
         let yaml = format!("{HEAD}restls-opts:\n  password: \"\"\n  version-hint: \"\"\n");
-        let option: AnyTLSOption = serde_yaml::from_str(&yaml).expect("option decodes");
+        let option: AnyTLSOption = yaml_serde::from_str(&yaml).expect("option decodes");
         assert!(AnyTLS::new(option).is_ok());
     }
 }
