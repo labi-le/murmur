@@ -1,5 +1,5 @@
 //! `config` cannot import `executor` (that would be circular), so `hub::executor` registers
-//! [`temporary_update_general`] into `config::config::GENERAL_UPDATE_HOOK` once.
+//! [`temporary_update_parse_geodata`] into `config::config::GENERAL_UPDATE_HOOK` once.
 //!
 //! The registration goes through [`ensure_general_update_hook_registered`], which
 //! `murmur_config::config::parse_raw_config` calls; the rollback handle is a `Drop`-based guard.
@@ -95,7 +95,7 @@ static GENERAL_UPDATE_HOOK_INIT: Once = Once::new();
 /// why this is a runtime-registered callback rather than a plain `use`.
 fn general_update_hook(general: &General) -> Pin<Box<dyn Future<Output = Box<dyn FnOnce() + Send>> + Send + '_>> {
     Box::pin(async move {
-        let rollback: Box<dyn FnOnce() + Send> = Box::new(temporary_update_general(general).await);
+        let rollback: Box<dyn FnOnce() + Send> = Box::new(temporary_update_parse_geodata(general));
         rollback
     })
 }
@@ -139,8 +139,9 @@ pub async fn parse_with_path(path: &str) -> Result<Config> {
 
 /// `ParseWithBytes` config with buffer.
 pub async fn parse_with_bytes(buf: &[u8]) -> Result<Config> {
-    // The general-update hook this parse fires writes the process-global tunnel mode and rolls it
-    // back at the end of the parse; a concurrent `/configs` PATCH test must not interleave.
+    // The general-update hook this parse fires publishes the candidate geodata settings and
+    // restores them at the end of the parse; a concurrent test that reads those geodata settings
+    // must not interleave.
     // `CONFIG_OPERATION`, which every production entry point takes first (`hub::parse`,
     // `PUT /configs`, `PATCH /configs`), is what serialises those callers; this test-only lock
     // keeps direct `parse_with_bytes` callers in the test suite honest, and is never taken before
@@ -665,10 +666,58 @@ pub async fn get_general() -> General {
 }
 
 /// The general-update entry point; see the module doc comment.
-pub(crate) async fn temporary_update_general(general: &General) -> impl FnOnce() {
-    let old_general = get_general().await;
-    update_general(general, false);
-    move || update_general(&old_general, false)
+/// Applies the settings a parse reads through the live accessors, and only those: rule and
+/// rule-provider construction consults the geodata matching strategy, loader and geo-x URLs
+/// (`rules-common::geoip`, `component-geodata`). The rest of the candidate general config
+/// (routing mode, resolver and dialer settings, listener options, interface) is deliberately left
+/// untouched, because traffic threads read those globals without holding `CONFIG_OPERATION`: a
+/// candidate that later fails validation would otherwise be visible to live connections.
+pub(crate) fn temporary_update_parse_geodata(general: &General) -> impl FnOnce() {
+    let old = ParseGeodata::capture();
+    geodata_utils::set_geodata_mode(general.geodata_mode);
+    geodata_utils::set_loader(&general.geodata_loader);
+    geodata_utils::set_site_matcher(&general.geosite_matcher);
+    geodata_init::set_geo_ip_url(&general.geo_x_url.geo_ip);
+    geodata_init::set_mmdb_url(&general.geo_x_url.mmdb);
+    geodata_init::set_geo_site_url(&general.geo_x_url.geo_site);
+    geodata_init::set_asn_url(&general.geo_x_url.asn);
+    move || old.restore()
+}
+
+/// The geodata settings a parse may publish, captured so the hook restores them when the parse
+/// finishes, whether or not it succeeds.
+struct ParseGeodata {
+    mode: bool,
+    loader: String,
+    site_matcher: String,
+    geo_ip_url: String,
+    mmdb_url: String,
+    geo_site_url: String,
+    asn_url: String,
+}
+
+impl ParseGeodata {
+    fn capture() -> Self {
+        Self {
+            mode: geodata_utils::geodata_mode(),
+            loader: geodata_utils::loader_name(),
+            site_matcher: geodata_utils::site_matcher_name(),
+            geo_ip_url: geodata_init::geo_ip_url(),
+            mmdb_url: geodata_init::mmdb_url(),
+            geo_site_url: geodata_init::geo_site_url(),
+            asn_url: geodata_init::asn_url(),
+        }
+    }
+
+    fn restore(self) {
+        geodata_utils::set_geodata_mode(self.mode);
+        geodata_utils::set_loader(&self.loader);
+        geodata_utils::set_site_matcher(&self.site_matcher);
+        geodata_init::set_geo_ip_url(&self.geo_ip_url);
+        geodata_init::set_mmdb_url(&self.mmdb_url);
+        geodata_init::set_geo_site_url(&self.geo_site_url);
+        geodata_init::set_asn_url(&self.asn_url);
+    }
 }
 
 pub async fn shutdown() {
@@ -759,6 +808,67 @@ mod tests {
             found.as_deref(),
             Some("patched.example.com"),
             "update_dns must patch the new enhancer from the live DefaultHostMapper"
+        );
+    }
+
+    /// The parse hook publishes only the geodata settings that rule construction reads. The
+    /// routing mode, resolver and dialer globals stay at the applied configuration, so traffic
+    /// cannot observe a candidate general config while a parse that may be rejected is running.
+    #[tokio::test]
+    async fn the_parse_hook_leaves_traffic_visible_general_settings_alone() {
+        use murmur_tunnel::mode::TunnelMode;
+
+        let _tunnel_state = crate::test_support::TUNNEL_STATE_LOCK.lock().await;
+        struct RestoreGeodata(Option<ParseGeodata>);
+        impl Drop for RestoreGeodata {
+            fn drop(&mut self) {
+                if let Some(previous) = self.0.take() {
+                    previous.restore();
+                }
+            }
+        }
+        let _restore = RestoreGeodata(Some(ParseGeodata::capture()));
+
+        let applied_mode = mode();
+        let applied_disable_ipv6 = comp_resolver::disable_ipv6();
+        let applied_tcp_concurrent = dialer_dialer::get_tcp_concurrent();
+        let applied_geodata = ParseGeodata::capture();
+
+        let mut general = get_general().await;
+        general.mode = if applied_mode == TunnelMode::RULE { TunnelMode::DIRECT } else { TunnelMode::RULE };
+        general.ipv6 = applied_disable_ipv6; // `update_general` maps `ipv6 == true` to `disable_ipv6 == false`
+        general.tcp_concurrent = !applied_tcp_concurrent;
+        general.geodata_mode = !applied_geodata.mode;
+        general.geodata_loader =
+            if applied_geodata.loader == "standard" { "memconservative".to_owned() } else { "standard".to_owned() };
+
+        let rollback = temporary_update_parse_geodata(&general);
+        assert_eq!(mode(), applied_mode, "a candidate routing mode must not reach live traffic");
+        assert_eq!(
+            comp_resolver::disable_ipv6(),
+            applied_disable_ipv6,
+            "a candidate resolver setting must not reach live traffic"
+        );
+        assert_eq!(
+            dialer_dialer::get_tcp_concurrent(),
+            applied_tcp_concurrent,
+            "a candidate dialer setting must not reach live traffic"
+        );
+        assert_eq!(
+            geodata_utils::geodata_mode(),
+            general.geodata_mode,
+            "rule construction must see the candidate geodata mode"
+        );
+        assert_eq!(
+            geodata_utils::loader_name(),
+            general.geodata_loader,
+            "rule construction must see the candidate geodata loader"
+        );
+        rollback();
+        assert_eq!(
+            (geodata_utils::geodata_mode(), geodata_utils::loader_name()),
+            (applied_geodata.mode, applied_geodata.loader),
+            "the hook must restore the applied geodata settings"
         );
     }
 }

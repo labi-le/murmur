@@ -163,7 +163,7 @@ impl std::error::Error for ReloadError {
 /// Parses the configuration at startup, or again on a reload.
 ///
 /// Holds [`CONFIG_OPERATION`] across the parse and the apply, so an API update cannot interleave
-/// with the parse-time general update and be rolled back by it. The error names the stage that
+/// with the parse-time geodata update and be rolled back by it. The error names the stage that
 /// failed (see [`ReloadError`]).
 pub async fn parse(config_bytes: &[u8], options: &[Option]) -> Result<(), ReloadError> {
     let _operation = lock_config_operation().await;

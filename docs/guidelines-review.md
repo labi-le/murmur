@@ -103,6 +103,29 @@ watcher/edit/rename/delete-recreate, proxy and fake-IP smoke again. Temporary pr
 were removed; production PID 3350 and deployment were unchanged. Platform and live-tailnet
 limits from the preceding verification entry still apply.
 
+## Rejected-config isolation verification, 2026-10-18
+
+The follow-up integrates `17cbbe4` and `5066ddd` from the watcher branch. Malformed
+nonempty SS/VMess listener URLs now fail apply before replacing their existing listener.
+The parse hook temporarily publishes only geodata settings; candidate routing mode,
+resolver and dialer settings stay out of live traffic. Independent review found a missing
+test-state lock in the new hook regression. The test now takes `TUNNEL_STATE_LOCK` and
+restores geodata on drop, including assertion failures. No other review blocker remained.
+
+Targeted listener and hub regressions passed through `tools/cargo-slot`, followed by
+`make gate`: **3,226 tests passed, two documented soaks skipped**, formatting and
+all-targets/all-features clippy passed. Dependency hygiene reported advisories, bans,
+licenses and sources OK, with existing duplicate-version warnings; machete found no
+unused dependencies and audit completed its 752-dependency scan.
+
+An isolated default-feature binary accepted SS/VMess listeners, kept each reachable
+after its malformed replacement was submitted and continued relaying the exact local
+HTTP payload. An invalid rules candidate left the applied DIRECT mode unchanged.
+The PID stayed unchanged. The first smoke incorrectly expected an HTTP error for an
+apply failure: the existing API returns 204 and logs that failure. The corrected probe
+checked that log and the preserved listener instead. Parse failures return an HTTP error.
+The production router and its ongoing soak were not changed.
+
 ## What the lints cannot see, and what the tree does about it
 
 ### The rewrite itself: differential audit

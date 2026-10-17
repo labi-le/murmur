@@ -75,9 +75,12 @@ caller, while a `tun` section the device refuses stays the documented degradatio
 not observed; replace the target file.
 
 Every parse-and-apply, watched or not, holds one process-wide lock (`hub::lock_config_operation`)
-that the API updates take as well: a parse writes the live general settings for its duration and
-rolls them back when it returns, so without that lock a concurrent `PUT` or `PATCH /configs` could
-be undone by the rollback of a file that was rejected. While watch mode is on, `PUT /configs` with
+that the API updates take as well. During parsing, only the candidate geodata settings are
+published temporarily for rule construction and restored on return; live routing mode, resolver
+and dialer settings stay unchanged until apply. The lock prevents another configuration operation
+from interleaving with that temporary state. A malformed nonempty `ss-config` or `vmess-config`
+fails apply instead of disabling its existing listener; an empty value disables it explicitly.
+While watch mode is on, `PUT /configs` with
 a `path` or a `payload` still applies to the running process and does not move the watcher, so the
 next real file change replaces those API-only settings. `--watch-config` together with `-f -` or
 `--config` is refused before the configuration is read, so it never waits for stdin. Rule and

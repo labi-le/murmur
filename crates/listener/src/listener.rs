@@ -360,25 +360,33 @@ pub async fn re_create_redir(port: i32, tunnel: Arc<dyn Tunnel>) -> anyhow::Resu
 pub async fn re_create_shadow_socks(shadow_socks_config: &str, tunnel: Arc<dyn Tunnel>) -> anyhow::Result<()> {
     let mut state = SS_MUX.lock().await;
 
-    let ss_config = match parse_ss_url(shadow_socks_config) {
-        Ok((addr, cipher, password)) => {
-            let LcShadowsocksServer { mux_option, shadow_tls, res_tls, jls_config, kcp_tun, simple_obfs, .. } =
-                LcShadowsocksServer::default();
-            LcShadowsocksServer {
-                enable: !shadow_socks_config.is_empty(),
-                listen: addr,
-                password,
-                cipher,
-                udp: true,
-                mux_option,
-                shadow_tls,
-                res_tls,
-                jls_config,
-                kcp_tun,
-                simple_obfs,
+    let ss_config = if shadow_socks_config.is_empty() {
+        // An empty `ss-config` is the disable signal, not a parse failure.
+        LcShadowsocksServer::default()
+    } else {
+        match parse_ss_url(shadow_socks_config) {
+            Ok((addr, cipher, password)) => {
+                let LcShadowsocksServer { mux_option, shadow_tls, res_tls, jls_config, kcp_tun, simple_obfs, .. } =
+                    LcShadowsocksServer::default();
+                LcShadowsocksServer {
+                    enable: true,
+                    listen: addr,
+                    password,
+                    cipher,
+                    udp: true,
+                    mux_option,
+                    shadow_tls,
+                    res_tls,
+                    jls_config,
+                    kcp_tun,
+                    simple_obfs,
+                }
+            }
+            Err(err) => {
+                errorln!("Start ShadowSocks server error: {}", err);
+                return Err(anyhow!("the shadowsocks listener config is invalid: {err}"));
             }
         }
-        Err(_) => LcShadowsocksServer::default(),
     };
 
     let mut should_ignore = false;
@@ -418,48 +426,56 @@ pub async fn re_create_shadow_socks(shadow_socks_config: &str, tunnel: Arc<dyn T
 pub async fn re_create_vmess(vmess_config: &str, tunnel: Arc<dyn Tunnel>) -> anyhow::Result<()> {
     let mut state = VMESS_MUX.lock().await;
 
-    let vs_config = match parse_vmess_url(vmess_config) {
-        Ok((addr, username, password)) => {
-            let LcVmessServer {
-                ws_path,
-                grpc_service_name,
-                certificate,
-                private_key,
-                client_auth_type,
-                client_auth_cert,
-                ech_key,
-                shadow_tls,
-                res_tls,
-                jls_config,
-                reality_config,
-                tls_mirror_config,
-                mekya_config,
-                mkcp_config,
-                mux_option,
-                ..
-            } = LcVmessServer::default();
-            LcVmessServer {
-                enable: !vmess_config.is_empty(),
-                listen: addr,
-                users: vec![LcVmessUser { username, uuid: password, alter_id: 1 }],
-                ws_path,
-                grpc_service_name,
-                certificate,
-                private_key,
-                client_auth_type,
-                client_auth_cert,
-                ech_key,
-                shadow_tls,
-                res_tls,
-                jls_config,
-                reality_config,
-                tls_mirror_config,
-                mekya_config,
-                mkcp_config,
-                mux_option,
+    let vs_config = if vmess_config.is_empty() {
+        // An empty `vmess-config` is the disable signal, not a parse failure.
+        LcVmessServer::default()
+    } else {
+        match parse_vmess_url(vmess_config) {
+            Ok((addr, username, password)) => {
+                let LcVmessServer {
+                    ws_path,
+                    grpc_service_name,
+                    certificate,
+                    private_key,
+                    client_auth_type,
+                    client_auth_cert,
+                    ech_key,
+                    shadow_tls,
+                    res_tls,
+                    jls_config,
+                    reality_config,
+                    tls_mirror_config,
+                    mekya_config,
+                    mkcp_config,
+                    mux_option,
+                    ..
+                } = LcVmessServer::default();
+                LcVmessServer {
+                    enable: true,
+                    listen: addr,
+                    users: vec![LcVmessUser { username, uuid: password, alter_id: 1 }],
+                    ws_path,
+                    grpc_service_name,
+                    certificate,
+                    private_key,
+                    client_auth_type,
+                    client_auth_cert,
+                    ech_key,
+                    shadow_tls,
+                    res_tls,
+                    jls_config,
+                    reality_config,
+                    tls_mirror_config,
+                    mekya_config,
+                    mkcp_config,
+                    mux_option,
+                }
+            }
+            Err(err) => {
+                errorln!("Start Vmess server error: {}", err);
+                return Err(anyhow!("the vmess listener config is invalid: {err}"));
             }
         }
-        Err(_) => LcVmessServer::default(),
     };
 
     let mut should_ignore = false;
@@ -1068,5 +1084,23 @@ mod tests {
             return;
         }
         panic!("no probed port stayed free for the TCP half");
+    }
+
+    /// A nonempty `ss-config` or `vmess-config` that does not parse is a configuration error, not a
+    /// request to disable the listener: it must fail the apply, so a reload is not cached as
+    /// applied and the previous listener is left in place. An empty value keeps the disable
+    /// meaning.
+    #[tokio::test]
+    async fn a_malformed_inbound_config_fails_instead_of_disabling_the_listener() {
+        assert!(
+            re_create_shadow_socks("not-a-url", null_tunnel()).await.is_err(),
+            "a malformed nonempty ss-config must fail the apply"
+        );
+        assert!(
+            re_create_vmess("not-a-url", null_tunnel()).await.is_err(),
+            "a malformed nonempty vmess-config must fail the apply"
+        );
+        assert!(re_create_shadow_socks("", null_tunnel()).await.is_ok(), "an empty ss-config disables the listener");
+        assert!(re_create_vmess("", null_tunnel()).await.is_ok(), "an empty vmess-config disables the listener");
     }
 }

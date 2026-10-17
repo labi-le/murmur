@@ -1155,8 +1155,10 @@ pub async fn parse_raw_config(raw_cfg: RawConfig) -> Result<Config> {
     let general = parse_general(&raw_cfg);
 
     // Rule/rule-provider parsing below relies on geodata settings (mode, loader, geo-x URLs)
-    // from this config's `general`, not whatever is currently applied; temporarily apply it and
-    // roll back once parsing finishes.
+    // from this config's `general`, not whatever is currently applied; the hook publishes only
+    // those settings and restores them once parsing finishes. It must not publish the candidate
+    // routing mode, resolver or dialer settings: traffic threads read those without the
+    // configuration lock, and a candidate that is rejected would otherwise be visible to them.
     let hook = GENERAL_UPDATE_HOOK
         .get()
         .ok_or_else(|| anyhow!("hub::executor registers the general-update hook before any config parses"))?;
