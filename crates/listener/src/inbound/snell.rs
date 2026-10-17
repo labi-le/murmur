@@ -143,17 +143,17 @@ mod tests {
         STANDARD.encode(bytes)
     });
 
-    fn yaml_str(s: &str) -> serde_yaml::Value {
-        serde_yaml::Value::from(s)
+    fn yaml_str(s: &str) -> yaml_serde::Value {
+        yaml_serde::Value::from(s)
     }
-    fn yaml_i64(n: i64) -> serde_yaml::Value {
-        serde_yaml::Value::from(n)
+    fn yaml_i64(n: i64) -> yaml_serde::Value {
+        yaml_serde::Value::from(n)
     }
-    fn yaml_str_list(items: &[&str]) -> serde_yaml::Value {
-        serde_yaml::Value::Sequence(items.iter().map(|s| serde_yaml::Value::from(*s)).collect())
+    fn yaml_str_list(items: &[&str]) -> yaml_serde::Value {
+        yaml_serde::Value::Sequence(items.iter().map(|s| yaml_serde::Value::from(*s)).collect())
     }
-    fn yaml_map(entries: &[(&str, serde_yaml::Value)]) -> serde_yaml::Mapping {
-        entries.iter().map(|(k, v)| (serde_yaml::Value::from(*k), v.clone())).collect()
+    fn yaml_map(entries: &[(&str, yaml_serde::Value)]) -> yaml_serde::Mapping {
+        entries.iter().map(|(k, v)| (yaml_serde::Value::from(*k), v.clone())).collect()
     }
 
     async fn test_inbound_snell(inbound_options: SnellOption, mut outbound_options: OutSnellOption) {

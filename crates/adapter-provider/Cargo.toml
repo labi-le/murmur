@@ -19,7 +19,7 @@ parking_lot.workspace = true
 regex.workspace = true
 serde.workspace = true
 serde_json.workspace = true
-serde_yaml.workspace = true
+yaml_serde.workspace = true
 tokio.workspace = true
 tokio-util.workspace = true
 murmur-adapter = { path = "../adapter" }

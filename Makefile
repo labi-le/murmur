@@ -73,17 +73,11 @@ gate: fmt-check nextest clippy hygiene
 
 gate-full: gate clippy-windows test-heavy
 
-# Wired into `gate` but still non-blocking, so that a missing tool or an unreachable advisory
-# database cannot fail the gate. All three are clean on this tree as of the last run:
-#   * cargo deny check  -- `advisories ok, bans ok, licenses ok, sources ok`; the remaining warnings
-#     are 59 `duplicate` (the deliberate `multiple-versions = "warn"` policy) and the two
-#     not-encountered GPL allowance entries. The advisories it would otherwise report are listed in
-#     `deny.toml` with the reason each is accepted (Marvin timing attack on `rsa`, the `wasmtime`
-#     advisories, the unmaintained `instant` and `rustls-pemfile`).
-#   * cargo audit       -- scans the 730 lockfile dependencies without a finding.
-#   * cargo machete     -- no unused dependencies.
-# Keep the `-` prefixes: the printed output is the signal, and a registry outage must not turn a
-# green tree red. `lint` runs the same three targets blocking, for anyone who wants them to fail.
+# Wired into `gate` but non-blocking, so a missing tool or an unreachable advisory database
+# cannot fail the gate. Read the output: a successful `make gate` alone does not establish
+# clean dependency hygiene. The accepted advisory exceptions are documented in `deny.toml`
+# and mirrored in `.cargo/audit.toml`; duplicate-version warnings remain informational.
+# Keep the `-` prefixes. `lint` runs these checks as blocking targets, alongside spelling.
 hygiene:
 	-$(CARGO) deny check
 	-$(CARGO) machete

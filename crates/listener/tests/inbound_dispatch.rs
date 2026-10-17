@@ -23,7 +23,7 @@ use std::sync::Arc;
 
 use murmur_constant::listener::InboundListener;
 use murmur_listener::parse::parse_listener;
-use serde_yaml::Mapping;
+use yaml_serde::Mapping;
 
 /// Every `type` string the registry accepts.
 const LISTENER_TYPES: &[&str] = &[
@@ -50,7 +50,7 @@ const LISTENER_TYPES: &[&str] = &[
 ];
 
 fn parse_yaml(yaml: &str) -> Result<Arc<dyn InboundListener>, String> {
-    let mapping: Mapping = serde_yaml::from_str(yaml).expect("listener mapping");
+    let mapping: Mapping = yaml_serde::from_str(yaml).expect("listener mapping");
     parse_listener(&mapping).map_err(|err| err.to_string())
 }
 

@@ -59,7 +59,7 @@ pub struct SnellOption {
     pub udp: bool,
     pub version: i32,
     pub reuse: bool,
-    pub obfs_opts: serde_yaml::Mapping,
+    pub obfs_opts: yaml_serde::Mapping,
     pub client_fingerprint: String,
 }
 
@@ -439,7 +439,7 @@ mod restls_cancellation_tests {
             server: "localhost".into(),
             port: 443,
             version: snellt::VERSION3,
-            obfs_opts: serde_yaml::from_str("mode: restls\nhost: localhost\npassword: secret\nversion-hint: tls13")
+            obfs_opts: yaml_serde::from_str("mode: restls\nhost: localhost\npassword: secret\nversion-hint: tls13")
                 .unwrap(),
             ..Default::default()
         })

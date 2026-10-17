@@ -384,7 +384,7 @@ fn zip_file_unpack(zipfile: &Path, out_dir: &Path, file_mode: u32) -> Result<Pat
         return Err(anyhow!("the target file is a directory"));
     }
 
-    let name = zf.name().to_owned();
+    let name = zf.name().map_err(|err| anyhow!("zip file name: {err}"))?.into_owned();
     let base_name = Path::new(&name).file_name().map_or_else(|| name.clone(), |s| s.to_string_lossy().into_owned());
     let output_name = out_dir.join(&base_name);
     let mut data = Vec::new();

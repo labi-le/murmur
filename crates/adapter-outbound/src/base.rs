@@ -1007,8 +1007,8 @@ mod tests {
         restls_opts: RestlsOptions,
     }
 
-    fn parse(yaml: &str) -> serde_yaml::Result<TlsOptions> {
-        serde_yaml::from_str(yaml)
+    fn parse(yaml: &str) -> yaml_serde::Result<TlsOptions> {
+        yaml_serde::from_str(yaml)
     }
 
     fn reality_cfg(short_id: &str) -> Result<Option<murmur_reality::RealityClientConfig>> {
@@ -1111,8 +1111,8 @@ mod tests {
             "ip-version: null\n",
             "dialer-proxy: null\n",
         );
-        let direct: BasicOption = serde_yaml::from_str(yaml).unwrap();
-        let flattened: FlattenedOption = serde_yaml::from_str(yaml).unwrap();
+        let direct: BasicOption = yaml_serde::from_str(yaml).unwrap();
+        let flattened: FlattenedOption = yaml_serde::from_str(yaml).unwrap();
 
         assert!(!direct.tfo && !flattened.basic_option.tfo);
         assert!(direct.interface.is_empty() && direct.dialer_proxy.is_empty() && direct.routing_mark == 0);

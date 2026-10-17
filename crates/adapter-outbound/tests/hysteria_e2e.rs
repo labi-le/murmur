@@ -171,7 +171,7 @@ fn outbound(server: SocketAddr, auth_string: &str, alpn: Option<&str>) -> Arc<Hy
     if let Some(alpn) = alpn {
         yaml.push_str(&format!("alpn: [\"{alpn}\"]\n"));
     }
-    Hysteria::new(serde_yaml::from_str(&yaml).expect("hysteria option")).expect("hysteria outbound")
+    Hysteria::new(yaml_serde::from_str(&yaml).expect("hysteria option")).expect("hysteria outbound")
 }
 
 fn tcp_metadata() -> Metadata {

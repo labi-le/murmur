@@ -587,7 +587,7 @@ mod tests {
 
     #[test]
     fn every_option_field_decodes_from_its_wire_name() {
-        let option: Hysteria2Option = serde_yaml::from_str(
+        let option: Hysteria2Option = yaml_serde::from_str(
             r#"
 name: h2
 server: example.com

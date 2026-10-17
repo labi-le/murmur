@@ -1119,20 +1119,20 @@ mod jls_option_tests {
 
     fn new_err(extra: &str) -> String {
         let yaml = format!("{HEAD}tls: true\n{extra}");
-        let option: VmessOption = serde_yaml::from_str(&yaml).expect("option decodes");
+        let option: VmessOption = yaml_serde::from_str(&yaml).expect("option decodes");
         Vmess::new(option).err().map(|err| err.to_string()).expect("rejected")
     }
 
     #[test]
     fn credentials_select_jls_while_empty_ones_select_nothing() {
         let yaml = format!("{HEAD}tls: true\n{JLS}");
-        let option: VmessOption = serde_yaml::from_str(&yaml).expect("option decodes");
+        let option: VmessOption = yaml_serde::from_str(&yaml).expect("option decodes");
         let vmess = Vmess::new(option).expect("accepted");
         let config = vmess.jls_config.as_ref().expect("JLS selected");
         assert_eq!((config.user.username.as_str(), config.user.password.as_str()), ("user", "pass"));
 
         let yaml = format!("{HEAD}tls: true\njls-opts:\n  username: \"\"\n  password: \"\"\n");
-        let option: VmessOption = serde_yaml::from_str(&yaml).expect("option decodes");
+        let option: VmessOption = yaml_serde::from_str(&yaml).expect("option decodes");
         assert!(Vmess::new(option).expect("accepted").jls_config.is_none());
 
         // The credential has to be present and empty: a block that leaves it out already fails to
@@ -1149,13 +1149,13 @@ mod jls_option_tests {
     #[test]
     fn jls_requires_tls_and_rejects_the_kcp_transports() {
         let yaml = format!("{HEAD}tls: false\n{JLS}");
-        let option: VmessOption = serde_yaml::from_str(&yaml).expect("option decodes");
+        let option: VmessOption = yaml_serde::from_str(&yaml).expect("option decodes");
         let err = Vmess::new(option).err().map(|err| err.to_string()).expect("rejected");
         assert_eq!(err, "JLS requires TLS");
 
         for network in ["kcp", "mkcp"] {
             let yaml = format!("{HEAD}tls: true\nnetwork: {network}\n{JLS}");
-            let option: VmessOption = serde_yaml::from_str(&yaml).expect("option decodes");
+            let option: VmessOption = yaml_serde::from_str(&yaml).expect("option decodes");
             let err = Vmess::new(option).err().map(|err| err.to_string()).expect("rejected");
             assert_eq!(err, "JLS only supports TCP transports", "network {network}");
         }
@@ -1173,7 +1173,7 @@ mod restls_option_tests {
 
     fn new_err(extra: &str) -> String {
         let yaml = format!("{HEAD}tls: true\n{extra}");
-        let option: VmessOption = serde_yaml::from_str(&yaml).expect("option decodes");
+        let option: VmessOption = yaml_serde::from_str(&yaml).expect("option decodes");
         Vmess::new(option).err().map(|err| err.to_string()).expect("rejected")
     }
 
@@ -1189,13 +1189,13 @@ mod restls_option_tests {
     #[test]
     fn restls_requires_tls_and_rejects_the_kcp_transports() {
         let yaml = format!("{HEAD}tls: false\n{RESTLS}");
-        let option: VmessOption = serde_yaml::from_str(&yaml).expect("option decodes");
+        let option: VmessOption = yaml_serde::from_str(&yaml).expect("option decodes");
         let err = Vmess::new(option).err().map(|err| err.to_string()).expect("rejected");
         assert_eq!(err, "Restls requires TLS");
 
         for network in ["kcp", "mkcp"] {
             let yaml = format!("{HEAD}tls: true\nnetwork: {network}\n{RESTLS}");
-            let option: VmessOption = serde_yaml::from_str(&yaml).expect("option decodes");
+            let option: VmessOption = yaml_serde::from_str(&yaml).expect("option decodes");
             let err = Vmess::new(option).err().map(|err| err.to_string()).expect("rejected");
             assert_eq!(err, "Restls only supports TCP transports", "network {network}");
         }
@@ -1206,7 +1206,7 @@ mod restls_option_tests {
     #[test]
     fn the_restls_server_name_is_the_configured_servername() {
         let yaml = format!("{HEAD}tls: true\nservername: sni.example\n{RESTLS}");
-        let option: VmessOption = serde_yaml::from_str(&yaml).expect("option decodes");
+        let option: VmessOption = yaml_serde::from_str(&yaml).expect("option decodes");
         let vmess = Vmess::new(option).expect("accepted");
         let config = vmess.restls_config.as_ref().expect("Restls selected");
         assert_eq!(config.server_name, "sni.example");
@@ -1215,7 +1215,7 @@ mod restls_option_tests {
     #[test]
     fn an_empty_block_leaves_the_security_mode_field_alone() {
         let yaml = format!("{HEAD}tls: true\nrestls-opts:\n  password: \"\"\n  version-hint: \"\"\n");
-        let option: VmessOption = serde_yaml::from_str(&yaml).expect("option decodes");
+        let option: VmessOption = yaml_serde::from_str(&yaml).expect("option decodes");
         assert!(Vmess::new(option).expect("accepted").restls_config.is_none());
     }
 }
@@ -1231,7 +1231,7 @@ mod shadow_tls_option_tests {
     #[tokio::test]
     async fn a_v3_block_builds_a_config_but_refuses_to_dial() {
         let yaml = format!("{HEAD}tls: true\nshadow-tls-opts:\n  password: p\n  version: 3\n");
-        let option: VmessOption = serde_yaml::from_str(&yaml).expect("option decodes");
+        let option: VmessOption = yaml_serde::from_str(&yaml).expect("option decodes");
         let vmess = Vmess::new(option).expect("accepted");
 
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.expect("bind");

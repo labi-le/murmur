@@ -43,7 +43,7 @@ struct RuleProviderSchema {
 
 pub fn parse_rule_provider(
     name: &str,
-    mapping: &serde_yaml::Mapping,
+    mapping: &yaml_serde::Mapping,
     parse: ParseRuleFunc,
     make_bundle_file: &dyn Fn(&str) -> Option<BundleFile>,
 ) -> Result<Arc<dyn RuleProvider>> {

@@ -1002,7 +1002,7 @@ mod tests {
             "  server-url: https://realm.example.com\n",
             "initial-stream-receive-window: 1024\n",
         );
-        let mapping: serde_yaml::Mapping = serde_yaml::from_str(yaml).expect("parse yaml");
+        let mapping: yaml_serde::Mapping = yaml_serde::from_str(yaml).expect("parse yaml");
         let listener = crate::parse::parse_listener(&mapping).expect("hysteria2 listener parses");
         let option: serde_json::Value =
             serde_json::from_str(&listener.config().option_to_string()).expect("option json");
@@ -1038,7 +1038,7 @@ mod tests {
             "certificate: cert.pem\n",
             "private-key: key.pem\n",
         );
-        let mapping: serde_yaml::Mapping = serde_yaml::from_str(yaml).expect("parse yaml");
+        let mapping: yaml_serde::Mapping = yaml_serde::from_str(yaml).expect("parse yaml");
         let listener = crate::parse::parse_listener(&mapping).expect("hysteria2 listener parses");
         let option: serde_json::Value =
             serde_json::from_str(&listener.config().option_to_string()).expect("option json");
@@ -1051,7 +1051,7 @@ mod tests {
     #[test]
     fn parse_listener_requires_a_certificate_and_a_private_key() {
         let yaml = "name: hysteria2-in\ntype: hysteria2\nport: 8443\n";
-        let mapping: serde_yaml::Mapping = serde_yaml::from_str(yaml).expect("parse yaml");
+        let mapping: yaml_serde::Mapping = yaml_serde::from_str(yaml).expect("parse yaml");
         let err = crate::parse::parse_listener(&mapping).err().expect("TLS material is required").to_string();
         assert!(err.contains("certificate") && err.contains("private-key"), "{err}");
     }

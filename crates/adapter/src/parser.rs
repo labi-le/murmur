@@ -10,7 +10,7 @@ use std::sync::Arc;
 
 use anyhow::{anyhow, Result};
 use serde::Deserialize;
-use serde_yaml::{Mapping, Value};
+use yaml_serde::{Mapping, Value};
 
 use murmur_adapter_outbound::base::{self, BasicOption, ProxyAdapter as OutboundProxyAdapter};
 use murmur_common::structure::structure::{

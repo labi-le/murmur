@@ -9,4 +9,4 @@ CACHEDIR.TAG
 /union2.txt
 /ipcg-nodeb-probe/
 /$JCODE_SCRATCH_DIR/
-/${JCODE_SCRATCH_DIR:-/
+/$[{]JCODE_SCRATCH_DIR:-/

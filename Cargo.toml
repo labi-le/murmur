@@ -122,7 +122,7 @@ fancy-regex = "0.14"
 flate2 = "1.1.10"
 futures = "0.3.34"
 futures-util = "0.3.34"
-geiserx_tailscale = { version = "0.57.2", features = ["tsnet"] }
+geiserx_tailscale = { version = "0.57.7", features = ["tsnet"] }
 h2 = "0.4.19"
 h3 = "0.0.8"
 h3-quinn = "0.0.10"
@@ -161,11 +161,11 @@ regex = "1.13.1"
 rsa = { version = "0.9", features = ["pem"] }
 ring = "0.17.14"
 russh = "0.63"
-rustls = "0.23.45"
+rustls = "0.23.46"
 rustls-native-certs = "0.8.4"
 serde = { version = "1.0.229", features = ["derive"] }
 serde_json = "1.0.151"
-serde_yaml = "0.9.34"
+yaml_serde = "0.10.7"
 sevenz-rust2 = "0.23"
 sha1 = "0.11.0"
 sha2 = "0.11.0"
@@ -182,7 +182,7 @@ url = "2.5.8"
 uuid = { version = "1.26.1", features = ["v4", "v5", "serde"] }
 windows-sys = { version = "0.60.2", features = ["Win32_Foundation", "Win32_NetworkManagement_IpHelper", "Win32_NetworkManagement_Ndis", "Win32_Networking_WinSock", "Win32_Storage_FileSystem", "Win32_System_IO", "Win32_System_LibraryLoader", "Win32_System_Threading"] }
 x25519-dalek = { version = "3.0.0", features = ["static_secrets"] }
-zip = { version = "2.2", default-features = false, features = ["deflate"] }
+zip = { version = "9.0.0", default-features = false, features = ["deflate"] }
 zstd = "0.14.0"
 
 [workspace.package]

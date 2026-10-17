@@ -1,6 +1,6 @@
 use anyhow::{anyhow, Result};
 use serde::Serialize;
-use serde_yaml::Value;
+use yaml_serde::Value;
 
 pub fn filter<T: PartialEq + Clone>(t_slice: &[T], filter: impl Fn(&T) -> bool) -> Vec<T> {
     t_slice.iter().filter(|t| filter(t)).cloned().collect()
@@ -13,7 +13,7 @@ pub fn map<T, N>(arr: Option<&[T]>, mut block: impl FnMut(&T) -> N) -> Option<Ve
 }
 
 pub fn to_string_slice<T: Serialize>(value: &T) -> Result<Vec<String>> {
-    match serde_yaml::to_value(value)? {
+    match yaml_serde::to_value(value)? {
         Value::Sequence(seq) => Ok(seq.iter().map(value_string).collect()),
         Value::String(s) => Ok(vec![s]),
         Value::Null | Value::Bool(_) | Value::Number(_) | Value::Mapping(_) | Value::Tagged(_) => {

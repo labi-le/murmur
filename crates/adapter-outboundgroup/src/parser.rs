@@ -4,7 +4,7 @@ use std::sync::Arc;
 use anyhow::{anyhow, Result};
 use fancy_regex::Regex;
 use serde::Deserialize;
-use serde_yaml::Mapping;
+use yaml_serde::Mapping;
 
 use murmur_adapter_provider::healthcheck::new_health_check;
 use murmur_adapter_provider::provider::new_compatible_provider;

@@ -578,20 +578,20 @@ mod jls_option_tests {
 
     fn new_err(extra: &str) -> String {
         let yaml = format!("{HEAD}{extra}");
-        let option: TrojanOption = serde_yaml::from_str(&yaml).expect("option decodes");
+        let option: TrojanOption = yaml_serde::from_str(&yaml).expect("option decodes");
         Trojan::new(option).err().map(|err| err.to_string()).expect("rejected")
     }
 
     #[test]
     fn credentials_select_jls_while_empty_ones_select_nothing() {
         let yaml = format!("{HEAD}{JLS}");
-        let option: TrojanOption = serde_yaml::from_str(&yaml).expect("option decodes");
+        let option: TrojanOption = yaml_serde::from_str(&yaml).expect("option decodes");
         let trojan = Trojan::new(option).expect("accepted");
         let config = trojan.jls_config.as_ref().expect("JLS selected");
         assert_eq!((config.user.username.as_str(), config.user.password.as_str()), ("user", "pass"));
 
         let yaml = format!("{HEAD}jls-opts:\n  username: \"\"\n  password: \"\"\n");
-        let option: TrojanOption = serde_yaml::from_str(&yaml).expect("option decodes");
+        let option: TrojanOption = yaml_serde::from_str(&yaml).expect("option decodes");
         assert!(Trojan::new(option).expect("accepted").jls_config.is_none());
 
         // The credential has to be present and empty: a block that leaves it out already fails to
@@ -618,7 +618,7 @@ mod restls_option_tests {
 
     fn new_err(extra: &str) -> String {
         let yaml = format!("{HEAD}{extra}");
-        let option: TrojanOption = serde_yaml::from_str(&yaml).expect("option decodes");
+        let option: TrojanOption = yaml_serde::from_str(&yaml).expect("option decodes");
         Trojan::new(option).err().map(|err| err.to_string()).expect("rejected")
     }
 
@@ -637,13 +637,13 @@ mod restls_option_tests {
     #[test]
     fn the_restls_server_name_follows_the_sni_default() {
         let yaml = format!("{HEAD}{RESTLS}");
-        let option: TrojanOption = serde_yaml::from_str(&yaml).expect("option decodes");
+        let option: TrojanOption = yaml_serde::from_str(&yaml).expect("option decodes");
         let trojan = Trojan::new(option).expect("accepted");
         let config = trojan.restls_config.as_ref().expect("Restls selected");
         assert_eq!(config.server_name, "example.com");
 
         let yaml = format!("{HEAD}sni: sni.example\n{RESTLS}");
-        let option: TrojanOption = serde_yaml::from_str(&yaml).expect("option decodes");
+        let option: TrojanOption = yaml_serde::from_str(&yaml).expect("option decodes");
         let trojan = Trojan::new(option).expect("accepted");
         let config = trojan.restls_config.as_ref().expect("Restls selected");
         assert_eq!(config.server_name, "sni.example");
@@ -652,7 +652,7 @@ mod restls_option_tests {
     #[test]
     fn an_empty_block_leaves_the_security_mode_field_alone() {
         let yaml = format!("{HEAD}restls-opts:\n  password: \"\"\n  version-hint: \"\"\n");
-        let option: TrojanOption = serde_yaml::from_str(&yaml).expect("option decodes");
+        let option: TrojanOption = yaml_serde::from_str(&yaml).expect("option decodes");
         assert!(Trojan::new(option).expect("accepted").restls_config.is_none());
     }
 }

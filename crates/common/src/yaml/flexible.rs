@@ -9,7 +9,7 @@
 //! the input domain, as in a sniffer port list mixing a single port with a range.
 
 use serde::de::{Deserialize, Deserializer};
-use serde_yaml::Value;
+use yaml_serde::Value;
 
 fn scalar_to_string<'de, D: Deserializer<'de>>(value: Value) -> Result<String, D::Error> {
     use serde::de::Error;

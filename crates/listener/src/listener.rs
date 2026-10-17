@@ -282,6 +282,7 @@ pub async fn re_create_socks(port: i32, tunnel: Arc<dyn Tunnel>) -> anyhow::Resu
     infoln!("SOCKS proxy listening at: {}", tcp_listener.address());
     state.listener = Some(tcp_listener);
     state.udp_listener = Some(udp_listener);
+    drop(state);
     Ok(())
 }
 
@@ -410,6 +411,7 @@ pub async fn re_create_shadow_socks(shadow_socks_config: &str, tunnel: Arc<dyn T
     }
 
     *state = Some(listener);
+    drop(state);
     Ok(())
 }
 
@@ -490,6 +492,7 @@ pub async fn re_create_vmess(vmess_config: &str, tunnel: Arc<dyn Tunnel>) -> any
     }
 
     *state = Some(listener);
+    drop(state);
     Ok(())
 }
 
@@ -525,6 +528,7 @@ pub async fn re_create_tuic(config: LcTuicServer, tunnel: Arc<dyn Tunnel>) -> an
     }
 
     state.last_conf = config;
+    drop(state);
     if failed {
         return Err(anyhow!("the tuic listener did not start"));
     }
@@ -652,6 +656,7 @@ pub async fn re_create_mixed(port: i32, tunnel: Arc<dyn Tunnel>) -> anyhow::Resu
     infoln!("Mixed(http+socks) proxy listening at: {}", listener.address());
     state.listener = Some(listener);
     state.udp_listener = Some(udp_listener);
+    drop(state);
     Ok(())
 }
 
@@ -1058,7 +1063,6 @@ mod tests {
             if !redir_state(port).await.1 {
                 assert_eq!(redir_udp_warnings(&logs, 1).await, 1, "the retry must reach the UDP bind");
             }
-
             close_redir().await;
             murmur_log::un_subscribe(logs).await;
             return;

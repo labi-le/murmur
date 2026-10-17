@@ -110,7 +110,7 @@ impl Runtime {
         let port = free_udp_port();
         let state_dir = format!("zerotier-e2e-{name}-{}", std::process::id());
         let _ = std::fs::remove_dir_all(PATH.resolve(&state_dir));
-        let option: ZeroTierOption = serde_yaml::from_str(&format!(
+        let option: ZeroTierOption = yaml_serde::from_str(&format!(
             "name: {name}\nnetwork: {NETWORK}\nstate-dir: {state_dir}\nprimary-port: {port}\n"
         ))
         .expect("the option decodes");

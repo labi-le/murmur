@@ -23,6 +23,8 @@ Ba = "Ba"
 COMMOND = "COMMOND"
 Ciph = "Ciph"
 Encrypter = "Encrypter"
+# Four-character error label in the text log format.
+ERRO = "ERRO"
 Fo = "Fo"
 GOST = "GOST"
 Gost = "Gost"

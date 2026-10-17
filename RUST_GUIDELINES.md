@@ -2821,15 +2821,11 @@ nothing about the `rust-version = "1.97"` claim (Version Policy below); and
 workflow triggers on a push to `main`, any pull request, and
 `workflow_dispatch`.
 
-**Current state of this workspace.** The gate above is green: `cargo clippy
---all-targets --all-features -- -D warnings` reports nothing (the burn-down
-started at 6,576 diagnostics, 5,587 of them in production code), `cargo fmt --all
--- --check` is clean, `cargo deny check`, `cargo audit`, `cargo machete` and
-`typos` all report nothing, and `cargo test --all-features --no-fail-fast` passes
-its tests with 0 failures and two documented `#[ignore]`d soaks. Which of the
-rules below the toolchain enforces, and how the rest were audited, is written up
-in [`docs/guidelines-review.md`](docs/guidelines-review.md); its one open item is
-the cancel-safety note pass.
+**Recorded lint audit.** The original audit reached zero clippy diagnostics from a burn-down
+of 6,576 (5,587 in production code), with clean formatting and dependency checks. That is a
+historical result, not a claim about a newer toolchain or advisory database. See
+[`docs/guidelines-review.md`](docs/guidelines-review.md) for the original measurements and
+dated verification of subsequent gate repairs, including the two documented ignored soaks.
 
 **Rust 1.97+:** the `-D warnings` on the clippy line denies warnings only for
 the targets clippy compiles. To deny **rustc** warnings across the whole
@@ -2950,7 +2946,7 @@ to unlock the 1.95/1.97 idioms this guide recommends -- `bool::try_from`, the
 `isolate_*_one` integer helpers, and Cargo's `build.warnings` -- all of which
 the previous floor blocked. It is not a general "we wanted newer Rust" bump,
 and it is not dependency-forced either: **the Tailscale engine is satisfied by
-the floor, not the reason for it.** This workspace uses `geiserx_tailscale` 0.57.2
+the floor, not the reason for it.** This workspace uses `geiserx_tailscale` 0.57.7
 (the `tsnet` feature) as the `tsnet`/`ipn` engine behind the Tailscale
 outbound, and that crate's own manifest declares `rust-version = "1.94.1"` and
 `edition = "2024"`. A 1.97 workspace clears that requirement comfortably, so

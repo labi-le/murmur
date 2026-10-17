@@ -531,6 +531,7 @@ impl Conn for ServerStream {
         // A response header the send half only took a prefix of cannot be completed from here, and a
         // FIN would present the truncated header to the peer as the whole response.
         stream.reset();
+        drop(stream);
         Ok(())
     }
 }

@@ -18,7 +18,7 @@ use std::time::Instant;
 use anyhow::{anyhow, Result};
 use ipnet::IpNet;
 use serde::{Deserialize, Serialize};
-use serde_yaml::{Mapping, Value};
+use yaml_serde::{Mapping, Value};
 
 use murmur_adapter::adapter::Proxy;
 use murmur_adapter::parser::{parse_proxy, with_tunnel_for_api};
@@ -2532,21 +2532,21 @@ mod tests {
     #[test]
     fn sniffer_ports_accept_mixed_int_and_string_scalars() {
         let yaml = "sniff:\n  HTTP:\n    ports: [80, 8080-8880]\nport-whitelist: [80, \"443\"]\n";
-        let sniffer: RawSniffer = serde_yaml::from_str(yaml).expect("mixed-typed ports should decode");
+        let sniffer: RawSniffer = yaml_serde::from_str(yaml).expect("mixed-typed ports should decode");
         assert_eq!(sniffer.ports, vec!["80".to_owned(), "443".to_owned()]);
         assert_eq!(sniffer.sniff["HTTP"].ports, vec!["80".to_owned(), "8080-8880".to_owned()]);
     }
 
     #[test]
     fn raw_tun_deserializes_loopback_addresses() {
-        let tun: RawTun = serde_yaml::from_str("loopback-address: [\"127.0.0.1\", \"::1\"]\n").unwrap();
+        let tun: RawTun = yaml_serde::from_str("loopback-address: [\"127.0.0.1\", \"::1\"]\n").unwrap();
         let addrs: Vec<IpAddr> = vec!["127.0.0.1".parse().unwrap(), "::1".parse().unwrap()];
         assert_eq!(tun.loopback_address, addrs);
     }
 
     #[test]
     fn raw_tun_rejects_a_zoned_ipv6_loopback_address() {
-        let err = serde_yaml::from_str::<RawTun>("loopback-address: [\"fe80::1%eth0\"]\n").unwrap_err();
+        let err = yaml_serde::from_str::<RawTun>("loopback-address: [\"fe80::1%eth0\"]\n").unwrap_err();
         assert!(err.to_string().contains("invalid IP address syntax"), "unexpected error: {err}");
     }
 
@@ -2761,7 +2761,7 @@ mod tests {
     fn unmarshal_raw_config_of_an_empty_document_keeps_defaults() {
         let got = unmarshal_raw_config(b"").unwrap();
         let want = default_raw_config().unwrap();
-        assert_eq!(serde_yaml::to_string(&got).unwrap(), serde_yaml::to_string(&want).unwrap());
+        assert_eq!(yaml_serde::to_string(&got).unwrap(), yaml_serde::to_string(&want).unwrap());
     }
 
     #[test]
@@ -2781,7 +2781,7 @@ mod tests {
     fn unmarshal_raw_config_null_tun_section_keeps_defaults() {
         let got = unmarshal_raw_config(b"tun: ~\n").unwrap();
         let want = default_raw_config().unwrap();
-        assert_eq!(serde_yaml::to_string(&got.tun).unwrap(), serde_yaml::to_string(&want.tun).unwrap());
+        assert_eq!(yaml_serde::to_string(&got.tun).unwrap(), yaml_serde::to_string(&want.tun).unwrap());
     }
 
     /// Within a named sub-key, `dns-hijack: ~` merges onto a sequence-typed field and null replaces
@@ -2803,7 +2803,7 @@ mod tests {
     fn unmarshal_raw_config_null_dns_section_keeps_defaults() {
         let got = unmarshal_raw_config(b"dns: ~\n").unwrap();
         let want = default_raw_config().unwrap();
-        assert_eq!(serde_yaml::to_string(&got.dns).unwrap(), serde_yaml::to_string(&want.dns).unwrap());
+        assert_eq!(yaml_serde::to_string(&got.dns).unwrap(), yaml_serde::to_string(&want.dns).unwrap());
     }
 
     /// Same null-onto-mapping no-op as tun, for `sniffer:`; the default `force_dns_mapping`,
@@ -2813,7 +2813,7 @@ mod tests {
     fn unmarshal_raw_config_null_sniffer_section_keeps_defaults() {
         let got = unmarshal_raw_config(b"sniffer: ~\n").unwrap();
         let want = default_raw_config().unwrap();
-        assert_eq!(serde_yaml::to_string(&got.sniffer).unwrap(), serde_yaml::to_string(&want.sniffer).unwrap());
+        assert_eq!(yaml_serde::to_string(&got.sniffer).unwrap(), yaml_serde::to_string(&want.sniffer).unwrap());
         assert!(got.sniffer.force_dns_mapping);
         assert!(got.sniffer.parse_pure_ip);
         assert!(got.sniffer.override_dest);
@@ -2825,7 +2825,7 @@ mod tests {
     fn unmarshal_raw_config_null_profile_section_keeps_defaults() {
         let got = unmarshal_raw_config(b"profile: ~\n").unwrap();
         let want = default_raw_config().unwrap();
-        assert_eq!(serde_yaml::to_string(&got.profile).unwrap(), serde_yaml::to_string(&want.profile).unwrap());
+        assert_eq!(yaml_serde::to_string(&got.profile).unwrap(), yaml_serde::to_string(&want.profile).unwrap());
         assert!(got.profile.store_selected);
     }
 

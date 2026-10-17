@@ -65,7 +65,7 @@ where
         A: MapAccess<'de>,
     {
         let mut ordered_map = OrderedMap::new();
-        while let Some(key_value) = map.next_key::<serde_yaml::Value>()? {
+        while let Some(key_value) = map.next_key::<yaml_serde::Value>()? {
             let key: K = decode_key(key_value)?;
             let value: V = map.next_value()?;
             ordered_map.set(key, value);

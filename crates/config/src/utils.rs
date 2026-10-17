@@ -3,7 +3,7 @@ use std::net::IpAddr;
 use std::sync::Arc;
 
 use anyhow::{anyhow, Result};
-use serde_yaml::Mapping;
+use yaml_serde::Mapping;
 
 use murmur_adapter_outboundgroup::parser::GroupCommonOption;
 use murmur_common::structure::structure::{new_decoder, Option as StructureOption};
@@ -245,10 +245,10 @@ mod tests {
     use super::*;
     use crate::config::{parse_proxies, RawConfig};
 
-    fn mapping(pairs: &[(&str, serde_yaml::Value)]) -> Mapping {
+    fn mapping(pairs: &[(&str, yaml_serde::Value)]) -> Mapping {
         let mut m = Mapping::new();
         for (k, v) in pairs {
-            m.insert(serde_yaml::Value::String((*k).to_owned()), v.clone());
+            m.insert(yaml_serde::Value::String((*k).to_owned()), v.clone());
         }
         m
     }
@@ -390,8 +390,8 @@ mod tests {
                 ("server", "s.example.com".into()),
                 ("port", 443.into()),
                 ("uuid", "00000000-0000-0000-0000-000000000000".into()),
-                ("flow", serde_yaml::Value::Null),
-                ("udp", serde_yaml::Value::Null),
+                ("flow", yaml_serde::Value::Null),
+                ("udp", yaml_serde::Value::Null),
             ])],
             ..Default::default()
         };
@@ -413,9 +413,9 @@ mod tests {
                 ("cipher", "auto".into()),
                 (
                     "ws-opts",
-                    serde_yaml::Value::Mapping(mapping(&[(
+                    yaml_serde::Value::Mapping(mapping(&[(
                         "headers",
-                        serde_yaml::Value::Mapping(mapping(&[("X-Token", serde_yaml::Value::Null)])),
+                        yaml_serde::Value::Mapping(mapping(&[("X-Token", yaml_serde::Value::Null)])),
                     )])),
                 ),
             ])],
