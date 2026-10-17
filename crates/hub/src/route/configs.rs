@@ -48,8 +48,26 @@ pub(crate) async fn route(req: Req, segs: &[&str]) -> Option<Response<RespBody>>
     match segs {
         [] => match *req.method() {
             Method::GET => Some(get_configs().await),
-            Method::PUT if !embed_mode() => Some(update_configs(req).await),
-            Method::PATCH if !embed_mode() => Some(patch_configs(req).await),
+            // The body is decoded before the process-wide lock is taken: decoding awaits the
+            // client, and a slow or stalled body must not hold up a watched reload, a SIGHUP or
+            // another update. The parse and the mutation that follow are what the lock covers.
+            Method::PUT if !embed_mode() => {
+                let force = force_requested(req.uri().query().unwrap_or(""));
+                let Ok(request) =
+                    super::common::decode_json_body::<Option<UpdateConfigsRequest>, _>(req.into_body()).await
+                else {
+                    return Some(json_response(StatusCode::BAD_REQUEST, &err_bad_request()));
+                };
+                let _operation = crate::hub::lock_config_operation().await;
+                Some(update_configs(force, request.unwrap_or_default()).await)
+            }
+            Method::PATCH if !embed_mode() => {
+                let Ok(general) = super::common::decode_json_body::<ConfigSchema, _>(req.into_body()).await else {
+                    return Some(json_response(StatusCode::BAD_REQUEST, &err_bad_request()));
+                };
+                let _operation = crate::hub::lock_config_operation().await;
+                Some(patch_configs(general).await)
+            }
             _ => Some(status_only(StatusCode::METHOD_NOT_ALLOWED)),
         },
         ["geo"] if !embed_mode() => {
@@ -706,27 +724,37 @@ fn pointer_or_default_tuic_server(p: Option<TuicServerSchema>, mut def: TuicServ
 /// A top-level `null` body is not a valid `ConfigSchema`, so it answers 400 `Body invalid`. An
 /// implementation that dereferences the absent result instead would abort the connection with a
 /// panic, a failure mode hyper cannot reproduce here.
-async fn patch_configs(req: Req) -> Response<RespBody> {
-    let Ok(mut general) = super::common::decode_json_body::<ConfigSchema, _>(req.into_body()).await else {
-        return json_response(StatusCode::BAD_REQUEST, &err_bad_request());
-    };
+async fn patch_configs(mut general: ConfigSchema) -> Response<RespBody> {
     apply_general_schema(&mut general);
 
     let ports = get_ports().await;
 
     let tunnel = tunnel_arc();
-    re_create_http(general.port.unwrap_or(ports.port), Arc::clone(&tunnel)).await;
-    re_create_socks(general.socks_port.unwrap_or(ports.socks_port), Arc::clone(&tunnel)).await;
-    re_create_redir(general.redir_port.unwrap_or(ports.redir_port), Arc::clone(&tunnel)).await;
-    re_create_tproxy(general.tproxy_port.unwrap_or(ports.tproxy_port), Arc::clone(&tunnel)).await;
-    re_create_mixed(general.mixed_port.unwrap_or(ports.mixed_port), Arc::clone(&tunnel)).await;
-    if let Some(tun_patch) = general.tun {
-        re_create_tun(merge_tun_schema(&get_tun_conf(), tun_patch), Arc::clone(&tunnel)).await;
+    let mut failures = Vec::new();
+    for result in [
+        re_create_http(general.port.unwrap_or(ports.port), Arc::clone(&tunnel)).await,
+        re_create_socks(general.socks_port.unwrap_or(ports.socks_port), Arc::clone(&tunnel)).await,
+        re_create_redir(general.redir_port.unwrap_or(ports.redir_port), Arc::clone(&tunnel)).await,
+        re_create_tproxy(general.tproxy_port.unwrap_or(ports.tproxy_port), Arc::clone(&tunnel)).await,
+        re_create_mixed(general.mixed_port.unwrap_or(ports.mixed_port), Arc::clone(&tunnel)).await,
+        re_create_shadow_socks(&general.shadow_socks_config.unwrap_or(ports.shadow_socks_config), Arc::clone(&tunnel))
+            .await,
+        re_create_vmess(&general.vmess_config.unwrap_or(ports.vmess_config), Arc::clone(&tunnel)).await,
+        re_create_tuic(pointer_or_default_tuic_server(general.tuic_server, last_tuic_conf().await), tunnel).await,
+    ] {
+        if let Err(err) = result {
+            failures.push(err);
+        }
     }
-    re_create_shadow_socks(&general.shadow_socks_config.unwrap_or(ports.shadow_socks_config), Arc::clone(&tunnel))
-        .await;
-    re_create_vmess(&general.vmess_config.unwrap_or(ports.vmess_config), Arc::clone(&tunnel)).await;
-    re_create_tuic(pointer_or_default_tuic_server(general.tuic_server, last_tuic_conf().await), tunnel).await;
+    if let Some(tun_patch) = general.tun {
+        re_create_tun(merge_tun_schema(&get_tun_conf(), tun_patch), tunnel_arc()).await;
+    }
+    if !failures.is_empty() {
+        // Each listener logged its own bind error; this line says the request left the running
+        // configuration incomplete rather than conforming to it.
+        let joined = failures.iter().map(ToString::to_string).collect::<Vec<_>>().join("; ");
+        errorln!("PATCH /configs left the running configuration incomplete: {joined}");
+    }
 
     if let Some(mode) = general.mode {
         murmur_tunnel::tunnel::set_mode(mode);
@@ -773,22 +801,17 @@ fn apply_general_schema(general: &mut ConfigSchema) {
     }
 }
 
-async fn update_configs(req: Req) -> Response<RespBody> {
-    #[derive(Deserialize, Default)]
-    struct UpdateConfigsRequest {
-        #[serde(default)]
-        path: String,
-        #[serde(default)]
-        payload: String,
-    }
+/// The `PUT /configs` body: an optional `path` or inline `payload`, both empty meaning "reread the
+/// configured file".
+#[derive(Deserialize, Default)]
+struct UpdateConfigsRequest {
+    #[serde(default)]
+    path: String,
+    #[serde(default)]
+    payload: String,
+}
 
-    let force = force_requested(req.uri().query().unwrap_or(""));
-
-    let Ok(request) = super::common::decode_json_body::<Option<UpdateConfigsRequest>, _>(req.into_body()).await else {
-        return json_response(StatusCode::BAD_REQUEST, &err_bad_request());
-    };
-    let mut request = request.unwrap_or_default();
-
+async fn update_configs(force: bool, mut request: UpdateConfigsRequest) -> Response<RespBody> {
     let cfg: Config = if request.payload.is_empty() {
         if request.path.is_empty() {
             request.path = PATH.config();
@@ -815,7 +838,11 @@ async fn update_configs(req: Req) -> Response<RespBody> {
         }
     };
 
-    apply_config(cfg, force).await;
+    if let Err(err) = apply_config(cfg, force).await {
+        // The request still carries the configuration it was given; this says the running state
+        // does not match it yet, which a 204 alone would hide.
+        errorln!("PUT /configs left the running configuration incomplete: {err}");
+    }
     no_content()
 }
 
@@ -838,14 +865,13 @@ pub(crate) async fn update_geo_databases() -> Response<RespBody> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::test_support::TUNNEL_STATE_LOCK;
     use murmur_component_process::find_process_mode::FindProcessMode;
     use murmur_config::config::{General, Inbound};
     use murmur_listener::listener::{get_tuic_conf, set_tun_conf};
     use murmur_listener_config::tuic::TuicServer;
     use murmur_listener_config::tun::Tun;
     use murmur_log::LogLevel;
-
-    use crate::test_support::TUNNEL_STATE_LOCK;
 
     fn default_tun_for_test() -> Tun {
         Tun {
@@ -1146,7 +1172,13 @@ mod tests {
         let addr = listener.local_addr().expect("listener has a local address");
         tokio::spawn(async move {
             let (conn, _) = listener.accept().await.expect("accept loopback connection");
-            let svc = service_fn(|req: Req| async move { Ok::<_, Infallible>(patch_configs(req).await) });
+            let svc = service_fn(|req: Req| async move {
+                // The route decodes before taking the config lock; mirror that order here.
+                let general = crate::route::common::decode_json_body::<ConfigSchema, _>(req.into_body())
+                    .await
+                    .expect("the test body is valid JSON");
+                Ok::<_, Infallible>(patch_configs(general).await)
+            });
             let _ = hyper::server::conn::http1::Builder::new().serve_connection(TokioIo::new(conn), svc).await;
         });
 
@@ -1210,7 +1242,9 @@ mod tests {
     async fn patch_configs_merges_tuic_server_onto_last_stored_conf() {
         let _tunnel_state = TUNNEL_STATE_LOCK.lock().await;
         let _restore = TunnelStateGuard::save();
-        re_create_tuic(
+        // The listener may or may not bind in the test process; what the test reads back is the
+        // conf this call stores, which is stored either way.
+        let _ = re_create_tuic(
             TuicServer { listen: ":10443".to_owned(), certificate: "example.crt".to_owned(), ..TuicServer::default() },
             tunnel_arc(),
         )
@@ -1247,5 +1281,48 @@ mod tests {
         assert!(!stored.enable);
         assert_eq!(stored.device, "metatun");
         assert_eq!(stored.mtu, 1400);
+    }
+
+    /// A stalled request body must not hold the process-wide configuration lock: the route decodes
+    /// before taking it, so a client that stops mid-body cannot block watched reloads or SIGHUPs.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_stalled_request_body_does_not_hold_the_config_lock() {
+        use std::convert::Infallible;
+
+        use hyper::service::service_fn;
+        use hyper_util::rt::TokioIo;
+        use tokio::io::AsyncWriteExt as _;
+        use tokio::net::{TcpListener, TcpStream};
+
+        // Serialise with the reload tests, which hold the same lock through `hub::parse`.
+        let _listeners = crate::route::server::CONTROLLER_LISTENERS.lock().await;
+
+        let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind loopback listener");
+        let addr = listener.local_addr().expect("listener has a local address");
+        tokio::spawn(async move {
+            let (conn, _) = listener.accept().await.expect("accept loopback connection");
+            let svc = service_fn(|req: Req| async move {
+                Ok::<_, Infallible>(route(req, &[]).await.unwrap_or_else(|| status_only(StatusCode::NOT_FOUND)))
+            });
+            let _ = hyper::server::conn::http1::Builder::new().serve_connection(TokioIo::new(conn), svc).await;
+        });
+
+        let mut stream = TcpStream::connect(addr).await.expect("connect to loopback listener");
+        // A complete head and a body that declares more than it sends: the handler waits in the
+        // decoder, which runs before the lock is taken.
+        stream
+            .write_all(
+                b"PATCH /configs HTTP/1.1\r\nHost: test\r\nContent-Length: 64\r\nConnection: close\r\n\r\n{\"tun\":",
+            )
+            .await
+            .expect("write the partial request");
+        tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+
+        assert!(
+            tokio::time::timeout(std::time::Duration::from_millis(500), crate::hub::lock_config_operation())
+                .await
+                .is_ok(),
+            "a stalled request body must not hold the config lock"
+        );
     }
 }

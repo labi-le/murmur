@@ -141,6 +141,10 @@ pub async fn parse_with_path(path: &str) -> Result<Config> {
 pub async fn parse_with_bytes(buf: &[u8]) -> Result<Config> {
     // The general-update hook this parse fires writes the process-global tunnel mode and rolls it
     // back at the end of the parse; a concurrent `/configs` PATCH test must not interleave.
+    // `CONFIG_OPERATION`, which every production entry point takes first (`hub::parse`,
+    // `PUT /configs`, `PATCH /configs`), is what serialises those callers; this test-only lock
+    // keeps direct `parse_with_bytes` callers in the test suite honest, and is never taken before
+    // `CONFIG_OPERATION`.
     #[cfg(test)]
     let _tunnel_state = crate::test_support::TUNNEL_STATE_LOCK.lock().await;
     ensure_geodata_loaders_registered();
@@ -298,11 +302,35 @@ fn update_hosts(tree: murmur_component_trie::domain::DomainTrie<comp_host::HostV
     comp_resolver::set_default_hosts(comp_host::new_hosts(tree));
 }
 
-async fn update_listeners(general: &General, listeners: &HashMap<String, Arc<dyn InboundListener>>, force: bool) {
+/// The outcome of one apply step that can report several independent failures: one error naming
+/// them all, or `Ok(())` when the list is empty. An empty `step` reports the failures alone.
+fn step_outcome(step: &str, failures: Vec<anyhow::Error>) -> Result<()> {
+    if failures.is_empty() {
+        return Ok(());
+    }
+    let joined = failures.iter().map(ToString::to_string).collect::<Vec<_>>().join("; ");
+    if step.is_empty() {
+        return Err(anyhow!("{joined}"));
+    }
+    Err(anyhow!("{step}: {joined}"))
+}
+
+/// Recreates the inbound listeners. Every listener is attempted even when an earlier one fails,
+/// and the failures come back as one error: the caller has to know that the running configuration
+/// is incomplete, but a listener that could not bind must not stop the others from starting.
+async fn update_listeners(
+    general: &General,
+    listeners: &HashMap<String, Arc<dyn InboundListener>>,
+    force: bool,
+) -> Result<()> {
     let tunnel = tunnel_arc();
-    listener::patch_inbound_listeners(listeners, Arc::clone(&tunnel), true).await;
+    let mut failures = Vec::new();
+
+    if let Err(err) = listener::patch_inbound_listeners(listeners, Arc::clone(&tunnel), true).await {
+        failures.push(err);
+    }
     if !force {
-        return;
+        return step_outcome("listeners", failures);
     }
 
     listener::set_allow_lan(general.inbound.allow_lan);
@@ -311,14 +339,22 @@ async fn update_listeners(general: &General, listeners: &HashMap<String, Arc<dyn
     inbound_ipfilter::set_dis_allowed_ips(general.inbound.lan_dis_allowed_ips.clone());
 
     listener::set_bind_address(&general.inbound.bind_address);
-    listener::re_create_http(general.inbound.port, Arc::clone(&tunnel)).await;
-    listener::re_create_socks(general.inbound.socks_port, Arc::clone(&tunnel)).await;
-    listener::re_create_redir(general.inbound.redir_port, Arc::clone(&tunnel)).await;
-    listener::re_create_tproxy(general.inbound.tproxy_port, Arc::clone(&tunnel)).await;
-    listener::re_create_mixed(general.inbound.mixed_port, Arc::clone(&tunnel)).await;
-    listener::re_create_shadow_socks(&general.inbound.shadow_socks_config, Arc::clone(&tunnel)).await;
-    listener::re_create_vmess(&general.inbound.vmess_config, Arc::clone(&tunnel)).await;
-    listener::re_create_tuic(general.inbound.tuic_server.clone(), tunnel).await;
+    for result in [
+        listener::re_create_http(general.inbound.port, Arc::clone(&tunnel)).await,
+        listener::re_create_socks(general.inbound.socks_port, Arc::clone(&tunnel)).await,
+        listener::re_create_redir(general.inbound.redir_port, Arc::clone(&tunnel)).await,
+        listener::re_create_tproxy(general.inbound.tproxy_port, Arc::clone(&tunnel)).await,
+        listener::re_create_mixed(general.inbound.mixed_port, Arc::clone(&tunnel)).await,
+        listener::re_create_shadow_socks(&general.inbound.shadow_socks_config, Arc::clone(&tunnel)).await,
+        listener::re_create_vmess(&general.inbound.vmess_config, Arc::clone(&tunnel)).await,
+        listener::re_create_tuic(general.inbound.tuic_server.clone(), tunnel).await,
+    ] {
+        if let Err(err) = result {
+            failures.push(err);
+        }
+    }
+
+    step_outcome("listeners", failures)
 }
 
 fn update_general(general: &General, logging: bool) {
@@ -455,8 +491,8 @@ async fn try_set_iptables(iptables: &IPTables, general: &General, dns_enable: bo
     Ok(())
 }
 
-async fn update_tunnels(tunnels: &[ListenerTunnel]) {
-    listener::patch_tunnel(tunnels, tunnel_arc()).await;
+async fn update_tunnels(tunnels: &[ListenerTunnel]) -> Result<()> {
+    listener::patch_tunnel(tunnels, tunnel_arc()).await
 }
 
 async fn update_updater(geo_auto_update: bool, geo_update_interval: i32, controller: &cfgmod::Controller) {
@@ -474,7 +510,11 @@ fn init_inner_tcp() {
 }
 
 /// Dispatches the configuration to all parts except the external controller.
-pub async fn apply_config(cfg: Config, force: bool) {
+///
+/// Every part is still applied when one of them fails: the failures are collected and returned once
+/// at the end, so a caller can tell the running state is incomplete without the configuration being
+/// abandoned half-way.
+pub async fn apply_config(cfg: Config, force: bool) -> Result<()> {
     let _guard = MUX.lock().await;
 
     murmur_log::set_level(cfg.general.log_level);
@@ -502,10 +542,17 @@ pub async fn apply_config(cfg: Config, force: bool) {
     update_dns(cfg.dns, general_ipv6);
 
     update_ntp(&cfg.ntp);
-    update_listeners(&cfg.general, &cfg.listeners, force).await;
+    let mut failures = Vec::new();
+    if let Err(err) = update_listeners(&cfg.general, &cfg.listeners, force).await {
+        failures.push(err);
+    }
+    // A tun failure is a documented degradation, not an incomplete apply: the listener clears
+    // `enable` and stores that conf, so the next apply with the same section is a no-op.
     listener::re_create_tun(cfg.general.inbound.tun.clone(), tunnel_arc()).await;
     update_iptables(&cfg.iptables, &cfg.general, dns_enable, &dns_listen).await;
-    update_tunnels(&cfg.tunnels).await;
+    if let Err(err) = update_tunnels(&cfg.tunnels).await {
+        failures.push(err);
+    }
 
     on_inner_loading();
 
@@ -523,6 +570,8 @@ pub async fn apply_config(cfg: Config, force: bool) {
     update_updater(cfg.general.geo_auto_update, cfg.general.geo_update_interval, &cfg.controller).await;
 
     comp_resolver::reset_connection();
+
+    step_outcome("", failures)
 }
 
 fn update_sniffer(sniffer_config: &sniffer_dispatcher::Config) {
