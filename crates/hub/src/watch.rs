@@ -139,10 +139,12 @@ pub enum Reload {
 ///
 /// `last_applied` holds the bytes of the last file that applied successfully; identical contents
 /// are skipped, and a file that fails at any step (unreadable, rejected by the parser, or applied
-/// with a reported failure such as a listener that could not bind) leaves it alone, so the same
-/// bytes are retried on the next change instead of being skipped as already applied. `force`
-/// bypasses the equality check: an operator's `SIGHUP` reapplies the disk state even when the file
-/// did not change, which is also what undoes an API-only change.
+/// with a reported failure such as a listener that could not bind) leaves it unset, so the same
+/// bytes are retried on the next change instead of being skipped as already applied. A failed apply
+/// clears it even when it held the previous good file: the failure may already have closed or
+/// replaced listeners, so restoring that file has to reapply it. `force` bypasses the equality
+/// check: an operator's `SIGHUP` reapplies the disk state even when the file did not change, which
+/// is also what undoes an API-only change.
 #[must_use]
 pub async fn reload_from_disk(
     path: &Path,
@@ -162,7 +164,13 @@ pub async fn reload_from_disk(
             *last_applied = Some(bytes);
             Reload::Applied
         }
-        Err(err) => Reload::Failed(err),
+        Err(err) => {
+            // The parse may have mutated globals and closed or replaced listeners before it
+            // reported the failure, so the running state is no longer the file `last_applied`
+            // remembers. Forget it: restoring the last-known-good file has to reapply it.
+            *last_applied = None;
+            Reload::Failed(err)
+        }
     }
 }
 
@@ -329,7 +337,7 @@ mod tests {
         write_atomically(&target, "mode: [\n");
         timeout(EVENT_WINDOW, watch.settled()).await.expect("the broken replacement must be reported");
         assert!(matches!(reload_from_disk(watch.target(), &[], &mut applied, false).await, Reload::Failed(_)));
-        assert_eq!(applied.as_deref(), Some(second.as_bytes()), "a rejected file must leave the last good one applied");
+        assert!(applied.is_none(), "a failed apply must forget the cached content");
 
         let third = config_with("third");
         write_atomically(&target, &third);
@@ -465,5 +473,77 @@ mod tests {
         timeout(EVENT_WINDOW, watch.settled()).await.expect("the save must be reported");
         assert!(matches!(reload_from_disk(watch.target(), &[], &mut applied, false).await, Reload::Unchanged));
         assert_eq!(murmur_log::level(), LogLevel::WARNING, "an unchanged save must not replace an API setting");
+    }
+
+    /// A probe that returns a loopback port nothing holds.
+    async fn free_port() -> u16 {
+        let probe = tokio::net::TcpListener::bind("127.0.0.1:0").await.expect("the probe must bind");
+        let port = probe.local_addr().expect("the probe has an address").port();
+        drop(probe);
+        port
+    }
+
+    /// Restoring the last known good file after a failed apply reapplies it: the failure may already
+    /// have closed the old listener, so the cache must not claim that file is still running.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn restoring_the_last_good_file_after_a_failed_apply_reapplies_it() {
+        let _listeners = lock_controller_listeners().await;
+        init_runtime();
+        let fixture = Fixture::new("restore");
+        let target = fixture.path("config.yaml");
+        let good_port = free_port().await;
+        let good = config_with_port(good_port);
+        std::fs::write(&target, &good).expect("the target must be writable");
+        let watch = start_watching(&target).await;
+        let mut applied: Option<Vec<u8>> = None;
+        assert!(matches!(reload_from_disk(watch.target(), &[], &mut applied, false).await, Reload::Applied));
+
+        let occupied = tokio::net::TcpListener::bind("127.0.0.1:0").await.expect("a port must be occupiable");
+        let blocked = config_with_port(occupied.local_addr().expect("the socket has an address").port());
+        std::fs::write(&target, &blocked).expect("the target must be writable");
+        assert!(matches!(reload_from_disk(watch.target(), &[], &mut applied, false).await, Reload::Failed(_)));
+        assert!(applied.is_none(), "a failed apply must forget the cached content");
+
+        std::fs::write(&target, &good).expect("the target must be writable");
+        assert!(
+            matches!(reload_from_disk(watch.target(), &[], &mut applied, false).await, Reload::Applied),
+            "the restored file must be reapplied, not reported as unchanged"
+        );
+        assert_eq!(applied.as_deref(), Some(good.as_bytes()));
+    }
+
+    /// A controller address that cannot bind fails the reload and is not cached; once the address is
+    /// free the same file applies and the controller answers.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_controller_that_cannot_bind_fails_the_reload_and_is_retried() {
+        let _listeners = lock_controller_listeners().await;
+        init_runtime();
+        let fixture = Fixture::new("controller");
+        let target = fixture.path("config.yaml");
+        let occupied = tokio::net::TcpListener::bind("127.0.0.1:0").await.expect("a port must be occupiable");
+        let port = occupied.local_addr().expect("the socket has an address").port();
+        let blocked = format!("external-controller: 127.0.0.1:{port}\n");
+        std::fs::write(&target, &blocked).expect("the target must be writable");
+        let watch = start_watching(&target).await;
+        let mut applied: Option<Vec<u8>> = None;
+
+        assert!(
+            matches!(reload_from_disk(watch.target(), &[], &mut applied, false).await, Reload::Failed(_)),
+            "a controller that cannot bind must fail the apply"
+        );
+        assert!(applied.is_none());
+
+        drop(occupied);
+        assert!(matches!(reload_from_disk(watch.target(), &[], &mut applied, false).await, Reload::Applied));
+        assert_eq!(applied.as_deref(), Some(blocked.as_bytes()));
+        let mut answered = false;
+        for _ in 0..100 {
+            if tokio::net::TcpStream::connect(("127.0.0.1", port)).await.is_ok() {
+                answered = true;
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        assert!(answered, "the reloaded controller must accept a connection");
     }
 }

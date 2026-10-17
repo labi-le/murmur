@@ -133,7 +133,9 @@ async fn providers_mount_keeps_the_trailing_slash_matrix() {
     let addr = probe.local_addr().expect("probe local address").to_string();
     drop(probe);
 
-    re_create_server(Arc::new(Config { addr: addr.clone(), ..Config::default() })).await;
+    re_create_server(Arc::new(Config { addr: addr.clone(), ..Config::default() }))
+        .await
+        .expect("the test controller must start");
 
     let mut providers: HashMap<String, Arc<dyn ProxyProvider>> = HashMap::new();
     providers.insert(PROVIDER.to_owned(), Arc::new(MatrixProvider(vec![ConcreteProxy::new(new_direct())])));

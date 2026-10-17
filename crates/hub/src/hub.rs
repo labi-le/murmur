@@ -87,11 +87,21 @@ pub fn with_secret(secret: &str) -> Option {
 /// reached every part but at least one of them could not do what it asked, so the running state is
 /// the partially applied one.
 pub async fn apply_config(cfg: Config) -> Result<()> {
-    apply_route(&cfg).await;
-    executor_mod::apply_config(cfg, true).await
+    let mut failures = Vec::new();
+    if let Err(err) = apply_route(&cfg).await {
+        failures.push(err);
+    }
+    if let Err(err) = executor_mod::apply_config(cfg, true).await {
+        failures.push(err);
+    }
+    if failures.is_empty() {
+        return Ok(());
+    }
+    let joined = failures.iter().map(ToString::to_string).collect::<Vec<_>>().join("; ");
+    Err(anyhow::anyhow!("{joined}"))
 }
 
-async fn apply_route(cfg: &Config) {
+async fn apply_route(cfg: &Config) -> Result<()> {
     #[cfg(all(target_os = "android", feature = "cmfa"))]
     {
         static ANDROID_EMBED_INIT: std::sync::Once = std::sync::Once::new();
@@ -118,7 +128,7 @@ async fn apply_route(cfg: &Config) {
             allow_private_network: cfg.controller.cors.allow_private_network,
         },
     }))
-    .await;
+    .await
 }
 
 /// Parses the configuration at startup, or again on a reload.

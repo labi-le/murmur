@@ -670,6 +670,23 @@ async fn main() -> Result<()> {
         return Ok(());
     }
 
+    let options = hub_options(&flags);
+
+    // The watch registers before the file is read: a replacement landing between the read and the
+    // registration would otherwise be missed, and the process would keep the bytes it parsed
+    // until the next edit. An event arriving during startup stays queued in the watcher.
+    let watch = if watching {
+        match hub_watch::ConfigWatcher::new(&PATH.config()).await {
+            Ok(watcher) => Some(watcher),
+            Err(err) => {
+                fatalln!("watch mode error: {err}");
+                return Ok(());
+            }
+        }
+    } else {
+        None
+    };
+
     // Watch mode reads the file itself and hands those exact bytes to the first parse, so the
     // reload loop starts holding the configuration that is already running: a byte-identical save
     // is then skipped as unchanged instead of replacing a change made over the API. Reading the
@@ -687,21 +704,6 @@ async fn main() -> Result<()> {
         }
     } else {
         (config_bytes, None)
-    };
-
-    let options = hub_options(&flags);
-
-    // Watching starts before the first parse, so a change written during startup is not missed.
-    let watch = if watching {
-        match hub_watch::ConfigWatcher::new(&PATH.config()).await {
-            Ok(watcher) => Some(watcher),
-            Err(err) => {
-                fatalln!("watch mode error: {err}");
-                return Ok(());
-            }
-        }
-    } else {
-        None
     };
 
     if let Err(err) = hub::parse(&config_bytes, &options).await {

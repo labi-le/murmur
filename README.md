@@ -62,12 +62,14 @@ file itself, so atomic replacement by an editor or a configuration generator, a 
 and a file deleted then recreated all reload, while sibling files, reads and opens do not. The
 bytes the process applied at startup count as applied, so saving that same file again is skipped
 instead of reapplying it over a runtime change made through the API. A truncated, malformed or
-unreadable file is not applied, and neither is a configuration whose listeners could not bind: the
-specific error is logged, the file is not recorded as applied, and the same bytes are retried once
-the cause is gone. A completed reload means the file parsed and every part it named applied; the
-apply steps that can report a failure (inbound listeners and tunnels) report it to the caller,
-while a `tun` section the device refuses stays the documented degradation that clears `enable` in
-the stored conf. Because the watcher follows the canonical path, replacing the symlink itself is
+unreadable file is not applied, and neither is a configuration whose listeners or external
+controller could not bind: the specific error is logged and the cache of applied content is
+cleared, because a failed apply may already have closed or replaced listeners. Restoring the last
+good file therefore reapplies it, and the same bytes are retried once the cause is gone. A
+completed reload means the file parsed and every part it named applied; the apply steps that can
+report a failure (inbound listeners, tunnels and the controller transports) report it to the
+caller, while a `tun` section the device refuses stays the documented degradation that clears
+`enable` in the stored conf. Because the watcher follows the canonical path, replacing the symlink itself is
 not observed; replace the target file.
 
 Every parse-and-apply, watched or not, holds one process-wide lock (`hub::lock_config_operation`)
