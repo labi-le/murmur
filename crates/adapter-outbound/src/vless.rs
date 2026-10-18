@@ -63,6 +63,7 @@ use murmur_transport::gun;
 use murmur_transport_shadowtls as shadowtls;
 use murmur_transport_vless::config_pb::Addons;
 use murmur_transport_vless::encryption;
+use murmur_transport_vless::encryption::common::SharedCommonConn;
 use murmur_transport_vless::vision::vision::TlsConnCheck;
 use murmur_transport_vless::vless::XRV;
 use murmur_transport_vless::vless::{self as vless_client, DstAddr};
@@ -345,19 +346,18 @@ impl TlsMaterial {
 /// What Vision receives for the conn the adapter actually hands it.
 ///
 /// With VLESS encryption the conn Vision wraps is the encryption layer, never the TLS session:
-/// the reference accepts its encryption conn as a padding-only Vision transport, so Vision must
-/// not inspect the TLS version or keep the TLS raw-transport handoff. Without encryption the
-/// already-evaluated TLS check passes through unchanged.
+/// the reference accepts its encryption conn as a padding-only Vision transport and switches
+/// direct mode to the conn beneath it. The adapter therefore passes the encryption direct handle
+/// and drops the below-TLS handoff; without encryption the evaluated TLS check is already correct.
 fn vision_transport(
     tls_check: TlsConnCheck,
     direct_net: Option<SharedConn>,
     buffered_incoming: Option<Arc<dyn TlsBufferedIncoming>>,
-    encrypted: bool,
+    encrypted_direct: Option<SharedConn>,
 ) -> (TlsConnCheck, Option<SharedConn>, Option<Arc<dyn TlsBufferedIncoming>>) {
-    if encrypted {
-        (TlsConnCheck::NoTls, None, None)
-    } else {
-        (tls_check, direct_net, buffered_incoming)
+    match encrypted_direct {
+        Some(direct) => (TlsConnCheck::NoTls, Some(direct), None),
+        None => (tls_check, direct_net, buffered_incoming),
     }
 }
 
@@ -1200,9 +1200,13 @@ impl Vless {
 
         let result: Result<Box<dyn NetConn>> = async {
             let mut conn: Box<dyn murmur_common_net::io::Stream> = Box::new(OldConnAsStream(shared));
+            let mut encrypted_direct: Option<SharedConn> = None;
 
             if let Some(enc) = &self.encryption {
-                conn = Box::new(enc.handshake(conn).await?);
+                let encrypted = SharedCommonConn::new(enc.handshake(conn).await?);
+                encrypted_direct =
+                    Some(SharedConn::from_boxed(Box::new(StreamAsOldConn::new(Box::new(encrypted.direct())))));
+                conn = Box::new(encrypted);
             }
 
             let dst_addr = if metadata.network == murmur_constant::metadata::NetWork::UDP {
@@ -1273,10 +1277,11 @@ impl Vless {
             };
 
             // The conn Vision wraps is the encryption layer, so any TLS session sits below it:
-            // Vision pads the encryption stream and must not keep the raw-transport handoff or
-            // the TLS version check.
+            // Vision pads the encryption stream and must not keep the below-TLS handoff or the
+            // TLS version check. The direct handle it gets instead is the transport immediately
+            // beneath the encryption layer, plus the plaintext that layer already buffered.
             let (tls_check, direct_net, buffered_incoming) =
-                vision_transport(tls_check, direct_net, buffered_incoming, self.encryption.is_some());
+                vision_transport(tls_check, direct_net, buffered_incoming, encrypted_direct);
             let stream = self.client.stream_conn(conn, tls_check, direct_net, buffered_incoming, &dst_addr)?;
             let old_conn: Box<dyn NetConn> = Box::new(StreamAsOldConn::new(stream));
             Ok(old_conn)
@@ -1975,31 +1980,29 @@ mod vision_option_tests {
     }
 
     /// Encryption wraps whatever TLS session exists, so Vision is padding-only for every TLS
-    /// result and never keeps the TLS raw-transport handoff or TLS version check.
+    /// result, drops the below-TLS handoff, and receives the encryption direct handle instead.
     #[test]
-    fn an_encrypted_conn_is_padding_only_regardless_of_the_tls_check() {
+    fn an_encrypted_conn_is_padding_only_and_keeps_the_encryption_direct_handle() {
         let tls13 = TlsConnCheck::Supported { handshake_complete: true, version: 0x0304 };
         let tls12 = TlsConnCheck::Supported { handshake_complete: true, version: 0x0303 };
 
-        // Without encryption the evaluated TLS check passes through untouched.
-        assert!(matches!(
-            vision_transport(tls13, None, None, false).0,
-            TlsConnCheck::Supported { version: 0x0304, .. }
-        ));
-        assert!(matches!(
-            vision_transport(tls12, None, None, false).0,
-            TlsConnCheck::Supported { version: 0x0303, .. }
-        ));
-        assert!(matches!(vision_transport(TlsConnCheck::Unsupported, None, None, false).0, TlsConnCheck::Unsupported));
+        // Without encryption the evaluated TLS check and handoff pass through untouched.
+        assert!(matches!(vision_transport(tls13, None, None, None).0, TlsConnCheck::Supported { version: 0x0304, .. }));
+        assert!(matches!(vision_transport(tls12, None, None, None).0, TlsConnCheck::Supported { version: 0x0303, .. }));
+        assert!(matches!(vision_transport(TlsConnCheck::Unsupported, None, None, None).0, TlsConnCheck::Unsupported));
 
         for check in [tls13, tls12, TlsConnCheck::Unsupported] {
             let (conn, _peer) = murmur_common_net::deadline::pipe_sing::pipe();
-            let direct = SharedConn::from_boxed(Box::new(conn));
+            let below_tls = SharedConn::from_boxed(Box::new(conn));
+            let (pipe_conn, _peer) = murmur_common_net::deadline::pipe_sing::pipe();
+            let encryption_direct = SharedConn::from_boxed(Box::new(pipe_conn));
             let buffered: Arc<dyn TlsBufferedIncoming> = Arc::new(NoBuffered);
-            let (check, direct, buffered) = vision_transport(check, Some(direct), Some(buffered), true);
+
+            let (check, direct, buffered) =
+                vision_transport(check, Some(below_tls), Some(buffered), Some(encryption_direct));
             assert!(matches!(check, TlsConnCheck::NoTls));
-            assert!(direct.is_none(), "the TLS raw transport must not reach Vision");
-            assert!(buffered.is_none(), "the TLS buffered plaintext must not reach Vision");
+            assert!(direct.is_some(), "encryption's direct transport must reach Vision");
+            assert!(buffered.is_none(), "the below-TLS buffered plaintext must not reach Vision");
         }
     }
 

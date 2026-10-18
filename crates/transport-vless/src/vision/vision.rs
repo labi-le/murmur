@@ -75,8 +75,10 @@ pub fn new_conn(
             return Err(anyhow!("failed to use vision, maybe \"tls\" is not enable and \"encryption\" is empty"));
         }
         TlsConnCheck::NoTls => {
-            if net_conn.is_some() || buffered_incoming.is_some() {
-                return Err(anyhow!("vision: encryption-only conn cannot carry a TLS raw transport"));
+            // Encryption supplies its own direct transport (the conn beneath the encryption
+            // layer), but TLS-specific buffered plaintext has no meaning here.
+            if buffered_incoming.is_some() {
+                return Err(anyhow!("vision: encryption-only conn cannot carry TLS buffered plaintext"));
             }
         }
         TlsConnCheck::Supported { handshake_complete, version } => {

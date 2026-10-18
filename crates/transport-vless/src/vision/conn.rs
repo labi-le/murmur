@@ -1286,16 +1286,27 @@ mod tests {
         assert!(new_conn(shared(inner), TlsConnCheck::Unsupported, None, None, UUID).is_err());
     }
 
-    /// Padding-only Vision never switches to direct mode, so a TLS raw-transport handle is refused.
+    /// Padding-only Vision uses the encryption layer's own direct transport, but a TLS-specific
+    /// buffered-plaintext handle has no meaning once encryption owns the switch.
     #[test]
-    fn no_tls_conn_refuses_a_tls_raw_transport() {
+    fn no_tls_conn_accepts_a_direct_transport_and_refuses_tls_buffered_input() {
         let (inner, _peer) = pipe();
         let (raw, _raw_peer) = pipe();
-        let err = new_conn(shared(inner), TlsConnCheck::NoTls, Some(shared(raw)), None, UUID)
+        assert!(new_conn(shared(inner), TlsConnCheck::NoTls, Some(shared(raw)), None, UUID).is_ok());
+
+        let (inner, _peer) = pipe();
+        struct NoBuffered;
+        impl TlsBufferedIncoming for NoBuffered {
+            fn take_buffered_incoming(&self) -> Option<Vec<u8>> {
+                None
+            }
+        }
+        let buffered: Arc<dyn TlsBufferedIncoming> = Arc::new(NoBuffered);
+        let err = new_conn(shared(inner), TlsConnCheck::NoTls, None, Some(buffered), UUID)
             .err()
             .map(|err| err.to_string())
             .expect("rejected");
-        assert_eq!(err, "vision: encryption-only conn cannot carry a TLS raw transport");
+        assert_eq!(err, "vision: encryption-only conn cannot carry TLS buffered plaintext");
     }
 
     /// A Pending below the vision layer must resume the queued frame: the caller's re-poll uses

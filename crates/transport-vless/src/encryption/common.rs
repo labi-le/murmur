@@ -11,8 +11,10 @@ use rand::Rng as _;
 use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
 use x25519_dalek::{PublicKey, StaticSecret};
 
-use murmur_common_net::io::{ExtendedStream, Stream};
+use murmur_common_net::io::{close_stream, ExtendedStream, Stream};
 use murmur_common_pool as pool;
+use murmur_std_compat::net::{Addr, Conn as NetConn, TcpAddr};
+use parking_lot::Mutex;
 
 use super::client::ClientInstance;
 use super::xor::{AesCtrStream, XorConn};
@@ -200,6 +202,13 @@ impl BytesReader {
         self.buf.clear();
         self.buf.extend_from_slice(data);
         self.off = 0;
+    }
+
+    /// Takes the unread bytes, leaving the reader empty.
+    fn take(&mut self) -> Vec<u8> {
+        let out = self.buf.drain(self.off..).collect();
+        self.off = 0;
+        out
     }
 }
 
@@ -515,6 +524,284 @@ impl Stream for CommonConn {
 }
 
 impl ExtendedStream for CommonConn {}
+
+impl CommonConn {
+    /// Takes the plaintext this conn has already decrypted but not yet handed to the caller.
+    ///
+    /// A caller switching to the transport beneath the encryption layer (XTLS Vision direct mode)
+    /// has to deliver these bytes before reading that transport. An encrypted frame still in
+    /// flight cannot be re-injected, so the switch is refused instead of losing ciphertext.
+    pub fn take_buffered_input(&mut self) -> io::Result<Vec<u8>> {
+        if self.peer_frame_len != 0 || self.raw_input_filled != 0 {
+            return Err(io::Error::other("XTLS Vision direct switch with an encryption frame in flight"));
+        }
+        Ok(self.input.take())
+    }
+}
+
+/// One encryption conn shared by the Vision-facing stream and its direct-mode transport handle.
+///
+/// Vision normally polls this wrapper, which runs the VLESS encryption framing. After a DIRECT
+/// switch it polls [`DirectCommonConn`] instead, which first drains the decrypted surplus and then
+/// reads and writes the transport immediately beneath the encryption layer (the XOR layer when
+/// one is installed), matching the reference's `UnwrapRawConn` behaviour for `CommonConn`.
+pub struct SharedCommonConn {
+    inner: Arc<Mutex<CommonConn>>,
+}
+
+impl SharedCommonConn {
+    #[must_use]
+    pub fn new(conn: CommonConn) -> Self {
+        Self { inner: Arc::new(Mutex::new(conn)) }
+    }
+
+    #[must_use]
+    pub fn direct(&self) -> DirectCommonConn {
+        DirectCommonConn { inner: Arc::clone(&self.inner), pending: None }
+    }
+}
+
+impl Clone for SharedCommonConn {
+    fn clone(&self) -> Self {
+        Self { inner: Arc::clone(&self.inner) }
+    }
+}
+
+impl core::fmt::Debug for SharedCommonConn {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        f.debug_struct("SharedCommonConn").finish_non_exhaustive()
+    }
+}
+
+impl AsyncRead for SharedCommonConn {
+    fn poll_read(self: Pin<&mut Self>, cx: &mut Context<'_>, buf: &mut ReadBuf<'_>) -> Poll<io::Result<()>> {
+        Pin::new(&mut *self.inner.lock()).poll_read(cx, buf)
+    }
+}
+
+impl AsyncWrite for SharedCommonConn {
+    fn poll_write(self: Pin<&mut Self>, cx: &mut Context<'_>, buf: &[u8]) -> Poll<io::Result<usize>> {
+        Pin::new(&mut *self.inner.lock()).poll_write(cx, buf)
+    }
+
+    fn poll_flush(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+        Pin::new(&mut *self.inner.lock()).poll_flush(cx)
+    }
+
+    fn poll_shutdown(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+        Pin::new(&mut *self.inner.lock()).poll_shutdown(cx)
+    }
+}
+
+impl Stream for SharedCommonConn {
+    fn local_addr(&self) -> io::Result<std::net::SocketAddr> {
+        self.inner.lock().local_addr()
+    }
+
+    fn peer_addr(&self) -> io::Result<std::net::SocketAddr> {
+        self.inner.lock().peer_addr()
+    }
+
+    fn shutdown_read(&self) -> io::Result<()> {
+        self.inner.lock().shutdown_read()
+    }
+
+    fn shutdown_write(&self) -> io::Result<()> {
+        self.inner.lock().shutdown_write()
+    }
+
+    fn as_socket(&self) -> Option<socket2::SockRef<'_>> {
+        None
+    }
+
+    fn old_conn(&self) -> Option<&dyn NetConn> {
+        Some(self)
+    }
+}
+
+impl NetConn for SharedCommonConn {
+    fn local_addr(&self) -> io::Result<Box<dyn Addr>> {
+        Ok(Box::new(TcpAddr::from(self.inner.lock().local_addr()?)))
+    }
+
+    fn remote_addr(&self) -> io::Result<Box<dyn Addr>> {
+        Ok(Box::new(TcpAddr::from(self.inner.lock().peer_addr()?)))
+    }
+
+    fn close(&self) -> io::Result<()> {
+        close_stream(&*self.inner.lock())
+    }
+
+    fn close_read(&self) -> io::Result<()> {
+        self.inner.lock().shutdown_read()
+    }
+
+    fn close_write(&self) -> io::Result<()> {
+        self.inner.lock().shutdown_write()
+    }
+
+    fn set_deadline(&self, deadline: Option<tokio::time::Instant>) -> io::Result<()> {
+        let guard = self.inner.lock();
+        match guard.conn.old_conn() {
+            Some(conn) => conn.set_deadline(deadline),
+            None => Ok(()),
+        }
+    }
+
+    fn set_read_deadline(&self, deadline: Option<tokio::time::Instant>) -> io::Result<()> {
+        let guard = self.inner.lock();
+        match guard.conn.old_conn() {
+            Some(conn) => conn.set_read_deadline(deadline),
+            None => Ok(()),
+        }
+    }
+
+    fn set_write_deadline(&self, deadline: Option<tokio::time::Instant>) -> io::Result<()> {
+        let guard = self.inner.lock();
+        match guard.conn.old_conn() {
+            Some(conn) => conn.set_write_deadline(deadline),
+            None => Ok(()),
+        }
+    }
+
+    fn as_socket(&self) -> Option<socket2::SockRef<'_>> {
+        None
+    }
+}
+
+/// The transport beneath the encryption layer, used after an XTLS Vision DIRECT switch.
+///
+/// Buffered plaintext is delivered first; afterwards reads and writes bypass the encryption
+/// framing (but keep the XOR layer when the encryption installed one).
+pub struct DirectCommonConn {
+    inner: Arc<Mutex<CommonConn>>,
+    pending: Option<(Vec<u8>, usize)>,
+}
+
+impl core::fmt::Debug for DirectCommonConn {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        f.debug_struct("DirectCommonConn").finish_non_exhaustive()
+    }
+}
+
+impl AsyncRead for DirectCommonConn {
+    fn poll_read(self: Pin<&mut Self>, cx: &mut Context<'_>, buf: &mut ReadBuf<'_>) -> Poll<io::Result<()>> {
+        let this = self.get_mut();
+        let mut guard = this.inner.lock();
+        if this.pending.is_none() {
+            match guard.take_buffered_input() {
+                Ok(pending) => this.pending = Some((pending, 0)),
+                Err(err) => return Poll::Ready(Err(err)),
+            }
+        }
+        if let Some((pending, offset)) = &mut this.pending {
+            if *offset < pending.len() {
+                let n = (pending.len() - *offset).min(buf.remaining());
+                let Some(chunk) = pending.get(*offset..*offset + n) else {
+                    return Poll::Ready(Err(io::Error::other("direct pending buffer out of range")));
+                };
+                buf.put_slice(chunk);
+                *offset += n;
+                if *offset == pending.len() {
+                    this.pending = None;
+                }
+                return Poll::Ready(Ok(()));
+            }
+            this.pending = None;
+        }
+        Pin::new(&mut guard.conn).poll_read(cx, buf)
+    }
+}
+
+impl AsyncWrite for DirectCommonConn {
+    fn poll_write(self: Pin<&mut Self>, cx: &mut Context<'_>, buf: &[u8]) -> Poll<io::Result<usize>> {
+        Pin::new(&mut self.inner.lock().conn).poll_write(cx, buf)
+    }
+
+    fn poll_flush(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+        Pin::new(&mut self.inner.lock().conn).poll_flush(cx)
+    }
+
+    fn poll_shutdown(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+        Pin::new(&mut self.inner.lock().conn).poll_shutdown(cx)
+    }
+}
+
+impl Stream for DirectCommonConn {
+    fn local_addr(&self) -> io::Result<std::net::SocketAddr> {
+        self.inner.lock().conn.local_addr()
+    }
+
+    fn peer_addr(&self) -> io::Result<std::net::SocketAddr> {
+        self.inner.lock().conn.peer_addr()
+    }
+
+    fn shutdown_read(&self) -> io::Result<()> {
+        self.inner.lock().conn.shutdown_read()
+    }
+
+    fn shutdown_write(&self) -> io::Result<()> {
+        self.inner.lock().conn.shutdown_write()
+    }
+
+    fn as_socket(&self) -> Option<socket2::SockRef<'_>> {
+        None
+    }
+
+    fn old_conn(&self) -> Option<&dyn NetConn> {
+        Some(self)
+    }
+}
+
+impl NetConn for DirectCommonConn {
+    fn local_addr(&self) -> io::Result<Box<dyn Addr>> {
+        Ok(Box::new(TcpAddr::from(self.inner.lock().conn.local_addr()?)))
+    }
+
+    fn remote_addr(&self) -> io::Result<Box<dyn Addr>> {
+        Ok(Box::new(TcpAddr::from(self.inner.lock().conn.peer_addr()?)))
+    }
+
+    fn close(&self) -> io::Result<()> {
+        close_stream(&self.inner.lock().conn)
+    }
+
+    fn close_read(&self) -> io::Result<()> {
+        self.inner.lock().conn.shutdown_read()
+    }
+
+    fn close_write(&self) -> io::Result<()> {
+        self.inner.lock().conn.shutdown_write()
+    }
+
+    fn set_deadline(&self, deadline: Option<tokio::time::Instant>) -> io::Result<()> {
+        let guard = self.inner.lock();
+        match guard.conn.old_conn() {
+            Some(conn) => conn.set_deadline(deadline),
+            None => Ok(()),
+        }
+    }
+
+    fn set_read_deadline(&self, deadline: Option<tokio::time::Instant>) -> io::Result<()> {
+        let guard = self.inner.lock();
+        match guard.conn.old_conn() {
+            Some(conn) => conn.set_read_deadline(deadline),
+            None => Ok(()),
+        }
+    }
+
+    fn set_write_deadline(&self, deadline: Option<tokio::time::Instant>) -> io::Result<()> {
+        let guard = self.inner.lock();
+        match guard.conn.old_conn() {
+            Some(conn) => conn.set_write_deadline(deadline),
+            None => Ok(()),
+        }
+    }
+
+    fn as_socket(&self) -> Option<socket2::SockRef<'_>> {
+        None
+    }
+}
 
 /// An AEAD with the implicit nonce incremented per message.
 #[derive(Debug)]
@@ -1345,5 +1632,69 @@ mod close_forwarding_tests {
         let mut buf = [0u8; 8];
         let n = server.read(&mut buf).await.expect("server read after peer close");
         assert_eq!(n, 0, "server must observe EOF once CommonConn's close reaches the real socket through old_conn()");
+    }
+}
+
+#[cfg(test)]
+mod direct_handoff_tests {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    use super::*;
+    use crate::encryption::factory::{new_client, new_server};
+    use crate::encryption::key::{gen_mlkem768, gen_x25519};
+    use tokio::net::{TcpListener, TcpStream};
+
+    /// A frame larger than the caller's read leaves decrypted plaintext buffered below. The direct
+    /// handle must deliver that plaintext before switching, then bypass the encryption framing in
+    /// both directions.
+    #[tokio::test]
+    async fn direct_handoff_drains_buffered_plaintext_then_bypasses_encryption() {
+        let (seed, client_key, _) = gen_mlkem768("").expect("gen_mlkem768");
+        let (private_key, password, _) = gen_x25519("").expect("gen_x25519");
+        let decryption = format!("mlkem768x25519plus.native.600s.{private_key}.{seed}");
+        let encryption = format!("mlkem768x25519plus.native.0rtt.{password}.{client_key}");
+
+        let client_instance = Arc::new(new_client(&encryption).expect("client config").expect("client instance"));
+        let server_instance = Arc::new(new_server(&decryption).expect("server config").expect("server instance"));
+        let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind loopback listener");
+        let addr = listener.local_addr().expect("listener address");
+        let (client_io, server_io) = tokio::join!(TcpStream::connect(addr), listener.accept());
+        let client_stream: Box<dyn Stream> = Box::new(client_io.expect("connect"));
+        let server_stream: Box<dyn Stream> = Box::new(server_io.expect("accept").0);
+        let (client_conn, server_conn) = tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            tokio::join!(client_instance.handshake(client_stream), server_instance.handshake(server_stream, None),)
+        })
+        .await
+        .expect("encryption handshake timed out");
+        let client_conn = client_conn.expect("client handshake");
+        let mut server_conn = server_conn.expect("server handshake");
+
+        let shared = SharedCommonConn::new(client_conn);
+        let mut normal = shared.clone();
+        let mut direct = shared.direct();
+
+        let message = b"buffered-direct-payload";
+        server_conn.write_all(message).await.expect("server write");
+        server_conn.flush().await.expect("server flush");
+
+        let mut prefix = [0u8; 4];
+        normal.read_exact(&mut prefix).await.expect("prefix read");
+        assert_eq!(&prefix, &message[..4]);
+
+        let mut buffered = vec![0u8; message.len() - 4];
+        direct.read_exact(&mut buffered).await.expect("buffered direct read");
+        assert_eq!(&buffered, &message[4..]);
+
+        server_conn.conn.write_all(b"raw-downlink").await.expect("raw server write");
+        server_conn.conn.flush().await.expect("raw server flush");
+        let mut raw_down = [0u8; 12];
+        direct.read_exact(&mut raw_down).await.expect("raw direct read");
+        assert_eq!(&raw_down, b"raw-downlink");
+
+        direct.write_all(b"raw-uplink").await.expect("raw direct write");
+        direct.flush().await.expect("raw direct flush");
+        let mut raw_up = [0u8; 10];
+        server_conn.conn.read_exact(&mut raw_up).await.expect("raw server read");
+        assert_eq!(&raw_up, b"raw-uplink");
     }
 }

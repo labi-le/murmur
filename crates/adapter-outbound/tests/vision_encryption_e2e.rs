@@ -29,6 +29,7 @@ use murmur_component_tls::utls;
 use murmur_constant::adapters::{Conn as CConn, ProxyAdapter};
 use murmur_constant::metadata::{Metadata, NetWork};
 use murmur_testsupport::TLS_CONFIG;
+use murmur_transport_vless::encryption::common::CommonConn;
 use murmur_transport_vless::encryption::factory::new_server;
 use murmur_transport_vless::encryption::key::{gen_mlkem768, gen_x25519};
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWriteExt};
@@ -37,6 +38,7 @@ use tokio_util::sync::CancellationToken;
 
 const UUID: [u8; 16] = [0x11; 16];
 const PAYLOAD: &[u8] = b"encryption-only-vision";
+const RAW_DOWNLINK: &[u8] = b"downlink-raw";
 const DEST_HOST: &str = "example.com";
 const DEST_PORT: u16 = 443;
 const TIMEOUT: Duration = Duration::from_secs(10);
@@ -75,8 +77,9 @@ async fn dial(vless: &Arc<Vless>) -> Box<dyn CConn> {
 }
 
 /// The VLESS request is written before the Vision stream pads the payload, matching the
-/// reference's request-then-Vision order.
-async fn assert_request_then_padded_payload(conn: &mut (impl AsyncRead + Unpin)) {
+/// reference's request-then-Vision order. The reply then sends the VLESS response header, a
+/// Vision DIRECT command, and raw bytes from beneath the encryption layer.
+async fn assert_request_then_padded_payload(conn: &mut CommonConn) {
     let mut request = [0u8; 17];
     conn.read_exact(&mut request).await.expect("vless request prefix");
     assert_eq!(request[0], 0, "VLESS version");
@@ -109,6 +112,26 @@ async fn assert_request_then_padded_payload(conn: &mut (impl AsyncRead + Unpin))
     let mut body = vec![0u8; content_len + padding_len];
     conn.read_exact(&mut body).await.expect("vision body");
     assert_eq!(&body[..content_len], PAYLOAD, "payload rides inside the padded frame");
+
+    conn.write_all(&[0u8, 0u8]).await.expect("vless response header");
+    let mut direct = Vec::with_capacity(21);
+    direct.extend_from_slice(&UUID);
+    direct.push(2); // COMMAND_PADDING_DIRECT
+    direct.extend_from_slice(&0u16.to_be_bytes());
+    direct.extend_from_slice(&0u16.to_be_bytes());
+    conn.write_all(&direct).await.expect("vision direct frame");
+    conn.flush().await.expect("vision direct flush");
+    conn.conn.write_all(RAW_DOWNLINK).await.expect("raw downlink write");
+    conn.conn.flush().await.expect("raw downlink flush");
+}
+
+async fn assert_direct_downlink(conn: &mut (impl AsyncRead + Unpin)) {
+    let mut downlink = [0u8; RAW_DOWNLINK.len()];
+    tokio::time::timeout(TIMEOUT, conn.read_exact(&mut downlink))
+        .await
+        .expect("downlink read timed out")
+        .expect("downlink read");
+    assert_eq!(&downlink, RAW_DOWNLINK, "DIRECT bytes come from beneath the encryption layer");
 }
 
 /// A server config capped at TLS 1.2, so the client's Vision check would see a non-1.3 session.
@@ -140,6 +163,7 @@ async fn an_encryption_only_vision_dial_reaches_padding_only_vision() {
     let mut conn = dial(&vless).await;
     conn.write_all(PAYLOAD).await.expect("payload write");
     conn.flush().await.expect("payload flush");
+    assert_direct_downlink(&mut conn).await;
 
     server.await.expect("server task");
 }
@@ -165,6 +189,7 @@ async fn a_tls12_encryption_dial_reaches_padding_only_vision() {
     let mut conn = dial(&vless).await;
     conn.write_all(PAYLOAD).await.expect("payload write");
     conn.flush().await.expect("payload flush");
+    assert_direct_downlink(&mut conn).await;
 
     server.await.expect("server task");
 }
