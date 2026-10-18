@@ -11,8 +11,10 @@
 //!   [`TlsConn`](murmur_component_tls::utls::TlsConn) the TLS layer returns, and for the plain
 //!   `tcp` network (the documented Vision transport) also hands it the raw transport below TLS
 //!   plus a handle that drains the TLS conn's buffered incoming plaintext at the direct-mode
-//!   switch. The `ws`/`http`/`h2` networks wrap the TLS conn in further framing before
-//!   `stream_conn_context` finishes, so Vision does not activate for them.
+//!   switch. The `ws`/`http`/`h2`/`grpc`/`xhttp` networks build their conn around the TLS session
+//!   and never evaluate its capability, and ShadowTLS/Restls/JLS replace the TLS session with an
+//!   erased conn, so `Vless::new` rejects an `xtls-rprx-vision` configuration on those shapes
+//!   instead of accepting it and failing every dial.
 //! * `xhttp`'s HTTP/3 download branch needs a raw `quinn::Connection`, not the `transport::tuic`
 //!   `murmur_quic`-mirror abstraction (`transport::tuic::common::dial_quic` returns `Arc<dyn
 //!   murmur_quic-shaped Conn>`, incompatible with `xhttp::client::DialQuicFunc`). This adapter
@@ -427,6 +429,7 @@ impl Vless {
         } else {
             None
         };
+        let vision_flow = addons.is_some();
 
         match option.packet_encoding.as_str() {
             "packetaddr" | "packet" => {
@@ -481,6 +484,24 @@ impl Vless {
         )?;
         if !security_mode.is_empty() && !option.tls {
             return Err(anyhow!("{security_mode} requires TLS"));
+        }
+
+        // Vision wraps the raw TLS record stream, so the outbound has to hand it a conn that
+        // reports its TLS session capability. The framed transports below build their conn
+        // around the TLS session and never evaluate one, and the security modes that replace the
+        // TLS session finish on an erased conn; accepting those configurations used to defer the
+        // failure to every dial, which logged `vision: not a valid supported TLS connection` and
+        // dropped the connection.
+        if vision_flow {
+            if !option.tls {
+                return Err(anyhow!("xtls-rprx-vision requires TLS"));
+            }
+            if matches!(option.network.as_str(), "ws" | "http" | "h2" | "grpc" | "xhttp") {
+                return Err(anyhow!("xtls-rprx-vision only supports the tcp network, not {}", option.network));
+            }
+            if matches!(security_mode, "ShadowTLS" | "Restls" | "JLS") {
+                return Err(anyhow!("xtls-rprx-vision requires the TLS session that {security_mode} replaces"));
+            }
         }
 
         let mut gun_client: Option<Arc<gun::gun::Client>> = None;
@@ -1846,6 +1867,75 @@ mod restls_option_tests {
         let yaml = format!("{HEAD}tls: true\nrestls-opts:\n  password: \"\"\n  version-hint: \"\"\n");
         let option: VlessOption = yaml_serde::from_str(&yaml).expect("option decodes");
         assert!(Vless::new(option).expect("accepted").restls_config.is_none());
+    }
+}
+
+/// XTLS Vision wraps the raw TLS record stream. An outbound that cannot hand it a conn reporting
+/// its TLS session capability must be rejected at construction: accepting it made every dial log
+/// `vision: not a valid supported TLS connection` and fail.
+#[cfg(test)]
+mod vision_option_tests {
+    use super::*;
+
+    const HEAD: &str = concat!(
+        "name: v\nserver: example.com\nport: 443\n",
+        "uuid: 00000000-0000-0000-0000-000000000001\nflow: xtls-rprx-vision\n",
+    );
+    const REALITY: &str = "reality-opts:\n  public-key: AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA\n";
+
+    fn new_err(extra: &str) -> String {
+        let yaml = format!("{HEAD}{extra}");
+        let option: VlessOption = yaml_serde::from_str(&yaml).expect("option decodes");
+        Vless::new(option).err().map(|err| err.to_string()).expect("rejected")
+    }
+
+    /// The framed transports build their conn around the TLS session and never evaluate its
+    /// capability, so the pair has to fail here rather than on every dial.
+    #[test]
+    fn vision_over_a_framed_transport_is_rejected() {
+        for network in ["ws", "http", "h2", "grpc", "xhttp"] {
+            assert_eq!(
+                new_err(&format!("tls: true\nnetwork: {network}\n")),
+                format!("xtls-rprx-vision only supports the tcp network, not {network}")
+            );
+        }
+    }
+
+    #[test]
+    fn vision_without_tls_is_rejected() {
+        assert_eq!(new_err("tls: false\n"), "xtls-rprx-vision requires TLS");
+    }
+
+    /// ShadowTLS, Restls and JLS replace the TLS session, so the conn Vision receives is erased
+    /// and reports no session capability.
+    #[test]
+    fn vision_with_a_security_mode_that_replaces_tls_is_rejected() {
+        for (extra, mode) in [
+            ("shadow-tls-opts:\n  password: p\n  version: 3\n", "ShadowTLS"),
+            ("restls-opts:\n  password: p\n  version-hint: tls13\n", "Restls"),
+            ("jls-opts:\n  username: user\n  password: pass\n", "JLS"),
+        ] {
+            assert_eq!(
+                new_err(&format!("tls: true\n{extra}")),
+                format!("xtls-rprx-vision requires the TLS session that {mode} replaces")
+            );
+        }
+    }
+
+    /// The transports that do expose a TLS session keep accepting Vision.
+    #[test]
+    fn vision_on_tcp_with_a_real_tls_session_is_accepted() {
+        let cases = [
+            "tls: true\n".to_owned(),
+            "tls: true\nnetwork: tcp\n".to_owned(),
+            "tls: true\nnetwork: raw\n".to_owned(),
+            format!("tls: true\nclient-fingerprint: chrome\n{REALITY}"),
+        ];
+        for extra in cases {
+            let yaml = format!("{HEAD}{extra}");
+            let option: VlessOption = yaml_serde::from_str(&yaml).expect("option decodes");
+            assert!(Vless::new(option).is_ok(), "{extra}");
+        }
     }
 }
 
