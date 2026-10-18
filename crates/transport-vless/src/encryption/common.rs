@@ -204,11 +204,12 @@ impl BytesReader {
         self.off = 0;
     }
 
-    /// Takes the unread bytes, leaving the reader empty.
+    /// Takes the unread bytes and clears the whole buffer, so the consumed prefix can never be
+    /// handed out again after a direct-mode drain.
     fn take(&mut self) -> Vec<u8> {
-        let out = self.buf.drain(self.off..).collect();
-        self.off = 0;
-        out
+        let mut buf = std::mem::take(&mut self.buf);
+        let offset = std::mem::take(&mut self.off);
+        buf.split_off(offset)
     }
 }
 
@@ -1680,10 +1681,16 @@ mod direct_handoff_tests {
         let mut prefix = [0u8; 4];
         normal.read_exact(&mut prefix).await.expect("prefix read");
         assert_eq!(&prefix, &message[..4]);
+        // Consume part of the decrypted surplus through the normal handle first, so the direct
+        // drain starts at a nonzero offset. Taking only the unread suffix must also clear the
+        // consumed prefix; otherwise the next direct read replays it into the raw stream.
+        let mut second = [0u8; 4];
+        normal.read_exact(&mut second).await.expect("buffered prefix read");
+        assert_eq!(&second, &message[4..8]);
 
-        let mut buffered = vec![0u8; message.len() - 4];
+        let mut buffered = vec![0u8; message.len() - 8];
         direct.read_exact(&mut buffered).await.expect("buffered direct read");
-        assert_eq!(&buffered, &message[4..]);
+        assert_eq!(&buffered, &message[8..]);
 
         server_conn.conn.write_all(b"raw-downlink").await.expect("raw server write");
         server_conn.conn.flush().await.expect("raw server flush");
