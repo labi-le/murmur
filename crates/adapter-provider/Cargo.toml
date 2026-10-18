@@ -33,5 +33,9 @@ murmur-log = { path = "../log" }
 murmur-tunnel = { path = "../tunnel" }
 
 
+[dev-dependencies]
+murmur-transport-vless = { path = "../transport-vless" }
+
+
 [lints]
 workspace = true

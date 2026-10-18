@@ -3783,6 +3783,7 @@ dependencies = [
  "murmur-component-resource",
  "murmur-constant",
  "murmur-log",
+ "murmur-transport-vless",
  "murmur-tunnel",
  "parking_lot",
  "regex",

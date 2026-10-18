@@ -14,7 +14,9 @@
 //!   switch. The `ws`/`http`/`h2`/`grpc`/`xhttp` networks build their conn around the TLS session
 //!   and never evaluate its capability, and ShadowTLS/Restls/JLS replace the TLS session with an
 //!   erased conn, so `Vless::new` rejects an `xtls-rprx-vision` configuration on those shapes
-//!   instead of accepting it and failing every dial.
+//!   instead of accepting it and failing every dial. Without outer TLS the configuration is still
+//!   valid when it carries real VLESS encryption: Vision then wraps the encryption conn and runs
+//!   padding-only, matching the reference's `*encryption.CommonConn` case.
 //! * `xhttp`'s HTTP/3 download branch needs a raw `quinn::Connection`, not the `transport::tuic`
 //!   `murmur_quic`-mirror abstraction (`transport::tuic::common::dial_quic` returns `Arc<dyn
 //!   murmur_quic-shaped Conn>`, incompatible with `xhttp::client::DialQuicFunc`). This adapter
@@ -340,6 +342,19 @@ impl TlsMaterial {
     }
 }
 
+/// The capability Vision receives for the conn the adapter actually hands it.
+///
+/// The reference accepts its encryption conn as a Vision transport even without outer TLS, so an
+/// encrypted conn whose TLS check is `Unsupported` becomes padding-only Vision rather than a
+/// rejection.
+fn vision_capability(tls_check: TlsConnCheck, encrypted: bool) -> TlsConnCheck {
+    if encrypted && matches!(tls_check, TlsConnCheck::Unsupported) {
+        TlsConnCheck::NoTls
+    } else {
+        tls_check
+    }
+}
+
 async fn stream_tls_conn(
     material: &TlsMaterial,
     ctx: &CancellationToken,
@@ -493,8 +508,8 @@ impl Vless {
         // failure to every dial, which logged `vision: not a valid supported TLS connection` and
         // dropped the connection.
         if vision_flow {
-            if !option.tls {
-                return Err(anyhow!("xtls-rprx-vision requires TLS"));
+            if !option.tls && encryption.is_none() {
+                return Err(anyhow!("xtls-rprx-vision requires TLS or VLESS encryption"));
             }
             if matches!(option.network.as_str(), "ws" | "http" | "h2" | "grpc" | "xhttp") {
                 return Err(anyhow!("xtls-rprx-vision only supports the tcp network, not {}", option.network));
@@ -1251,6 +1266,9 @@ impl Vless {
                 parse_vless_addr(metadata, false)
             };
 
+            // The reference accepts the VLESS encryption conn as a Vision transport even when no
+            // TLS session is present; Vision then pads without ever switching to direct mode.
+            let tls_check = vision_capability(tls_check, self.encryption.is_some());
             let stream = self.client.stream_conn(conn, tls_check, direct_net, buffered_incoming, &dst_addr)?;
             let old_conn: Box<dyn NetConn> = Box::new(StreamAsOldConn::new(stream));
             Ok(old_conn)
@@ -1902,8 +1920,32 @@ mod vision_option_tests {
     }
 
     #[test]
-    fn vision_without_tls_is_rejected() {
-        assert_eq!(new_err("tls: false\n"), "xtls-rprx-vision requires TLS");
+    fn vision_without_tls_or_encryption_is_rejected() {
+        assert_eq!(new_err("tls: false\n"), "xtls-rprx-vision requires TLS or VLESS encryption");
+        assert_eq!(new_err("tls: false\nencryption: none\n"), "xtls-rprx-vision requires TLS or VLESS encryption");
+    }
+
+    /// The reference accepts the VLESS encryption conn as a Vision transport, so real encryption
+    /// makes the same shape valid without outer TLS.
+    #[test]
+    fn vision_without_tls_accepts_real_encryption() {
+        let (_, client, _) = encryption::key::gen_mlkem768("").expect("gen_mlkem768");
+        let (_, password, _) = encryption::key::gen_x25519("").expect("gen_x25519");
+        let encryption = format!("mlkem768x25519plus.native.0rtt.{password}.{client}");
+        let yaml = format!("{HEAD}tls: false\nencryption: {encryption}\n");
+        let option: VlessOption = yaml_serde::from_str(&yaml).expect("option decodes");
+        assert!(Vless::new(option).is_ok());
+    }
+
+    #[test]
+    fn an_encrypted_conn_without_tls_reaches_vision_as_padding_only() {
+        let supported = TlsConnCheck::Supported { handshake_complete: true, version: 0x0304 };
+        assert!(matches!(vision_capability(TlsConnCheck::Unsupported, true), TlsConnCheck::NoTls));
+        assert!(matches!(vision_capability(TlsConnCheck::Unsupported, false), TlsConnCheck::Unsupported));
+        assert!(matches!(
+            vision_capability(supported, true),
+            TlsConnCheck::Supported { handshake_complete: true, version: 0x0304 }
+        ));
     }
 
     /// ShadowTLS, Restls and JLS replace the TLS session, so the conn Vision receives is erased

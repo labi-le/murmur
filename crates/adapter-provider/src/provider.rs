@@ -843,4 +843,44 @@ mod tests {
     fn re_search(pattern: &str, text: &str) -> bool {
         Regex::new(pattern).expect("valid pattern").is_match(text).unwrap_or(false)
     }
+
+    /// An encryption-only Vision entry is a supported configuration, so a mixed provider must
+    /// parse both entries instead of losing the whole payload at construction.
+    #[tokio::test]
+    async fn an_encryption_only_vision_entry_does_not_abort_a_mixed_provider() {
+        let (_, client, _) = murmur_transport_vless::encryption::key::gen_mlkem768("").expect("gen_mlkem768");
+        let (_, password, _) = murmur_transport_vless::encryption::key::gen_x25519("").expect("gen_x25519");
+        let yaml = format!(
+            r#"
+proxies:
+  - name: ordinary
+    type: socks5
+    server: 127.0.0.1
+    port: 1080
+  - name: vision-encrypted
+    type: vless
+    server: 127.0.0.1
+    port: 443
+    uuid: 11111111-1111-1111-1111-111111111111
+    flow: xtls-rprx-vision
+    tls: false
+    encryption: mlkem768x25519plus.native.0rtt.{password}.{client}
+"#
+        );
+        let parser = new_proxies_parser(
+            "mixed",
+            Arc::new(murmur_tunnel::tunnel::Tunnel),
+            "",
+            "",
+            "",
+            "",
+            OverrideSchema::default(),
+            "",
+        )
+        .expect("parser");
+
+        let proxies = parser(yaml.as_bytes()).expect("the mixed provider parses");
+        let names: Vec<String> = proxies.iter().map(|proxy| proxy.name()).collect();
+        assert_eq!(names, ["ordinary", "vision-encrypted"]);
+    }
 }

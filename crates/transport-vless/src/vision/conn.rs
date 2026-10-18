@@ -1265,6 +1265,39 @@ mod tests {
         assert_eq!(body, b"hello");
     }
 
+    /// The reference accepts the VLESS encryption conn as a Vision transport even without a TLS
+    /// session: the conn still frames and pads the first write.
+    #[tokio::test]
+    async fn no_tls_conn_frames_and_pads_the_first_write() {
+        let (inner, mut peer) = pipe();
+        let mut conn =
+            new_conn(shared(inner), TlsConnCheck::NoTls, None, None, UUID).expect("encryption-only vision conn");
+        let (write, (command, content_len, body)) = tokio::join!(conn.write_all(b"hello"), read_uuid_frame(&mut peer));
+        write.expect("vision write");
+        assert_eq!(command, COMMAND_PADDING_CONTINUE);
+        assert_eq!(content_len, 5);
+        assert_eq!(body, b"hello");
+    }
+
+    /// Without TLS and without encryption the conn shape is unknown, so Vision still fails closed.
+    #[test]
+    fn unsupported_conn_is_still_rejected() {
+        let (inner, _peer) = pipe();
+        assert!(new_conn(shared(inner), TlsConnCheck::Unsupported, None, None, UUID).is_err());
+    }
+
+    /// Padding-only Vision never switches to direct mode, so a TLS raw-transport handle is refused.
+    #[test]
+    fn no_tls_conn_refuses_a_tls_raw_transport() {
+        let (inner, _peer) = pipe();
+        let (raw, _raw_peer) = pipe();
+        let err = new_conn(shared(inner), TlsConnCheck::NoTls, Some(shared(raw)), None, UUID)
+            .err()
+            .map(|err| err.to_string())
+            .expect("rejected");
+        assert_eq!(err, "vision: encryption-only conn cannot carry a TLS raw transport");
+    }
+
     /// A Pending below the vision layer must resume the queued frame: the caller's re-poll uses
     /// the same slice, and a second wrap would duplicate the header (and the payload).
     #[tokio::test]
