@@ -342,16 +342,22 @@ impl TlsMaterial {
     }
 }
 
-/// The capability Vision receives for the conn the adapter actually hands it.
+/// What Vision receives for the conn the adapter actually hands it.
 ///
-/// The reference accepts its encryption conn as a Vision transport even without outer TLS, so an
-/// encrypted conn whose TLS check is `Unsupported` becomes padding-only Vision rather than a
-/// rejection.
-fn vision_capability(tls_check: TlsConnCheck, encrypted: bool) -> TlsConnCheck {
-    if encrypted && matches!(tls_check, TlsConnCheck::Unsupported) {
-        TlsConnCheck::NoTls
+/// With VLESS encryption the conn Vision wraps is the encryption layer, never the TLS session:
+/// the reference accepts its encryption conn as a padding-only Vision transport, so Vision must
+/// not inspect the TLS version or keep the TLS raw-transport handoff. Without encryption the
+/// already-evaluated TLS check passes through unchanged.
+fn vision_transport(
+    tls_check: TlsConnCheck,
+    direct_net: Option<SharedConn>,
+    buffered_incoming: Option<Arc<dyn TlsBufferedIncoming>>,
+    encrypted: bool,
+) -> (TlsConnCheck, Option<SharedConn>, Option<Arc<dyn TlsBufferedIncoming>>) {
+    if encrypted {
+        (TlsConnCheck::NoTls, None, None)
     } else {
-        tls_check
+        (tls_check, direct_net, buffered_incoming)
     }
 }
 
@@ -1265,9 +1271,11 @@ impl Vless {
                 parse_vless_addr(metadata, false)
             };
 
-            // The reference accepts the VLESS encryption conn as a Vision transport even when no
-            // TLS session is present; Vision then pads without ever switching to direct mode.
-            let tls_check = vision_capability(tls_check, self.encryption.is_some());
+            // The conn Vision wraps is the encryption layer, so any TLS session sits below it:
+            // Vision pads the encryption stream and must not keep the raw-transport handoff or
+            // the TLS version check.
+            let (tls_check, direct_net, buffered_incoming) =
+                vision_transport(tls_check, direct_net, buffered_incoming, self.encryption.is_some());
             let stream = self.client.stream_conn(conn, tls_check, direct_net, buffered_incoming, &dst_addr)?;
             let old_conn: Box<dyn NetConn> = Box::new(StreamAsOldConn::new(stream));
             Ok(old_conn)
@@ -1952,15 +1960,41 @@ mod vision_option_tests {
         assert!(Vless::new(option).is_ok());
     }
 
+    struct NoBuffered;
+
+    impl TlsBufferedIncoming for NoBuffered {
+        fn take_buffered_incoming(&self) -> Option<Vec<u8>> {
+            None
+        }
+    }
+
+    /// Encryption wraps whatever TLS session exists, so Vision is padding-only for every TLS
+    /// result and never keeps the TLS raw-transport handoff or TLS version check.
     #[test]
-    fn an_encrypted_conn_without_tls_reaches_vision_as_padding_only() {
-        let supported = TlsConnCheck::Supported { handshake_complete: true, version: 0x0304 };
-        assert!(matches!(vision_capability(TlsConnCheck::Unsupported, true), TlsConnCheck::NoTls));
-        assert!(matches!(vision_capability(TlsConnCheck::Unsupported, false), TlsConnCheck::Unsupported));
+    fn an_encrypted_conn_is_padding_only_regardless_of_the_tls_check() {
+        let tls13 = TlsConnCheck::Supported { handshake_complete: true, version: 0x0304 };
+        let tls12 = TlsConnCheck::Supported { handshake_complete: true, version: 0x0303 };
+
+        // Without encryption the evaluated TLS check passes through untouched.
         assert!(matches!(
-            vision_capability(supported, true),
-            TlsConnCheck::Supported { handshake_complete: true, version: 0x0304 }
+            vision_transport(tls13, None, None, false).0,
+            TlsConnCheck::Supported { version: 0x0304, .. }
         ));
+        assert!(matches!(
+            vision_transport(tls12, None, None, false).0,
+            TlsConnCheck::Supported { version: 0x0303, .. }
+        ));
+        assert!(matches!(vision_transport(TlsConnCheck::Unsupported, None, None, false).0, TlsConnCheck::Unsupported));
+
+        for check in [tls13, tls12, TlsConnCheck::Unsupported] {
+            let (conn, _peer) = murmur_common_net::deadline::pipe_sing::pipe();
+            let direct = SharedConn::from_boxed(Box::new(conn));
+            let buffered: Arc<dyn TlsBufferedIncoming> = Arc::new(NoBuffered);
+            let (check, direct, buffered) = vision_transport(check, Some(direct), Some(buffered), true);
+            assert!(matches!(check, TlsConnCheck::NoTls));
+            assert!(direct.is_none(), "the TLS raw transport must not reach Vision");
+            assert!(buffered.is_none(), "the TLS buffered plaintext must not reach Vision");
+        }
     }
 
     /// ShadowTLS, Restls and JLS replace the TLS session, so the conn Vision receives is erased
