@@ -508,10 +508,11 @@ impl Vless {
         }
 
         // Vision needs either a conn that reports its TLS session or the VLESS encryption layer.
-        // The framed transports below build their conn around the TLS session and never evaluate
-        // one, so without encryption they would defer a guaranteed failure to every dial (which
-        // logged `vision: not a valid supported TLS connection`); with encryption, Vision wraps the
-        // encryption conn instead, so the underlying transport no longer matters.
+        // Without encryption, the framed transports and the security modes that replace the TLS
+        // session hand Vision a conn with no capability, deferring a guaranteed failure to every
+        // dial (which logged `vision: not a valid supported TLS connection`). With encryption,
+        // Vision wraps the encryption conn instead, so neither the transport nor the replaced TLS
+        // session below it matters.
         if vision_flow {
             if !option.tls && encryption.is_none() {
                 return Err(anyhow!("xtls-rprx-vision requires TLS or VLESS encryption"));
@@ -519,7 +520,7 @@ impl Vless {
             if encryption.is_none() && matches!(option.network.as_str(), "ws" | "http" | "h2" | "grpc" | "xhttp") {
                 return Err(anyhow!("xtls-rprx-vision only supports the tcp network, not {}", option.network));
             }
-            if matches!(security_mode, "ShadowTLS" | "Restls" | "JLS") {
+            if encryption.is_none() && matches!(security_mode, "ShadowTLS" | "Restls" | "JLS") {
                 return Err(anyhow!("xtls-rprx-vision requires the TLS session that {security_mode} replaces"));
             }
         }
@@ -1907,6 +1908,11 @@ mod vision_option_tests {
         "uuid: 00000000-0000-0000-0000-000000000001\nflow: xtls-rprx-vision\n",
     );
     const REALITY: &str = "reality-opts:\n  public-key: AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA\n";
+    const TLS_REPLACING_MODES: [(&str, &str); 3] = [
+        ("shadow-tls-opts:\n  password: p\n  version: 3\n", "ShadowTLS"),
+        ("restls-opts:\n  password: p\n  version-hint: tls13\n", "Restls"),
+        ("jls-opts:\n  username: user\n  password: pass\n", "JLS"),
+    ];
 
     fn new_err(extra: &str) -> String {
         let yaml = format!("{HEAD}{extra}");
@@ -1997,19 +2003,26 @@ mod vision_option_tests {
         }
     }
 
-    /// ShadowTLS, Restls and JLS replace the TLS session, so the conn Vision receives is erased
-    /// and reports no session capability.
+    /// Without encryption Vision gets the erased conn a TLS-replacing security mode leaves.
     #[test]
-    fn vision_with_a_security_mode_that_replaces_tls_is_rejected() {
-        for (extra, mode) in [
-            ("shadow-tls-opts:\n  password: p\n  version: 3\n", "ShadowTLS"),
-            ("restls-opts:\n  password: p\n  version-hint: tls13\n", "Restls"),
-            ("jls-opts:\n  username: user\n  password: pass\n", "JLS"),
-        ] {
+    fn vision_with_a_security_mode_that_replaces_tls_is_rejected_without_encryption() {
+        for (extra, mode) in TLS_REPLACING_MODES {
             assert_eq!(
                 new_err(&format!("tls: true\n{extra}")),
                 format!("xtls-rprx-vision requires the TLS session that {mode} replaces")
             );
+        }
+    }
+
+    /// Encryption wraps the security transport, so Vision pads the encryption conn instead of
+    /// needing the replaced TLS session.
+    #[test]
+    fn vision_with_a_security_mode_that_replaces_tls_is_accepted_with_encryption() {
+        let encryption = encryption_value();
+        for (extra, mode) in TLS_REPLACING_MODES {
+            let yaml = format!("{HEAD}tls: true\n{extra}encryption: {encryption}\n");
+            let option: VlessOption = yaml_serde::from_str(&yaml).expect("option decodes");
+            assert!(Vless::new(option).is_ok(), "{mode}");
         }
     }
 
