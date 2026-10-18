@@ -14,9 +14,9 @@
 //!   switch. The `ws`/`http`/`h2`/`grpc`/`xhttp` networks build their conn around the TLS session
 //!   and never evaluate its capability, and ShadowTLS/Restls/JLS replace the TLS session with an
 //!   erased conn, so `Vless::new` rejects an `xtls-rprx-vision` configuration on those shapes
-//!   instead of accepting it and failing every dial. Without outer TLS the configuration is still
-//!   valid when it carries real VLESS encryption: Vision then wraps the encryption conn and runs
-//!   padding-only, matching the reference's `*encryption.CommonConn` case.
+//!   without VLESS encryption instead of accepting it and failing every dial. With encryption,
+//!   Vision wraps the encryption conn and runs padding-only, matching the reference's
+//!   `*encryption.CommonConn` case, so the transport restriction does not apply.
 //! * `xhttp`'s HTTP/3 download branch needs a raw `quinn::Connection`, not the `transport::tuic`
 //!   `murmur_quic`-mirror abstraction (`transport::tuic::common::dial_quic` returns `Arc<dyn
 //!   murmur_quic-shaped Conn>`, incompatible with `xhttp::client::DialQuicFunc`). This adapter
@@ -501,17 +501,16 @@ impl Vless {
             return Err(anyhow!("{security_mode} requires TLS"));
         }
 
-        // Vision wraps the raw TLS record stream, so the outbound has to hand it a conn that
-        // reports its TLS session capability. The framed transports below build their conn
-        // around the TLS session and never evaluate one, and the security modes that replace the
-        // TLS session finish on an erased conn; accepting those configurations used to defer the
-        // failure to every dial, which logged `vision: not a valid supported TLS connection` and
-        // dropped the connection.
+        // Vision needs either a conn that reports its TLS session or the VLESS encryption layer.
+        // The framed transports below build their conn around the TLS session and never evaluate
+        // one, so without encryption they would defer a guaranteed failure to every dial (which
+        // logged `vision: not a valid supported TLS connection`); with encryption, Vision wraps the
+        // encryption conn instead, so the underlying transport no longer matters.
         if vision_flow {
             if !option.tls && encryption.is_none() {
                 return Err(anyhow!("xtls-rprx-vision requires TLS or VLESS encryption"));
             }
-            if matches!(option.network.as_str(), "ws" | "http" | "h2" | "grpc" | "xhttp") {
+            if encryption.is_none() && matches!(option.network.as_str(), "ws" | "http" | "h2" | "grpc" | "xhttp") {
                 return Err(anyhow!("xtls-rprx-vision only supports the tcp network, not {}", option.network));
             }
             if matches!(security_mode, "ShadowTLS" | "Restls" | "JLS") {
@@ -1907,15 +1906,33 @@ mod vision_option_tests {
         Vless::new(option).err().map(|err| err.to_string()).expect("rejected")
     }
 
+    fn encryption_value() -> String {
+        let (_, client, _) = encryption::key::gen_mlkem768("").expect("gen_mlkem768");
+        let (_, password, _) = encryption::key::gen_x25519("").expect("gen_x25519");
+        format!("mlkem768x25519plus.native.0rtt.{password}.{client}")
+    }
+
     /// The framed transports build their conn around the TLS session and never evaluate its
-    /// capability, so the pair has to fail here rather than on every dial.
+    /// capability, so without encryption the pair has to fail here rather than on every dial.
     #[test]
-    fn vision_over_a_framed_transport_is_rejected() {
+    fn vision_over_a_framed_transport_is_rejected_without_encryption() {
         for network in ["ws", "http", "h2", "grpc", "xhttp"] {
             assert_eq!(
                 new_err(&format!("tls: true\nnetwork: {network}\n")),
                 format!("xtls-rprx-vision only supports the tcp network, not {network}")
             );
+        }
+    }
+
+    /// Encryption wraps the selected transport before Vision sees it, so the framed transports are
+    /// valid when the encryption conn is what Vision pads.
+    #[test]
+    fn vision_over_a_framed_transport_is_accepted_with_encryption() {
+        let encryption = encryption_value();
+        for network in ["ws", "http", "h2", "grpc", "xhttp"] {
+            let yaml = format!("{HEAD}tls: true\nnetwork: {network}\nencryption: {encryption}\n");
+            let option: VlessOption = yaml_serde::from_str(&yaml).expect("option decodes");
+            assert!(Vless::new(option).is_ok(), "{network}");
         }
     }
 
@@ -1929,9 +1946,7 @@ mod vision_option_tests {
     /// makes the same shape valid without outer TLS.
     #[test]
     fn vision_without_tls_accepts_real_encryption() {
-        let (_, client, _) = encryption::key::gen_mlkem768("").expect("gen_mlkem768");
-        let (_, password, _) = encryption::key::gen_x25519("").expect("gen_x25519");
-        let encryption = format!("mlkem768x25519plus.native.0rtt.{password}.{client}");
+        let encryption = encryption_value();
         let yaml = format!("{HEAD}tls: false\nencryption: {encryption}\n");
         let option: VlessOption = yaml_serde::from_str(&yaml).expect("option decodes");
         assert!(Vless::new(option).is_ok());
