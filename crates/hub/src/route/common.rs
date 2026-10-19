@@ -14,6 +14,7 @@
 use std::convert::Infallible;
 use std::future::Future;
 use std::pin::Pin;
+use std::sync::Arc;
 use std::task::{Context as TaskContext, Poll};
 
 use bytes::Bytes;
@@ -23,8 +24,10 @@ use hyper::body::{Body, Frame, Incoming, SizeHint};
 use hyper::{header, Method, Request, Response, StatusCode, Version};
 use hyper_util::rt::TokioIo;
 use serde::Serialize;
-use tokio::io::{AsyncReadExt as _, AsyncWrite, AsyncWriteExt};
+use tokio::io::{AsyncRead, AsyncReadExt as _, AsyncWrite, AsyncWriteExt};
 use tokio::sync::{mpsc, oneshot};
+use tokio::task::JoinHandle;
+use tokio_util::sync::CancellationToken;
 
 use murmur_adapter_outboundgroup::util::{self, ProxyGroup, SelectAble};
 use murmur_common::utils::path_unescape::path_unescape;
@@ -848,33 +851,141 @@ fn channel_body(buffer: usize) -> (mpsc::Sender<Bytes>, RespBody) {
 
 /// The two destinations streamed JSON is written to: an HTTP body channel, or the websocket
 /// connection after an upgrade.
-pub(crate) enum StreamSink {
+pub(crate) struct StreamSink {
+    dest: SinkDest,
+    /// Resolved once `dest` can no longer accept a write. The handler selects on
+    /// [`StreamSink::closed`] so a client that vanishes while no frame qualifies ends the stream
+    /// immediately instead of waiting for a record it may never send.
+    shutdown: CancellationToken,
+    /// Ends the destination watcher when the handler returns; see [`StreamSink::closed`].
+    watcher: Option<JoinHandle<()>>,
+}
+
+enum SinkDest {
     Http(mpsc::Sender<Bytes>),
-    Ws(TokioIo<hyper::upgrade::Upgraded>),
+    Ws(Arc<tokio::sync::Mutex<tokio::io::WriteHalf<TokioIo<hyper::upgrade::Upgraded>>>>),
 }
 
 impl StreamSink {
     /// Returns `false` once the sink can no longer accept data, which ends the stream.
+    ///
+    /// NOT cancel-safe: a dropped write may have emitted part of a frame.
     pub(crate) async fn write_text(&mut self, data: &[u8]) -> bool {
-        match self {
-            Self::Http(tx) => tx.send(Bytes::copy_from_slice(data)).await.is_ok(),
-            Self::Ws(io) => ws_write_server_text(io, data).await.is_ok(),
-        }
-    }
-
-    /// When a handler returns early (a bad `interval`, or a zero-period ticker), the websocket
-    /// connection is left open and never written to again; reading until the peer closes
-    /// reproduces that without leaking the socket.
-    pub(crate) async fn idle_until_peer_closes(mut self) {
-        let Self::Ws(io) = &mut self else { return };
-        let mut buf = [0u8; 512];
-        loop {
-            match io.read(&mut buf).await {
-                Ok(0) | Err(_) => break,
-                Ok(_) => {}
+        match &mut self.dest {
+            SinkDest::Http(tx) => tx.send(Bytes::copy_from_slice(data)).await.is_ok(),
+            SinkDest::Ws(writer) => {
+                let mut writer = writer.lock().await;
+                ws_write_server_text(&mut *writer, data).await.is_ok()
             }
         }
     }
+
+    /// Resolves when the client can no longer receive the stream: the HTTP body receiver was
+    /// dropped, or the upgraded connection reached a close frame, EOF, or an I/O error.
+    ///
+    /// cancel-safe: this only observes the cancellation token and leaves it untouched.
+    pub(crate) async fn closed(&self) {
+        self.shutdown.cancelled().await;
+    }
+
+    /// When a handler returns early (a bad `interval`, or a zero-period ticker), the websocket
+    /// connection is left open and never written to again; waiting for the peer to close
+    /// reproduces that without leaking the socket.
+    pub(crate) async fn idle_until_peer_closes(self) {
+        if matches!(&self.dest, SinkDest::Http(_)) {
+            return;
+        }
+        self.shutdown.cancelled().await;
+    }
+}
+
+impl Drop for StreamSink {
+    fn drop(&mut self) {
+        if let Some(watcher) = self.watcher.take() {
+            watcher.abort();
+        }
+    }
+}
+
+/// Reads the client half of an upgraded websocket and answers its control frames on `writer`.
+///
+/// Streaming routes only write, but a websocket peer that closes while the server is quiet is
+/// otherwise invisible until the next application write. Reading the control stream turns that
+/// close (or EOF, or an I/O error) into [`StreamSink::closed`]. Ping is answered with a pong
+/// carrying the same payload, a close frame is echoed, and data frames are discarded.
+async fn watch_websocket<R, W>(mut reader: R, writer: Arc<tokio::sync::Mutex<W>>, shutdown: CancellationToken)
+where
+    R: AsyncRead + Unpin,
+    W: AsyncWrite + Unpin,
+{
+    let mut fragmented = false;
+    loop {
+        let Ok(Some(header)) = murmur_ws::read_header(&mut reader).await else { break };
+        let state = if fragmented {
+            murmur_ws::STATE_SERVER_SIDE.set(murmur_ws::STATE_FRAGMENTED)
+        } else {
+            murmur_ws::STATE_SERVER_SIDE
+        };
+        if murmur_ws::check_header(&header, state).is_err() {
+            let body = murmur_ws::new_close_frame_body(murmur_ws::STATUS_PROTOCOL_ERROR, b"");
+            let mut writer = writer.lock().await;
+            let _ = ws_write_server_message(&mut *writer, murmur_ws::OP_CLOSE.0, &body).await;
+            drop(writer);
+            break;
+        }
+
+        if header.op_code.is_control() {
+            let Some(payload) = read_ws_payload(&mut reader, &header).await else { break };
+            if header.op_code == murmur_ws::OP_PING {
+                let mut writer = writer.lock().await;
+                if ws_write_server_message(&mut *writer, murmur_ws::OP_PONG.0, &payload).await.is_err() {
+                    break;
+                }
+            } else if header.op_code == murmur_ws::OP_CLOSE {
+                let mut writer = writer.lock().await;
+                let _ = ws_write_server_message(&mut *writer, murmur_ws::OP_CLOSE.0, &payload).await;
+                drop(writer);
+                break;
+            }
+            // A pong needs no response of its own.
+            continue;
+        }
+
+        if discard_ws_payload(&mut reader, header.length).await.is_err() {
+            break;
+        }
+        fragmented = !header.fin;
+    }
+    shutdown.cancel();
+}
+
+/// Reads and unmasks one control frame's payload. `check_header` has already bounded its length
+/// to [`murmur_ws::MAX_CONTROL_FRAME_PAYLOAD_SIZE`].
+async fn read_ws_payload<R: AsyncRead + Unpin>(reader: &mut R, header: &murmur_ws::Header) -> Option<Vec<u8>> {
+    let len = usize::try_from(header.length).ok()?;
+    let mut payload = vec![0u8; len];
+    reader.read_exact(&mut payload).await.ok()?;
+    if header.masked {
+        murmur_ws::cipher(&mut payload, header.mask, 0);
+    }
+    Some(payload)
+}
+
+/// Consumes a data frame's payload. Nothing in the streaming API accepts client data, but the
+/// bytes still have to be read before the next header.
+async fn discard_ws_payload<R: AsyncRead + Unpin>(reader: &mut R, length: i64) -> std::io::Result<()> {
+    let mut left = usize::try_from(length).map_err(|_| std::io::Error::other("negative websocket payload length"))?;
+    let mut buf = [0u8; 4096];
+    while left > 0 {
+        let want = left.min(buf.len());
+        let (target, _) = buf.split_at_mut(want);
+        let read = reader.read(target).await?;
+        if read == 0 {
+            return Err(std::io::ErrorKind::UnexpectedEof.into());
+        }
+        left -= read;
+    }
+    Ok(())
 }
 
 /// Shared shape of the streaming routes (`traffic`, `memory`, `logs`, `connections`): each
@@ -892,15 +1003,28 @@ where
             Ok(resp) => {
                 tokio::spawn(async move {
                     let Ok(upgraded) = hyper::upgrade::on(req).await else { return };
-                    run(StreamSink::Ws(TokioIo::new(upgraded))).await;
+                    let (reader, writer) = tokio::io::split(TokioIo::new(upgraded));
+                    let writer = Arc::new(tokio::sync::Mutex::new(writer));
+                    let shutdown = CancellationToken::new();
+                    let watcher = tokio::spawn(watch_websocket(reader, Arc::clone(&writer), shutdown.clone()));
+                    run(StreamSink { dest: SinkDest::Ws(writer), shutdown, watcher: Some(watcher) }).await;
                 });
                 resp
             }
         }
     } else {
         let (tx, body) = channel_body(32);
+        let shutdown = CancellationToken::new();
+        let watcher = {
+            let tx = tx.clone();
+            let shutdown = shutdown.clone();
+            tokio::spawn(async move {
+                tx.closed().await;
+                shutdown.cancel();
+            })
+        };
         tokio::spawn(async move {
-            run(StreamSink::Http(tx)).await;
+            run(StreamSink { dest: SinkDest::Http(tx), shutdown, watcher: Some(watcher) }).await;
         });
         response_with(StatusCode::OK, &[(header::CONTENT_TYPE, "application/json")], body)
     }

@@ -55,6 +55,7 @@ use murmur_adapter_inbound::listen::new_listen_config;
 use murmur_adapter_inbound::listen_notwindows::{listen_named_pipe, SUPPORT_NAMED_PIPE};
 #[cfg(target_os = "windows")]
 use murmur_adapter_inbound::listen_windows::{listen_named_pipe, SUPPORT_NAMED_PIPE};
+use murmur_common::observable::subscriber::Subscription;
 use murmur_common_net::io::{Acceptor, OldListenerAsAcceptor};
 use murmur_component_ca::auth::{
     client_auth_type_from_string, NO_CLIENT_CERT, REQUIRE_AND_VERIFY_CLIENT_CERT, VERIFY_CLIENT_CERT_IF_GIVEN,
@@ -388,15 +389,25 @@ fn get_logs(req: Req) -> Response<RespBody> {
 
     stream_response(req, move |mut sink: StreamSink| async move {
         let Ok(sub) = subscribe().await else { return };
+        // The explicit release below covers the normal exits; this guard covers a panic or an
+        // abort of this spawned task, which would otherwise leave the subscription counted.
+        let mut cleanup = SubscriptionCleanup::new(sub.clone());
         let (tx, mut rx) = tokio::sync::mpsc::channel::<Event>(1024);
-        let forward_sub = sub.clone();
+        let forward_sub = sub;
         let forwarder = tokio::spawn(async move {
             while let Some(event) = forward_sub.recv().await {
                 let _ = tx.try_send(event);
             }
         });
 
-        while let Some(log_m) = rx.recv().await {
+        loop {
+            // cancel-safe: `recv` leaves a queued event in the channel, and `closed` only observes
+            // the sink's cancellation token; neither loses state when the select drops it.
+            let log_m = tokio::select! {
+                () = sink.closed() => break,
+                log_m = rx.recv() => log_m,
+            };
+            let Some(log_m) = log_m else { break };
             if log_m.log_level < level {
                 continue;
             }
@@ -423,8 +434,37 @@ fn get_logs(req: Req) -> Response<RespBody> {
         }
 
         forwarder.abort();
-        un_subscribe(sub).await;
+        cleanup.release().await;
     })
+}
+
+/// Releases the `/logs` subscription on every exit from the streaming task.
+///
+/// `un_subscribe` is async, so the normal path awaits [`SubscriptionCleanup::release`]; the
+/// `Drop` fallback spawns the same cleanup when the task is aborted or unwinds, where awaiting is
+/// impossible.
+struct SubscriptionCleanup(Option<Subscription<Event>>);
+
+impl SubscriptionCleanup {
+    fn new(sub: Subscription<Event>) -> Self {
+        Self(Some(sub))
+    }
+
+    async fn release(&mut self) {
+        if let Some(sub) = self.0.take() {
+            un_subscribe(sub).await;
+        }
+    }
+}
+
+impl Drop for SubscriptionCleanup {
+    fn drop(&mut self) {
+        if let Some(sub) = self.0.take() {
+            if let Ok(handle) = tokio::runtime::Handle::try_current() {
+                drop(handle.spawn(un_subscribe(sub)));
+            }
+        }
+    }
 }
 
 fn version() -> Response<RespBody> {
@@ -1532,6 +1572,7 @@ pub(crate) static CONTROLLER_LISTENERS: tokio::sync::Mutex<()> = tokio::sync::Mu
 mod tests {
     use super::test_http::{exchange, RawResponse};
     use super::*;
+    use tokio::net::TcpStream;
 
     #[test]
     fn query_param_percent_and_plus_decodes_url_query_values() {
@@ -1905,7 +1946,7 @@ mod tests {
         use std::time::Duration;
 
         for _ in 0..500 {
-            if let Ok(mut stream) = tokio::net::TcpStream::connect(addr).await {
+            if let Ok(mut stream) = TcpStream::connect(addr).await {
                 return get_on(&mut stream, target, secret).await;
             }
             tokio::time::sleep(Duration::from_millis(20)).await;
@@ -2022,6 +2063,148 @@ mod tests {
         let state = RouterState::from_config(&Config { secret: "state-secret".to_owned(), ..Config::default() });
         assert_eq!(state.secret, "state-secret");
         assert!(RouterState::from_config(&Config::default()).secret.is_empty());
+    }
+
+    /// Serves `get_logs` over one raw loopback connection. The returned receiver resolves when
+    /// hyper's connection task finishes, which for a streaming response only happens once the
+    /// handler stops holding the body sender.
+    async fn open_logs(request: &str) -> (TcpStream, tokio::sync::oneshot::Receiver<()>) {
+        use tokio::io::AsyncWriteExt as _;
+        use tokio::net::TcpListener;
+
+        let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind loopback listener");
+        let addr = listener.local_addr().expect("listener has a local address");
+        let (done_tx, done_rx) = tokio::sync::oneshot::channel();
+        tokio::spawn(async move {
+            let (conn, _) = listener.accept().await.expect("accept loopback connection");
+            let service = hyper::service::service_fn(|req: Req| async move { Ok::<_, Infallible>(get_logs(req)) });
+            let _ = hyper::server::conn::http1::Builder::new()
+                .serve_connection(TokioIo::new(conn), service)
+                .with_upgrades()
+                .await;
+            let _ = done_tx.send(());
+        });
+
+        let mut stream = TcpStream::connect(addr).await.expect("connect to loopback listener");
+        stream.write_all(request.as_bytes()).await.expect("write request");
+        (stream, done_rx)
+    }
+
+    async fn read_response_head(stream: &mut TcpStream) -> String {
+        use tokio::io::AsyncReadExt as _;
+
+        let mut raw = Vec::new();
+        loop {
+            let mut chunk = [0u8; 256];
+            let read = stream.read(&mut chunk).await.expect("read response head");
+            assert!(read > 0, "server closed before the response head");
+            raw.extend_from_slice(&chunk[..read]);
+            if let Some(end) = raw.windows(4).position(|window| window == b"\r\n\r\n") {
+                return String::from_utf8_lossy(&raw[..end + 4]).into_owned();
+            }
+        }
+    }
+
+    async fn read_server_frame(stream: &mut TcpStream) -> (u8, Vec<u8>) {
+        use tokio::io::AsyncReadExt as _;
+
+        let mut head = [0u8; 2];
+        stream.read_exact(&mut head).await.expect("read frame header");
+        assert_eq!(head[1] & 0x80, 0, "server frames must not be masked");
+        let length = match head[1] & 0x7f {
+            126 => {
+                let mut extended = [0u8; 2];
+                stream.read_exact(&mut extended).await.expect("read extended frame length");
+                usize::from(u16::from_be_bytes(extended))
+            }
+            127 => {
+                let mut extended = [0u8; 8];
+                stream.read_exact(&mut extended).await.expect("read extended frame length");
+                usize::try_from(u64::from_be_bytes(extended)).expect("frame length fits in usize")
+            }
+            length => usize::from(length),
+        };
+        let mut payload = vec![0u8; length];
+        stream.read_exact(&mut payload).await.expect("read frame payload");
+        (head[0] & 0x0f, payload)
+    }
+
+    async fn write_client_frame(stream: &mut TcpStream, opcode: u8, payload: &[u8]) {
+        use tokio::io::AsyncWriteExt as _;
+
+        const MASK: [u8; 4] = [0x11, 0x22, 0x33, 0x44];
+        let length = u8::try_from(payload.len()).expect("control payload fits in one byte");
+        let mut frame = vec![0x80 | opcode, 0x80 | length];
+        frame.extend_from_slice(&MASK);
+        frame.extend(payload.iter().enumerate().map(|(index, byte)| byte ^ MASK[index % 4]));
+        stream.write_all(&frame).await.expect("write websocket frame");
+    }
+
+    /// The streaming routes share process-wide subscription state, so the two `/logs` tests must
+    /// not observe each other's subscriber.
+    static LOG_STREAM_TESTS: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+
+    /// The stream used to wait for a qualifying log record before testing the sink, so a client
+    /// that closed while the daemon was quiet kept the handler task and its subscription alive.
+    #[tokio::test]
+    async fn a_closed_logs_stream_releases_its_subscription_without_a_qualifying_record() {
+        let _guard = LOG_STREAM_TESTS.lock().await;
+        murmur_log::set_level(murmur_log::LogLevel::ERROR);
+
+        let (mut stream, done) =
+            open_logs("GET /logs?level=error HTTP/1.1\r\nHost: test\r\nConnection: close\r\n\r\n").await;
+        let head = read_response_head(&mut stream).await;
+        assert!(head.starts_with("HTTP/1.1 200 OK"), "{head}");
+        assert!(murmur_log::enabled(murmur_log::LogLevel::DEBUG), "the live stream must hold a log subscription");
+
+        drop(stream);
+        tokio::time::timeout(std::time::Duration::from_secs(2), async {
+            while murmur_log::enabled(murmur_log::LogLevel::DEBUG) {
+                tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("closing the client must release the /logs subscription");
+
+        done.await.expect("server task reported completion");
+    }
+
+    /// The websocket sink used to be write-only, so a peer that closed while no record qualified
+    /// left the upgraded socket and its subscription behind. Control frames must be answered and
+    /// the close must end the server side.
+    #[tokio::test]
+    async fn a_websocket_logs_client_is_answered_and_released_on_close() {
+        let _guard = LOG_STREAM_TESTS.lock().await;
+        murmur_log::set_level(murmur_log::LogLevel::ERROR);
+
+        let (mut stream, _done) = open_logs(
+            "GET /logs?level=error HTTP/1.1\r\nHost: test\r\nUpgrade: websocket\r\n\
+             Connection: Upgrade\r\nSec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\n\
+             Sec-WebSocket-Version: 13\r\n\r\n",
+        )
+        .await;
+        let head = read_response_head(&mut stream).await;
+        assert!(head.starts_with("HTTP/1.1 101 Switching Protocols"), "{head}");
+
+        write_client_frame(&mut stream, murmur_ws::OP_PING.0, b"hi").await;
+        let (opcode, payload) = tokio::time::timeout(std::time::Duration::from_secs(2), read_server_frame(&mut stream))
+            .await
+            .expect("the server must answer a ping on a quiet log stream");
+        assert_eq!(opcode, murmur_ws::OP_PONG.0);
+        assert_eq!(payload, b"hi");
+
+        write_client_frame(&mut stream, murmur_ws::OP_CLOSE.0, &[0x03, 0xe8]).await;
+        let (opcode, payload) = read_server_frame(&mut stream).await;
+        assert_eq!(opcode, murmur_ws::OP_CLOSE.0);
+        assert_eq!(payload, [0x03, 0xe8]);
+
+        use tokio::io::AsyncReadExt as _;
+        let mut byte = [0u8; 1];
+        let read = tokio::time::timeout(std::time::Duration::from_secs(2), stream.read(&mut byte))
+            .await
+            .expect("the server must close the upgraded socket after the close frame")
+            .expect("read after the close frame");
+        assert_eq!(read, 0, "the server must close the upgraded socket");
     }
 }
 
