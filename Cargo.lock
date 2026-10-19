@@ -5723,6 +5723,7 @@ dependencies = [
  "async-trait",
  "chrono",
  "criterion",
+ "dhat",
  "murmur-common",
  "murmur-common-net",
  "murmur-common-pool",

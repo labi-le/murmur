@@ -539,6 +539,16 @@ async fn handle_udp_conn(mut packet_adapter: PacketAdapterImpl) {
         return;
     }
 
+    // An established key needs neither the metadata cell nor a maker: both exist for the first
+    // packet, which the sniffer may mutate and the dial task consumes. A `None` here is not proof
+    // of absence — a concurrent creation can store the key just after the lookup — so the miss path
+    // below still runs the atomic `get_or_create`.
+    let nat = nat_table();
+    if let Some(sender) = nat.get(packet_adapter.key_ref()) {
+        sender.send(Arc::new(packet_adapter)).await;
+        return;
+    }
+
     let key = packet_adapter.key();
     let raw_packet = Arc::clone(&packet_adapter.packet);
     let metadata_cell = Arc::new(Mutex::new(packet_adapter.metadata().clone()));
@@ -557,7 +567,7 @@ async fn handle_udp_conn(mut packet_adapter: PacketAdapterImpl) {
         })
     };
 
-    let (sender, loaded) = nat_table().get_or_create(&key, maker);
+    let (sender, loaded) = nat.get_or_create(&key, maker);
 
     let packet: Arc<dyn PacketAdapter> = if loaded {
         sniff_packet
@@ -1124,7 +1134,7 @@ fn new_timeout_cancellation(duration: Duration) -> (CancellationToken, tokio::ta
 mod tests {
     use std::borrow::Cow;
     use std::io;
-    use std::net::IpAddr;
+    use std::net::{IpAddr, Ipv4Addr, SocketAddr};
     use std::pin::Pin;
     use std::sync::atomic::AtomicUsize;
     use std::sync::Arc;
@@ -1135,6 +1145,7 @@ mod tests {
     use super::*;
     use murmur_common::utils::ranges::IntRanges;
     use murmur_component::resolver::enhancer::{self as comp_enhancer, Enhancer, SharedEnhancer};
+    use murmur_constant::adapters::WriteBack;
     use murmur_constant::adapters::{Chain, DelayHistory, ProxyInfo, ProxyState};
     use murmur_constant::rule::RuleType;
 
@@ -1161,10 +1172,10 @@ mod tests {
     }
 
     impl Stream for StubConn {
-        fn local_addr(&self) -> io::Result<std::net::SocketAddr> {
+        fn local_addr(&self) -> io::Result<SocketAddr> {
             Err(io::Error::other("stub"))
         }
-        fn peer_addr(&self) -> io::Result<std::net::SocketAddr> {
+        fn peer_addr(&self) -> io::Result<SocketAddr> {
             Err(io::Error::other("stub"))
         }
     }
@@ -1567,5 +1578,92 @@ mod tests {
 
         let err = result.unwrap_err();
         assert_eq!(err.to_string(), "fake DNS record 198.18.0.2 missing");
+    }
+
+    struct RecordingPacket {
+        local: SocketAddr,
+        data: Vec<u8>,
+    }
+
+    #[async_trait]
+    impl WriteBack for RecordingPacket {
+        async fn write_back(&self, _b: &[u8], _addr: Option<SocketAddr>) -> Result<usize> {
+            Ok(0)
+        }
+    }
+
+    impl UDPPacket for RecordingPacket {
+        fn data(&self) -> &[u8] {
+            &self.data
+        }
+
+        fn drop_(&self) {}
+
+        fn local_addr(&self) -> SocketAddr {
+            self.local
+        }
+    }
+
+    struct RecordingSender {
+        sent: Mutex<Vec<usize>>,
+    }
+
+    #[async_trait]
+    impl PacketSender for RecordingSender {
+        async fn send(&self, packet: Arc<dyn PacketAdapter>) {
+            self.sent.lock().push(packet.data().len());
+        }
+
+        async fn process(&self, _conn: Arc<dyn PacketConn>, _proxy: Arc<dyn WriteBackProxy>) {}
+
+        fn close(&self) {}
+
+        async fn do_sniff(&self, _metadata: &mut Metadata) -> Result<()> {
+            Ok(())
+        }
+
+        fn add_mapping(&self, _origin_metadata: &Metadata, _metadata: &Metadata) {}
+
+        fn restore_read_from(&self, addr: IpAddr) -> IpAddr {
+            addr
+        }
+    }
+
+    /// Datagrams for a key that is already in the NAT table go straight to the stored sender: one
+    /// sender, no second dial, for every packet of the flow.
+    #[tokio::test]
+    async fn an_established_udp_key_reuses_its_sender_for_every_datagram() {
+        const PACKETS: usize = 1000;
+        let _guard = TEST_LOCK.lock().await;
+        reset_config();
+        on_running();
+
+        let recording = Arc::new(RecordingSender { sent: Mutex::new(Vec::new()) });
+        let shared = Arc::clone(&recording);
+        let sender: Arc<dyn PacketSender> = shared;
+        let registered = Arc::clone(&sender);
+        let local: SocketAddr = "127.0.0.1:58231".parse().expect("valid loopback address");
+        let key = local.to_string();
+        let (stored, loaded) = nat_table().get_or_create(&key, Box::new(move || registered));
+        assert!(!loaded, "the test registered the key itself");
+        assert!(Arc::ptr_eq(&stored, &sender), "the test's sender was not stored");
+
+        for _ in 0..PACKETS {
+            let metadata = Metadata {
+                network: NetWork::UDP,
+                type_: Type::TUN,
+                dst_ip: Some(IpAddr::V4(Ipv4Addr::new(203, 0, 113, 9))),
+                dst_port: 443,
+                ..Default::default()
+            };
+            let packet: Arc<dyn UDPPacket> = Arc::new(RecordingPacket { local, data: vec![0x2a; 64] });
+            let adapter = new_packet_adapter(packet, metadata);
+            assert_eq!(adapter.key_ref(), key, "the established lookup key changed");
+            handle_udp_conn(adapter).await;
+        }
+
+        assert_eq!(recording.sent.lock().len(), PACKETS, "a datagram did not reach the stored sender");
+        nat_table().delete(&key);
+        on_suspend();
     }
 }
