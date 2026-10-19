@@ -119,7 +119,11 @@ Health checks send HEAD requests to the configured origin, with an origin-form
 path/query and a `Host` header carrying its authority, including a nondefault
 port or bracketed IPv6 literal. An HTTP response outside `expected-status` can
 still produce a measured delay, but its per-URL health state is unhealthy; use
-that state rather than a nonzero delay alone to validate node availability.
+that state rather than a nonzero delay alone to validate node availability. Each
+probe is bounded by the configured test timeout. When the timeout fires the probe
+is cancelled and awaited, so the failed measurement is still published instead of
+leaving the node's previous state in place. The timeout watch is owned by the
+probe and is retired as soon as the probe finishes.
 
 File-provider watchers schedule updates on their owning Tokio runtime, not on
 notify's OS thread. They watch the provider's parent directory and filter by
