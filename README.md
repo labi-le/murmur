@@ -1219,6 +1219,22 @@ by the unit test suite.
   and drops the listener before rebinding. Verified live: after SIGHUP the API answers again on the
   same port, the mixed proxy relays, zero error lines, and the re-listen line is logged.
 
+- **A quiet `/logs` stream kept its subscription after the client left.** Closed. `get_logs`
+  waited only on the event channel, so a client that disconnected while no record met `?level=`
+  was noticed on the next qualifying write, if ever; the handler also ran detached from the
+  connection, and the websocket sink never read, so an idle peer's close was invisible.
+  `crates/hub/src/route/server.rs` now selects the sink's closure against the channel and releases
+  through a guard that also covers an aborted or panicking task; `crates/hub/src/route/common.rs`
+  watches the HTTP body receiver and the upgraded websocket's control frames (ping answered, close
+  echoed, data discarded). Tests:
+  `a_closed_logs_stream_releases_its_subscription_without_a_qualifying_record` and
+  `a_websocket_logs_client_is_answered_and_released_on_close`, both failing on the write-only form
+  with `Elapsed(())`. A loopback `level=error` probe opened and closed 1,000 plain HTTP streams and
+  1,000 websocket streams with no qualifying record: the process held 11 descriptors and no
+  `CLOSE_WAIT` sockets before, between and after the churn, against 112 descriptors and 101
+  `CLOSE_WAIT` sockets for 100 websocket disconnects with only the old receive loop restored
+  ([#192](https://github.com/labi-le/murmur/issues/192)).
+
 ## Licence
 
 murmur is licensed under the GNU General Public License, version 3 only; every crate manifest
