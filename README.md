@@ -680,15 +680,16 @@ Criterion point estimates (not deployment guarantees):
 
 ### Additional measurement suite
 
-`tools/bench_metrics.py` runs 19 isolated workloads through two optimized, `harness = false`
+`tools/bench_metrics.py` runs 24 isolated workloads through two optimized, `harness = false`
 targets: `metrics_cpu` uses the normal allocator, while `metrics_heap` installs
 [dhat](https://docs.rs/dhat/latest/dhat/) only in that benchmark executable. These two targets
 are built by `make bench-metrics`, not by `make bench` or `make bench-smoke`; the Criterion
 target list in `Makefile` deliberately omits them because this runner needs to harvest
 executable paths itself and to keep the `dhat` allocator confined to `metrics_heap`. Production
 binaries and Criterion targets do not use its allocator. The suite covers VLESS first/established
-writes, fresh Vision encode/decode, AEAD, domain/IP lookup, fake-IP hit/eviction, rule scans and
-buffer reuse, plus a zero-work control and a separately named stateful pipe diagnostic.
+writes, fresh Vision encode/decode, AEAD, domain/IP lookup, fake-IP forward hits, reverse hits and
+eviction at 256- and 1,000-entry capacities, rule scans and buffer reuse, plus a zero-work control
+and a separately named stateful pipe diagnostic.
 `rule_chain_256_miss_populated` complements the original empty-helper miss without changing it.
 
 ```bash
@@ -756,9 +757,8 @@ these Rust API ownership changes do not change configuration or controller paylo
 The CIDR traversal also avoids looking up each child twice.
 
 Vision returns its owned scratch and queued buffers to the existing pool on connection drop,
-keeps the UUID in an array and reuses the frame queue. Reverse TLS marker search checks up to
-four candidate starts with `memrchr_iter`, then uses `memmem::rfind` on the remaining prefix
-to bound work on dense false candidates. Fresh-frame allocations include the queue, benchmark
+keeps the UUID in an array, reuses the frame queue and uses `memchr::memmem::rfind` for the
+fixed TLS record marker. Its remaining fresh-frame allocations include the queue, benchmark
 transport ownership and formatted debug events. Log subscribers still receive those events.
 The pipe transfers its owned payload through the channel and returns the unread tail with
 each acknowledgement instead of copying it again. The larger acknowledgement adds 20 bytes
@@ -768,23 +768,6 @@ The measured allocation savings do not establish an end-to-end network speedup. 
 nanosecond-scale timing samples vary; in particular, removing the CIDR allocation alone is
 not evidence of a faster lookup. Reports are in `/tmp/murmur-opt-baseline-20261004` and
 `/tmp/murmur-opt-complete-20261004`; their `results.json` files retain operation counts and scope.
-
-**Vision reverse marker search (2026-10-19, [#175](https://github.com/labi-le/murmur/issues/175)):**
-the existing fresh 16 KiB encode workload measured 4,924 ns/op before and 1,521-1,571 ns/op
-with the bounded candidate scan (1,000,000 CPU operations, 2,000 heap operations). The final
-source measured 1,571 ns/op; a preserved baseline repeat measured 4,959. Allocations stayed at four calls /
-376 bytes per operation. A dense 16 KiB false-candidate probe measured 9,244 versus 9,265 ns;
-the unbounded candidate-only version was rejected after a 5.8x regression on that input.
-Last-occurrence selection and frame boundaries are unchanged. These x86 microbenchmarks
-include fresh connection state and do not establish ARM router throughput or retained heap.
-Artifacts: `/drive/tmp/murmur-component-audit-20261019/vision-final` and
-`/drive/tmp/murmur-component-audit-20261019/vision-baseline-repeat`.
-
-The existing `vision_decode_1024` helper calls the concrete inherent `Conn::read`, not the
-trait-based production relay path. Its per-operation `b.to_vec()` allocation is not evidence
-of an allocation on every production `AsyncRead` call, whose scratch buffer is reused.
-[#176](https://github.com/labi-le/murmur/issues/176) tracks separate fresh and steady-state
-trait-based measurements without changing the existing workload identity.
 
 **Vision forward marker search (2026-10-04):** the filter now skips non-candidate bytes with
 `memchr_iter` and compares each complete candidate without changing marker priority or TLS state.
