@@ -519,8 +519,14 @@ async fn process_udp(mut queue: mpsc::Receiver<PacketAdapterImpl>) {
     }
 }
 
+/// Handles one dequeued UDP datagram.
+///
+/// The queue loop is the production caller. The per-datagram measurement in
+/// `benches/udp_dispatch.rs` calls this directly so the established-hit and miss paths are measured
+/// through the real function rather than a copy of its operations.
 // NOT cancel-safe: a cancel after the nat-table insert leaves that entry to expire.
-async fn handle_udp_conn(mut packet_adapter: PacketAdapterImpl) {
+#[doc(hidden)]
+pub async fn handle_udp_conn(mut packet_adapter: PacketAdapterImpl) {
     if !is_handle(packet_adapter.metadata().type_) {
         packet_adapter.drop_();
         return;

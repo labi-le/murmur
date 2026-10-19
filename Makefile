@@ -11,6 +11,7 @@ BENCH_TARGETS = --bench vless --bench domain_match --bench fakeip --bench rule_m
 bench-alloc:
 	$(CARGO) bench -j 2 -p murmur-rules-common --bench alloc_census
 	$(CARGO) bench -j 2 -p murmur-tunnel --bench udp_hit_path
+	$(CARGO) bench -j 2 -p murmur-tunnel --bench udp_dispatch
 BENCH_ARGS ?=
 METRICS_ARGS ?=
 
