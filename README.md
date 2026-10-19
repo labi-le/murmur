@@ -379,7 +379,7 @@ trips over those four dialers (TLS 1.3 and TLS 1.2 each), including a camouflage
 the client's byte stream as TLS records and requires the ClientHello's SNI to match the configured
 name. The TLS 1.3 master-secret salt defect that made the engine's TLS 1.3 records undecryptable was
 fixed — RFC 8446 §7.1 derives the master secret from the *handshake* secret's `derived` value —
-leaving `murmur-restls` at 59 lib tests plus its interop tests green. The superseded
+leaving `murmur-restls` at 66 lib tests plus its interop tests green. The superseded
 `trojan::restls_stream_tests` module was deleted.
 
 Mieru is implemented: `crates/mieru` (the chacha20poly1305-authenticated multiplexed TCP/UDP engine)

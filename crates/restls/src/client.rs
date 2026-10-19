@@ -415,6 +415,7 @@ fn tls13_conn(
         }),
         peer_closed: false,
         read_buf: Vec::new(),
+        read_offset: 0,
         pending_raw: Vec::new(),
         write_buf: Vec::new(),
         response_records: 0,
@@ -701,6 +702,7 @@ fn tls12_conn(
         relay: Some(RelayRead::Tls12 { protection, real_record_counter: 0 }),
         peer_closed: false,
         read_buf: Vec::new(),
+        read_offset: 0,
         pending_raw: Vec::new(),
         write_buf: Vec::new(),
         response_records: 0,
@@ -837,6 +839,9 @@ struct RestlsConn {
 
     /// Decoded plaintext not yet delivered to the caller's `poll_read` buffer.
     read_buf: Vec<u8>,
+    /// Delivery cursor into `read_buf`: bytes below it have already been handed to the caller.
+    /// Small reads advance this instead of draining (and shifting) the unread suffix.
+    read_offset: usize,
     /// Raw bytes read from `inner` for the TLS record currently being assembled.
     pending_raw: Vec<u8>,
 
@@ -1067,6 +1072,38 @@ fn read_relayed_handshake(
     }
 }
 
+impl RestlsConn {
+    fn deliver_read_buf(&mut self, buf: &mut ReadBuf<'_>) {
+        let unread = self.read_buf.len().saturating_sub(self.read_offset);
+        let n = unread.min(buf.remaining());
+        let end = self.read_offset + n;
+        if let Some(bytes) = self.read_buf.get(self.read_offset..end) {
+            buf.put_slice(bytes);
+        }
+        self.read_offset = end;
+        if self.read_offset >= self.read_buf.len() {
+            self.read_buf.clear();
+            self.read_offset = 0;
+        }
+    }
+
+    /// Drops already-delivered bytes before another payload is appended. The read loop always
+    /// drains `read_buf` before decoding the next record, so this normally finds no prefix; it
+    /// keeps the cursor a plain offset if a future caller appends while a payload is partly
+    /// consumed.
+    fn compact_read_buf(&mut self) {
+        if self.read_offset == 0 {
+            return;
+        }
+        if self.read_offset >= self.read_buf.len() {
+            self.read_buf.clear();
+        } else {
+            self.read_buf.drain(..self.read_offset);
+        }
+        self.read_offset = 0;
+    }
+}
+
 impl AsyncRead for RestlsConn {
     fn poll_read(self: Pin<&mut Self>, cx: &mut Context<'_>, buf: &mut ReadBuf<'_>) -> Poll<io::Result<()>> {
         let this = self.get_mut();
@@ -1088,10 +1125,8 @@ impl AsyncRead for RestlsConn {
                     return Poll::Pending;
                 }
             }
-            if !this.read_buf.is_empty() {
-                let n = this.read_buf.len().min(buf.remaining());
-                buf.put_slice(this.read_buf.get(..n).unwrap_or_default());
-                this.read_buf.drain(..n);
+            if this.read_offset < this.read_buf.len() {
+                this.deliver_read_buf(buf);
                 return Poll::Ready(Ok(()));
             }
             match this.poll_fill_record(cx) {
@@ -1130,6 +1165,7 @@ impl AsyncRead for RestlsConn {
                 }
             };
             let payload = record.get(result.data_offset..result.data_offset + result.data_len).unwrap_or_default();
+            this.compact_read_buf();
             this.read_buf.extend_from_slice(payload);
             if let crate::script::Command::Response(n) = result.command {
                 this.response_records += u16::from(n);
@@ -1403,6 +1439,7 @@ mod tls12_client_tests {
                     relay: None,
                     peer_closed: false,
                     read_buf: Vec::new(),
+                    read_offset: 0,
                     pending_raw: Vec::new(),
                     write_buf: Vec::new(),
                     response_records: 0,
@@ -1479,6 +1516,7 @@ mod tls12_client_tests {
             relay: None,
             peer_closed: false,
             read_buf: Vec::new(),
+            read_offset: 0,
             pending_raw: Vec::new(),
             write_buf: Vec::new(),
             response_records: 0,
@@ -1556,6 +1594,7 @@ mod tls12_client_tests {
             relay: None,
             peer_closed: false,
             read_buf: Vec::new(),
+            read_offset: 0,
             pending_raw: Vec::new(),
             write_buf: Vec::new(),
             response_records: 0,
@@ -1622,6 +1661,7 @@ mod tls12_client_tests {
             relay: None,
             peer_closed: false,
             read_buf: Vec::new(),
+            read_offset: 0,
             pending_raw: Vec::new(),
             write_buf: Vec::new(),
             response_records: 0,
@@ -1676,6 +1716,7 @@ mod tls12_client_tests {
             relay: None,
             peer_closed: false,
             read_buf: Vec::new(),
+            read_offset: 0,
             pending_raw: Vec::new(),
             write_buf: Vec::new(),
             response_records: 0,
@@ -1734,6 +1775,7 @@ mod tls12_client_tests {
             relay: None,
             peer_closed: false,
             read_buf: Vec::new(),
+            read_offset: 0,
             pending_raw: Vec::new(),
             write_buf: Vec::new(),
             response_records: 0,
@@ -1789,6 +1831,7 @@ mod tls12_client_tests {
                 relay: None,
                 peer_closed: false,
                 read_buf: Vec::new(),
+                read_offset: 0,
                 pending_raw: Vec::new(),
                 write_buf: Vec::new(),
                 response_records: 0,
@@ -1844,6 +1887,7 @@ mod tls12_client_tests {
             relay: None,
             peer_closed: false,
             read_buf: Vec::new(),
+            read_offset: 0,
             pending_raw: Vec::new(),
             write_buf: Vec::new(),
             response_records: 0,
@@ -1884,6 +1928,7 @@ mod tls12_client_tests {
                 relay: None,
                 peer_closed: false,
                 read_buf: Vec::new(),
+                read_offset: 0,
                 pending_raw: Vec::new(),
                 write_buf: Vec::new(),
                 response_records: 0,
@@ -1946,6 +1991,7 @@ mod tls12_client_tests {
             relay: None,
             peer_closed: false,
             read_buf: Vec::new(),
+            read_offset: 0,
             pending_raw: Vec::new(),
             write_buf: Vec::new(),
             response_records: 0,
@@ -2019,6 +2065,7 @@ mod tls12_client_tests {
             relay: None,
             peer_closed: false,
             read_buf: Vec::new(),
+            read_offset: 0,
             pending_raw: Vec::new(),
             write_buf: Vec::new(),
             response_records: 0,
@@ -2077,6 +2124,7 @@ mod tls12_client_tests {
             relay,
             peer_closed: false,
             read_buf: Vec::new(),
+            read_offset: 0,
             pending_raw: Vec::new(),
             write_buf: Vec::new(),
             response_records: 0,
@@ -2229,5 +2277,67 @@ mod tls12_client_tests {
             !tls12_server_finished_matches(&master, &session_hash, Tls12PrfHash::Sha384, &verify_data),
             "another PRF hash"
         );
+    }
+
+    /// Small caller reads must deliver each record's payload exactly once, in order, with the
+    /// next record starting at its own payload.
+    #[tokio::test]
+    async fn small_reads_deliver_records_in_order() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        for chunk in [1usize, 64, 1024] {
+            let first: Vec<u8> = (0..4 * 1024).map(|i| (i % 251) as u8).collect();
+            let second: Vec<u8> = (0..3 * 1024).map(|i| (i % 239) as u8).collect();
+            let (inner, mut peer) = tokio::io::duplex(16 * 1024);
+            let mut conn = relay_test_conn(SharedConn::from_boxed(Box::new(TinySocket(inner))), None);
+            peer.write_all(&framing::write_record(
+                &[9; 32],
+                &[7; 32],
+                true,
+                0,
+                None,
+                &first,
+                first.len(),
+                crate::script::Command::Noop,
+            ))
+            .await
+            .unwrap();
+            peer.write_all(&framing::write_record(
+                &[9; 32],
+                &[7; 32],
+                true,
+                1,
+                None,
+                &second,
+                second.len(),
+                crate::script::Command::Noop,
+            ))
+            .await
+            .unwrap();
+
+            let mut out = vec![0u8; chunk];
+            let mut got = Vec::with_capacity(first.len() + second.len());
+            while got.len() < first.len() + second.len() {
+                let n = conn.read(&mut out).await.expect("small read must deliver payload");
+                assert!(n > 0, "delivery stalled at {} bytes with chunk {chunk}", got.len());
+                got.extend_from_slice(&out[..n]);
+            }
+            let mut expected = first;
+            expected.extend_from_slice(&second);
+            assert_eq!(got, expected, "chunk size {chunk}");
+        }
+    }
+
+    /// Compaction must keep only the undelivered suffix, so an append after a partial read
+    /// cannot replay already-delivered bytes.
+    #[tokio::test]
+    async fn compacting_a_partially_consumed_payload_keeps_the_unread_suffix() {
+        let (inner, _peer) = tokio::io::duplex(1);
+        let mut conn = relay_test_conn(SharedConn::from_boxed(Box::new(TinySocket(inner))), None);
+        conn.read_buf = vec![1, 2, 3, 4];
+        conn.read_offset = 2;
+        conn.compact_read_buf();
+        assert_eq!(conn.read_buf, [3, 4]);
+        assert_eq!(conn.read_offset, 0);
     }
 }
