@@ -27,12 +27,75 @@ struct SessionEntry {
     peer_addr: SocketAddr,
 }
 
+/// Sessions keyed by id, plus the peer index the server uses to find the ciphers that may open a
+/// datagram before session-id routing. The index has no independent lifetime: insert, retain and
+/// drain update both maps together, so an evicted session cannot leave a candidate behind.
+#[derive(Default)]
+struct SessionTable {
+    entries: HashMap<u32, SessionEntry>,
+    session_ids_by_peer: HashMap<SocketAddr, Vec<u32>>,
+}
+
+impl SessionTable {
+    fn len(&self) -> usize {
+        self.entries.len()
+    }
+
+    fn get(&self, id: u32) -> Option<&SessionEntry> {
+        self.entries.get(&id)
+    }
+
+    fn insert(&mut self, id: u32, entry: SessionEntry) {
+        let peer_addr = entry.peer_addr;
+        if let Some(previous) = self.entries.insert(id, entry) {
+            self.unindex(previous.peer_addr, id);
+        }
+        self.session_ids_by_peer.entry(peer_addr).or_default().push(id);
+    }
+
+    fn retain(&mut self, mut keep: impl FnMut(u32, &SessionEntry) -> bool) {
+        let before = self.entries.len();
+        self.entries.retain(|id, entry| keep(*id, entry));
+        if self.entries.len() == before {
+            return;
+        }
+        // One pass over the index, not one linear search per removed id: many idle sessions on
+        // one endpoint must not turn the sweep quadratic while the sessions mutex is held.
+        let entries = &self.entries;
+        self.session_ids_by_peer.retain(|_, ids| {
+            ids.retain(|id| entries.contains_key(id));
+            !ids.is_empty()
+        });
+    }
+
+    fn drain(&mut self) -> impl Iterator<Item = (u32, SessionEntry)> + '_ {
+        self.session_ids_by_peer.clear();
+        self.entries.drain()
+    }
+
+    /// Every session owned by `peer_addr`, in insertion order. One datagram is offered to each
+    /// cached cipher until one opens it; discovery is the caller's fallback.
+    fn candidates(&self, peer_addr: SocketAddr) -> impl Iterator<Item = &SessionEntry> {
+        self.session_ids_by_peer.get(&peer_addr).into_iter().flatten().filter_map(|id| self.entries.get(id))
+    }
+
+    fn unindex(&mut self, peer_addr: SocketAddr, id: u32) {
+        let Some(ids) = self.session_ids_by_peer.get_mut(&peer_addr) else { return };
+        if let Some(position) = ids.iter().position(|candidate| *candidate == id) {
+            ids.swap_remove(position);
+        }
+        if ids.is_empty() {
+            self.session_ids_by_peer.remove(&peer_addr);
+        }
+    }
+}
+
 struct Inner {
     socket: Arc<dyn PacketIo>,
     is_client: bool,
     client_cipher: Option<Arc<BlockCipher>>,
     client_server_addr: Option<SocketAddr>,
-    sessions: AsyncMutex<HashMap<u32, SessionEntry>>,
+    sessions: AsyncMutex<SessionTable>,
     users: Option<ServerUsers>,
     mtu: usize,
     closed: AtomicBool,
@@ -79,7 +142,7 @@ impl SegmentSink for ServerSink {
     async fn send_segment(&self, meta: [u8; wire::METADATA_LENGTH], payload: &[u8]) -> std::io::Result<()> {
         let (cipher, peer_addr) = {
             let sessions = self.inner.sessions.lock().await;
-            let Some(entry) = sessions.get(&self.session_id) else {
+            let Some(entry) = sessions.get(self.session_id) else {
                 return Err(std::io::Error::new(std::io::ErrorKind::NotFound, "session no longer registered"));
             };
             let looked_up = (Arc::clone(&entry.cipher), entry.peer_addr);
@@ -191,8 +254,11 @@ fn cipher_io_err(e: cipher::CipherError) -> std::io::Error {
     std::io::Error::other(e)
 }
 
-/// One shared `UdpSocket` carrying many [`Session`]s, told apart by session id (and, server-side,
-/// by which cached per-session cipher first decrypts a datagram).
+/// One shared `UdpSocket` carrying many [`Session`]s.
+///
+/// Server-side, the session table also indexes session ids by peer address, so an incoming
+/// datagram is offered only the ciphers cached for its source endpoint before user discovery;
+/// routing then uses the decrypted session id.
 pub struct PacketUnderlay {
     inner: Arc<Inner>,
     accept_rx: AsyncMutex<mpsc::Receiver<Arc<Session>>>,
@@ -234,7 +300,7 @@ impl PacketUnderlay {
             is_client: true,
             client_cipher: Some(Arc::new(block)),
             client_server_addr: Some(dialed.peer_addr),
-            sessions: AsyncMutex::new(HashMap::new()),
+            sessions: AsyncMutex::new(SessionTable::default()),
             users: None,
             mtu: DEFAULT_MTU,
             closed: AtomicBool::new(false),
@@ -256,7 +322,7 @@ impl PacketUnderlay {
             is_client: false,
             client_cipher: None,
             client_server_addr: None,
-            sessions: AsyncMutex::new(HashMap::new()),
+            sessions: AsyncMutex::new(SessionTable::default()),
             users: Some(users),
             mtu: DEFAULT_MTU,
             closed: AtomicBool::new(false),
@@ -367,7 +433,7 @@ struct IncomingSegment {
 }
 
 impl Inner {
-    /// Opens one datagram's metadata with the client cipher, the cipher cached for the peer, or
+    /// Opens one datagram's metadata with the client cipher, the ciphers indexed for the peer, or
     /// user discovery, in that order.
     async fn decrypt_meta(&self, encrypted_meta: &[u8], peer: SocketAddr) -> Option<DecryptedMeta> {
         if self.is_client {
@@ -377,13 +443,10 @@ impl Inner {
         }
         let cached = {
             let sessions = self.sessions.lock().await;
-            sessions.values().find_map(|entry| {
-                if entry.peer_addr == peer {
-                    entry.cipher.decrypt(encrypted_meta).ok().map(|pt| (Arc::clone(&entry.cipher), pt))
-                } else {
-                    None
-                }
-            })
+            let opened = sessions
+                .candidates(peer)
+                .find_map(|entry| entry.cipher.decrypt(encrypted_meta).ok().map(|pt| (Arc::clone(&entry.cipher), pt)));
+            opened
         };
         if let Some((cipher, plaintext)) = cached {
             return Some(DecryptedMeta { cipher, plaintext, discovered_user: None });
@@ -441,7 +504,7 @@ async fn route_segment(
         SessionMeta::DataAck(d) => d.session_id,
     };
 
-    let existing = inner.sessions.lock().await.get(&session_id).map(|e| Arc::clone(&e.session));
+    let existing = inner.sessions.lock().await.get(session_id).map(|e| Arc::clone(&e.session));
     if protocol == ProtocolType::OpenSessionRequest && !inner.is_client {
         if existing.is_some() {
             return;
@@ -545,7 +608,12 @@ async fn send_close_reply(
 
 #[cfg(test)]
 mod tests {
+    use std::collections::VecDeque;
     use std::sync::Mutex as StdMutex;
+
+    use tokio::io::AsyncReadExt;
+
+    use crate::session::SessionStream;
 
     use super::*;
 
@@ -603,5 +671,347 @@ mod tests {
             decode_segment(rest, DecryptedMeta { cipher: Arc::new(cipher), plaintext, discovered_user: None })
                 .expect("segment decodes");
         assert_eq!(segment.payload, Bytes::from_static(b"payload"));
+    }
+
+    struct NullSink;
+
+    #[async_trait::async_trait]
+    impl SegmentSink for NullSink {
+        async fn send_segment(&self, _meta: [u8; wire::METADATA_LENGTH], _payload: &[u8]) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    fn test_inner(sessions: SessionTable) -> Inner {
+        Inner {
+            socket: Arc::new(RecordingSocket::default()),
+            is_client: false,
+            client_cipher: None,
+            client_server_addr: None,
+            sessions: AsyncMutex::new(sessions),
+            users: None,
+            mtu: DEFAULT_MTU,
+            closed: AtomicBool::new(false),
+            local_addr: None,
+            user_name: None,
+            traffic_pattern: None,
+        }
+    }
+
+    fn test_entry(id: u32, cipher: Arc<BlockCipher>, peer: SocketAddr) -> SessionEntry {
+        let session = Arc::new(Session::new(
+            id,
+            false,
+            Transport::Stream,
+            1024,
+            Arc::new(NullSink),
+            SessionPeer { peer_addr: Some(peer), ..SessionPeer::default() },
+        ));
+        SessionEntry { session, cipher, peer_addr: peer }
+    }
+
+    #[tokio::test]
+    #[ignore = "peer-index benchmark; run with --ignored --nocapture"]
+    async fn benchmark_decrypt_meta_peer_lookup() {
+        let cipher = Arc::new(cipher::block_cipher_from_password(b"bench-pw", true).expect("cipher"));
+        let meta = SessionStruct {
+            protocol: ProtocolType::OpenSessionRequest as u8,
+            timestamp: wire::now_minutes(),
+            session_id: 1,
+            seq: 0,
+            status_code: wire::STATUS_OK,
+            payload_len: 0,
+            suffix_len: 0,
+        };
+        let encrypted = cipher.encrypt(&meta.marshal()).expect("metadata");
+        let missing: SocketAddr = SocketAddr::from(([127, 0, 0, 1], 65000));
+
+        for peers in [1usize, 32, 256, 4096] {
+            let mut sessions = SessionTable::default();
+            let mut addresses = Vec::with_capacity(peers);
+            for i in 0..peers {
+                let peer = SocketAddr::from(([127, 0, 0, 1], 10000 + i as u16));
+                addresses.push(peer);
+                sessions.insert(i as u32 + 1, test_entry(i as u32 + 1, Arc::clone(&cipher), peer));
+            }
+            let inner = test_inner(sessions);
+            for peer in &addresses {
+                assert!(inner.decrypt_meta(&encrypted, *peer).await.is_some());
+            }
+            let rounds = 20_000usize;
+            let started = std::time::Instant::now();
+            for i in 0..rounds {
+                assert!(inner.decrypt_meta(&encrypted, addresses[i % peers]).await.is_some());
+            }
+            let hit = started.elapsed() / u32::try_from(rounds).expect("rounds fit");
+            let started = std::time::Instant::now();
+            for _ in 0..rounds {
+                assert!(inner.decrypt_meta(&encrypted, missing).await.is_none());
+            }
+            let miss = started.elapsed() / u32::try_from(rounds).expect("rounds fit");
+            println!("peers={peers} hit={}ns miss={}ns", hit.as_nanos(), miss.as_nanos());
+        }
+
+        for sessions_per_peer in [1usize, 32, 256, 4096] {
+            let peer = SocketAddr::from(([127, 0, 0, 1], 10000));
+            let mut sessions = SessionTable::default();
+            for i in 0..sessions_per_peer {
+                let key = format!("bench-pw-{i}");
+                let entry_cipher = Arc::new(cipher::block_cipher_from_password(key.as_bytes(), true).expect("cipher"));
+                sessions.insert(i as u32 + 1, test_entry(i as u32 + 1, entry_cipher, peer));
+            }
+            let target = Arc::clone(
+                &sessions.get(u32::try_from(sessions_per_peer).expect("fits")).expect("last session").cipher,
+            );
+            let encrypted = target.encrypt(&meta.marshal()).expect("metadata");
+            let inner = test_inner(sessions);
+            let rounds = 200usize;
+            let started = std::time::Instant::now();
+            for _ in 0..rounds {
+                assert!(inner.decrypt_meta(&encrypted, peer).await.is_some());
+            }
+            let hit = started.elapsed() / u32::try_from(rounds).expect("rounds fit");
+            println!("same_peer_sessions={sessions_per_peer} hit={}ns", hit.as_nanos());
+        }
+    }
+
+    /// A peer may present metadata under any cipher it has used on this underlay. The indexed
+    /// candidates keep every session's cipher, so a later one still opens its own datagram.
+    #[tokio::test]
+    async fn a_later_cipher_for_the_same_peer_still_opens_metadata() {
+        let peer: SocketAddr = "192.0.2.7:4321".parse().expect("peer");
+        let first = Arc::new(cipher::block_cipher_from_password(b"first-key", true).expect("first cipher"));
+        let second = Arc::new(cipher::block_cipher_from_password(b"second-key", true).expect("second cipher"));
+        let inner = test_inner(SessionTable::default());
+        {
+            let mut sessions = inner.sessions.lock().await;
+            sessions.insert(1, test_entry(1, Arc::clone(&first), peer));
+            sessions.insert(2, test_entry(2, Arc::clone(&second), peer));
+        }
+        let meta = SessionStruct {
+            protocol: ProtocolType::OpenSessionRequest as u8,
+            timestamp: wire::now_minutes(),
+            session_id: 2,
+            seq: 0,
+            status_code: wire::STATUS_OK,
+            payload_len: 0,
+            suffix_len: 0,
+        };
+        let encrypted = second.encrypt(&meta.marshal()).expect("metadata");
+        let decrypted = inner.decrypt_meta(&encrypted, peer).await.expect("the later candidate opens it");
+        assert_eq!(decrypted.plaintext, meta.marshal());
+    }
+
+    /// A rotated credential on an endpoint that already owns a session must still reach discovery:
+    /// the peer candidates are tried first, and a miss does not close the path.
+    #[tokio::test]
+    async fn a_rotated_cipher_falls_through_peer_candidates_to_discovery() {
+        let (users, current) = server_cipher("bob", "rotated-secret");
+        let peer: SocketAddr = "192.0.2.7:4321".parse().expect("peer");
+        let old = Arc::new(cipher::block_cipher_from_password(b"old-key", true).expect("old cipher"));
+        let mut sessions = SessionTable::default();
+        sessions.insert(1, test_entry(1, old, peer));
+        let inner = Inner { users: Some(users), ..test_inner(sessions) };
+        let meta = SessionStruct {
+            protocol: ProtocolType::OpenSessionRequest as u8,
+            timestamp: wire::now_minutes(),
+            session_id: 2,
+            seq: 0,
+            status_code: wire::STATUS_OK,
+            payload_len: 0,
+            suffix_len: 0,
+        };
+        let encrypted = current.encrypt(&meta.marshal()).expect("metadata");
+
+        let decrypted = inner.decrypt_meta(&encrypted, peer).await.expect("discovery opens the rotated key");
+        assert_eq!(decrypted.discovered_user.as_deref(), Some("bob"));
+        assert_eq!(decrypted.plaintext, meta.marshal());
+    }
+
+    /// Eviction is the sweep's retain: dropping an entry must drop its peer candidate too, and an
+    /// empty peer bucket must not survive.
+    #[tokio::test]
+    async fn evicting_a_session_removes_its_peer_candidates() {
+        let first_peer: SocketAddr = "192.0.2.7:4321".parse().expect("peer");
+        let second_peer: SocketAddr = "192.0.2.8:4321".parse().expect("peer");
+        let cipher = Arc::new(cipher::block_cipher_from_password(b"key", true).expect("cipher"));
+        let mut sessions = SessionTable::default();
+        sessions.insert(1, test_entry(1, Arc::clone(&cipher), first_peer));
+        sessions.insert(2, test_entry(2, Arc::clone(&cipher), first_peer));
+        sessions.insert(3, test_entry(3, cipher, second_peer));
+
+        sessions.retain(|id, _| id != 1);
+        let kept: Vec<u32> = sessions.candidates(first_peer).map(|entry| entry.session.id()).collect();
+        assert_eq!(kept, vec![2]);
+
+        sessions.retain(|_, _| false);
+        assert_eq!(sessions.len(), 0);
+        assert!(sessions.candidates(first_peer).next().is_none());
+        assert!(sessions.candidates(second_peer).next().is_none());
+        assert!(sessions.session_ids_by_peer.is_empty());
+    }
+
+    /// A sweep that drops many sessions from one endpoint must leave a consistent index without a
+    /// per-removal walk of the same peer bucket.
+    #[tokio::test]
+    async fn evicting_many_same_peer_sessions_leaves_a_consistent_index() {
+        let peer: SocketAddr = "192.0.2.7:4321".parse().expect("peer");
+        let cipher = Arc::new(cipher::block_cipher_from_password(b"key", true).expect("cipher"));
+        let mut sessions = SessionTable::default();
+        for id in 1..=4096 {
+            sessions.insert(id, test_entry(id, Arc::clone(&cipher), peer));
+        }
+
+        sessions.retain(|id, _| id % 2 == 0);
+
+        assert_eq!(sessions.len(), 2048);
+        let kept: Vec<u32> = sessions.candidates(peer).map(|entry| entry.session.id()).collect();
+        assert_eq!(kept.len(), 2048);
+        assert!(kept.iter().all(|id| id % 2 == 0));
+    }
+
+    /// Closing the underlay drains every session and the peer buckets along with it.
+    #[tokio::test]
+    async fn closing_an_underlay_drops_sessions_and_peer_candidates() {
+        let socket = Arc::new(RecordingSocket::default());
+        let underlay = PacketUnderlay::bound(socket, ServerUsers::new(&HashMap::new(), false), None);
+        let peer: SocketAddr = "192.0.2.7:4321".parse().expect("peer");
+        let cipher = Arc::new(cipher::block_cipher_from_password(b"key", true).expect("cipher"));
+        {
+            let mut sessions = underlay.inner.sessions.lock().await;
+            sessions.insert(1, test_entry(1, Arc::clone(&cipher), peer));
+            sessions.insert(2, test_entry(2, cipher, peer));
+        }
+        assert_eq!(underlay.session_count().await, 2);
+
+        underlay.close().await;
+
+        assert_eq!(underlay.session_count().await, 0);
+        assert!(underlay.inner.sessions.lock().await.session_ids_by_peer.is_empty());
+    }
+
+    #[derive(Default)]
+    struct QueueSocket {
+        incoming: AsyncMutex<VecDeque<(Vec<u8>, SocketAddr)>>,
+        outgoing: AsyncMutex<Vec<(Vec<u8>, SocketAddr)>>,
+        notify: tokio::sync::Notify,
+    }
+
+    impl QueueSocket {
+        async fn push(&self, datagram: Vec<u8>, peer: SocketAddr) {
+            self.incoming.lock().await.push_back((datagram, peer));
+            self.notify.notify_one();
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl PacketIo for QueueSocket {
+        async fn recv_from(&self, buf: &mut [u8]) -> std::io::Result<(usize, SocketAddr)> {
+            loop {
+                let notified = self.notify.notified();
+                {
+                    let mut incoming = self.incoming.lock().await;
+                    if let Some((datagram, peer)) = incoming.pop_front() {
+                        let len = datagram.len().min(buf.len());
+                        buf.get_mut(..len).expect("bounds").copy_from_slice(datagram.get(..len).expect("bounds"));
+                        return Ok((len, peer));
+                    }
+                }
+                notified.await;
+            }
+        }
+
+        async fn send_to(&self, buf: &[u8], target: SocketAddr) -> std::io::Result<usize> {
+            self.outgoing.lock().await.push((buf.to_vec(), target));
+            Ok(buf.len())
+        }
+
+        fn local_addr(&self) -> std::io::Result<SocketAddr> {
+            Ok(SocketAddr::from(([192, 0, 2, 1], 9)))
+        }
+    }
+
+    fn server_cipher(user: &str, password: &str) -> (ServerUsers, Arc<BlockCipher>) {
+        let users = HashMap::from([(user.to_owned(), password.to_owned())]);
+        let users = ServerUsers::new(&users, false);
+        let credential = cipher::hash_password(password.as_bytes(), user.as_bytes());
+        let cipher = cipher::block_cipher_from_password(&credential, true).expect("client cipher");
+        (users, Arc::new(cipher))
+    }
+
+    fn open_datagram(cipher: &BlockCipher, session_id: u32) -> Vec<u8> {
+        let meta = SessionStruct {
+            protocol: ProtocolType::OpenSessionRequest as u8,
+            timestamp: wire::now_minutes(),
+            session_id,
+            seq: 0,
+            status_code: wire::STATUS_OK,
+            payload_len: 0,
+            suffix_len: 0,
+        };
+        cipher.encrypt(&meta.marshal()).expect("metadata")
+    }
+
+    fn data_datagram(cipher: &BlockCipher, session_id: u32, seq: u32, payload: &[u8]) -> Vec<u8> {
+        let meta = DataAckStruct {
+            protocol: ProtocolType::DataClientToServer as u8,
+            timestamp: wire::now_minutes(),
+            session_id,
+            seq,
+            payload_len: u16::try_from(payload.len()).expect("payload fits"),
+            ..DataAckStruct::default()
+        };
+        let mut datagram = cipher.encrypt(&meta.marshal()).expect("metadata");
+        datagram.extend_from_slice(&cipher.encrypt(payload).expect("payload"));
+        datagram
+    }
+
+    /// The read loop resolves each datagram through the peer index, accepts two authenticated
+    /// sessions, delivers payload on one, and leaves a wrong-key open request without a session.
+    #[tokio::test]
+    async fn a_bound_underlay_authenticates_multiple_sessions_and_rejects_a_wrong_key() {
+        let (users, cipher) = server_cipher("bob", "another-secret");
+        let (_, wrong_cipher) = server_cipher("mallory", "not-configured");
+        let socket = Arc::new(QueueSocket::default());
+        let packet_io = Arc::clone(&socket);
+        let packet_io: Arc<dyn PacketIo> = packet_io;
+        let underlay = PacketUnderlay::bound(packet_io, users, None);
+        let first_peer: SocketAddr = "198.51.100.10:40000".parse().expect("peer");
+        let second_peer: SocketAddr = "198.51.100.11:40000".parse().expect("peer");
+        let wrong_peer: SocketAddr = "198.51.100.12:40000".parse().expect("peer");
+        let timeout = Duration::from_secs(2);
+
+        socket.push(open_datagram(&cipher, 7), first_peer).await;
+        let first = tokio::time::timeout(timeout, underlay.accept_session())
+            .await
+            .expect("first session accepted")
+            .expect("session");
+        assert_eq!(first.id(), 7);
+        assert_eq!(first.user_name(), Some("bob"));
+
+        socket.push(open_datagram(&cipher, 8), second_peer).await;
+        let second = tokio::time::timeout(timeout, underlay.accept_session())
+            .await
+            .expect("second session accepted")
+            .expect("session");
+        assert_eq!(second.id(), 8);
+
+        let mut stream = SessionStream::new(Arc::clone(&first));
+        socket.push(data_datagram(&cipher, 7, 1, b"hello"), first_peer).await;
+        let mut payload = [0u8; 5];
+        tokio::time::timeout(timeout, stream.read_exact(&mut payload)).await.expect("payload read").expect("payload");
+        assert_eq!(&payload, b"hello");
+
+        socket.push(open_datagram(&wrong_cipher, 9), wrong_peer).await;
+        socket.push(open_datagram(&cipher, 10), second_peer).await;
+        let third = tokio::time::timeout(timeout, underlay.accept_session())
+            .await
+            .expect("third session accepted")
+            .expect("session");
+        assert_eq!(third.id(), 10, "the wrong-key open request must not create a session");
+        assert_eq!(underlay.session_count().await, 3);
+
+        underlay.close().await;
+        assert_eq!(underlay.session_count().await, 0);
     }
 }
