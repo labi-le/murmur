@@ -1,0 +1,48 @@
+[package]
+name = "murmur-tunnel"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[lib]
+doctest = false
+
+[dependencies]
+murmur-log = { path = "../log" }
+murmur-compat = { path = "../compat" }
+anyhow.workspace = true
+async-trait.workspace = true
+chrono.workspace = true
+parking_lot.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+socket2.workspace = true
+tokio.workspace = true
+tokio-util.workspace = true
+uuid.workspace = true
+murmur-common = { path = "../common" }
+murmur-common-net = { path = "../common-net" }
+murmur-common-pool = { path = "../common-pool" }
+murmur-component = { path = "../component" }
+murmur-component-loopback = { path = "../component-loopback" }
+murmur-component-memory = { path = "../component-memory" }
+murmur-component-nat = { path = "../component-nat" }
+murmur-component-process = { path = "../component-process" }
+murmur-component-sniffer = { path = "../component-sniffer" }
+murmur-constant = { path = "../constant" }
+murmur-constant-features = { path = "../constant-features" }
+murmur-context = { path = "../context" }
+murmur-std-compat = { path = "../std-compat" }
+
+
+[lints]
+workspace = true
+
+[dev-dependencies]
+criterion.workspace = true
+
+[[bench]]
+name = "udp_path"
+harness = false

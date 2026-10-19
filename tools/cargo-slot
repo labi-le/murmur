@@ -1,0 +1,311 @@
+#!/usr/bin/env bash
+# Run build commands on pc while holding one of CARGO_REMOTE_SLOTS shared
+# slots (5 by default). Rust and sccache configuration comes from
+# rust/flake.nix on pc; the systemd service owns the cache itself.
+dir=/drive/tmp/cargo-slots
+mkdir -p "$dir"
+
+CARGO_SLOT_MARKER=.cargo-slot-owned
+CARGO_SLOT_PC_CACHE_ROOT=/home/labile/.cache/cargo-pc
+
+# The flake lives one level above this tool; both this host and pc see the
+# checkout at the same path, so the value built here is valid there too.
+script_dir=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)
+rust_root=$(dirname -- "$script_dir")
+
+enqueue_epoch=$(date +%s)
+
+cargo_slot_subcommand() {
+  local args=("$@") i
+  for i in "${!args[@]}"; do
+    if [ "${args[$i]}" = cargo ]; then
+      echo "${args[$((i + 1))]:-}"
+      return
+    fi
+  done
+  echo ""
+}
+sub=$(cargo_slot_subcommand "$@")
+
+cargo_slot_log() {
+  local slot="$1" acquired="$2" finish="$3" rc="$4" revalidate_ms="${5:--}"
+  printf '%s %s %s %s %s %s %s %s\n' "$enqueue_epoch" "$acquired" "$finish" "$slot" "$rc" "${CARGO_TARGET_DIR:-default}" "$sub" "$revalidate_ms" >>"$dir/log"
+}
+
+# cargo fmt does not compile; run it locally without occupying a pc build slot.
+if [ "$sub" = fmt ]; then
+  acquired_epoch=$(date +%s)
+  "$@"
+  rc=$?
+  finish_epoch=$(date +%s)
+  cargo_slot_log fmt "$acquired_epoch" "$finish_epoch" "$rc"
+  exit "$rc"
+fi
+
+# Seed a not-yet-existing CARGO_TARGET_DIR from a shared warm template, via ZFS
+# block-cloning cp (near-zero time/space), so a fresh target dir's first build
+# only compiles the murmur crate itself instead of all ~390 dependencies.
+# Safe under concurrency: refresh and copy both happen under a flock on the
+# template; if seeding fails or races, the caller's normal cargo invocation
+# still does a correct (just slower) full build.
+cargo_slot_refresh_template() {
+  local template="$1" root lockhash
+  root=$PWD
+  while [ "$root" != / ] && [ ! -f "$root/Cargo.lock" ]; do root=$(dirname "$root"); done
+  [ -f "$root/Cargo.lock" ] || return 0
+  lockhash=$(cat "$root/Cargo.lock" "$root/Cargo.toml" <(rustc --version) <(printf '%s' "${RUSTFLAGS:-}") | sha256sum | cut -d' ' -f1)
+  if [ -f "$template/.cargo-slot-seed-hash" ] && [ "$(cat "$template/.cargo-slot-seed-hash" 2>/dev/null)" = "$lockhash" ]; then
+    return 0
+  fi
+  local build="$template.build.$$"
+  rm -rf "$build"
+  mkdir -p "$build"
+  if (exec 7>&- 2>/dev/null; cd "$root" && CARGO_TARGET_DIR="$build" cargo build --lib && CARGO_TARGET_DIR="$build" cargo test --lib --no-run); then
+    echo "$lockhash" >"$build/.cargo-slot-seed-hash"
+    rm -rf "$template"
+    mv "$build" "$template"
+  else
+    rm -rf "$build"
+  fi
+}
+
+cargo_slot_target_built() {
+  # `mkdir -p "$target"` before invoking cargo-slot is the common idiom used
+  # to pre-create a fresh CARGO_TARGET_DIR; that leaves an existing-but-empty
+  # directory, which `[ -e ]` alone cannot tell apart from a real prior
+  # build. Treat only a non-empty directory as "already built".
+  [ -e "$1" ] && [ -n "$(command ls -A "$1" 2>/dev/null)" ]
+}
+
+cargo_slot_seed_copy() {
+  local target="$1" template="$2" tmp
+  cargo_slot_target_built "$target" && return 0
+  mkdir -p "$(dirname "$template")"
+  exec 7>"$template.lock"
+  flock 7
+  cargo_slot_refresh_template "$template"
+  exec 7>&-
+  cargo_slot_target_built "$target" && return 0
+  [ -d "$template" ] || return 0
+  tmp="${target}.seed.$$"
+  rm -rf "$tmp"
+  if cp -a --reflink=auto "$template" "$tmp" 2>/dev/null; then
+    # The template may carry murmur-specific fingerprint/deps/incremental
+    # artefacts from whichever source tree last refreshed it, with mtimes
+    # cp -a preserves verbatim. If those mtimes are newer than this
+    # target's actual crate sources, cargo would consider the murmur build
+    # already fresh and silently reuse a stale lib/test binary. Strip them
+    # so only the (content-hashed, path-independent) dependency artifacts
+    # are reused; the murmur crate itself always gets rebuilt from the real
+    # sources of this target.
+    find "$tmp" -mindepth 1 \
+      \( -path '*/deps/murmur-*' -o -path '*/deps/libmurmur-*' \
+         -o -path '*/.fingerprint/murmur-*' -o -path '*/incremental/murmur-*' \) \
+      -exec rm -rf {} +
+    mv -T "$tmp" "$target" 2>/dev/null || rm -rf "$tmp"
+  else
+    rm -rf "$tmp"
+  fi
+}
+
+# Mark a target dir as cargo-slot-owned only after the seed attempt (success
+# or not) has run, never before: touching the marker first would make
+# cargo_slot_target_built see a "non-empty" dir on the very first use and
+# skip seeding entirely.
+cargo_slot_do_seed() {
+  local target="$1" template="$2"
+  [ -n "$target" ] && [ -n "$template" ] || return 0
+  cargo_slot_seed_copy "$target" "$template"
+  mkdir -p "$target" && touch "$target/$CARGO_SLOT_MARKER"
+}
+
+# Disk guard. A target directory is evictable only if cargo-slot marked it,
+# and only after a non-blocking exclusive lock on the same lock file held
+# (shared) throughout a running build. The scan root is fixed to the pc cache.
+cargo_slot_evict_template() {
+  cat <<'TEOF'
+set -euo pipefail
+root="__ROOT__"
+trigger=__TRIGGER__
+target=__TARGET__
+minage=__MINAGE__
+skip="__SKIP__"
+dryrun=__DRYRUN__
+cd "$root"
+root_real=$(realpath "$root")
+avail_kb=$(df --output=avail -k "$root_real" | tail -1)
+avail=$((avail_kb * 1024))
+if [ "$avail" -ge "$trigger" ]; then
+  echo "NOACTION root=$root_real avail=$avail trigger=$trigger"
+  exit 0
+fi
+echo "TRIGGER root=$root_real avail=$avail trigger=$trigger target=$target"
+now=$(date +%s)
+cands=$(mktemp)
+trap 'rm -f "$cands"' EXIT
+while IFS= read -r -d '' d; do
+  [ "$(basename "$d")" = tgt-template ] && continue
+  [ -n "$skip" ] && [ "$(basename "$d")" = "$skip" ] && continue
+  [ -f "$d/.cargo-slot-owned" ] || continue
+  d_real=$(realpath "$d") || continue
+  [ "$(dirname "$d_real")" = "$root_real" ] || continue
+  mt=$(stat -c %Y "$d/.cargo-slot-owned" 2>/dev/null) || continue
+  age=$((now - mt))
+  [ "$age" -ge "$minage" ] || continue
+  printf '%s\t%s\0' "$mt" "$d_real" >>"$cands"
+done < <(find "$root_real" -mindepth 1 -maxdepth 1 -type d -print0)
+if [ ! -s "$cands" ]; then
+  echo "NOACTION root=$root_real no-eligible-dirs"
+  exit 0
+fi
+sort -z -n "$cands" | while IFS=$'\t' read -r -d '' mt d_real; do
+  avail_kb=$(df --output=avail -k "$root_real" | tail -1)
+  avail=$((avail_kb * 1024))
+  if [ "$avail" -ge "$target" ]; then
+    echo "DONE root=$root_real avail=$avail target=$target"
+    break
+  fi
+  [ "$(basename "$d_real")" = tgt-template ] && continue
+  [ -n "$skip" ] && [ "$(basename "$d_real")" = "$skip" ] && continue
+  if [ "$(dirname "$d_real")" != "$root_real" ]; then
+    echo "SKIP-UNSAFE $d_real not-direct-child-of-$root_real"
+    continue
+  fi
+  [ -f "$d_real/.cargo-slot-owned" ] || { echo "SKIP-UNMARKED $d_real"; continue; }
+  age=$((now - mt))
+  if [ "$dryrun" = 1 ]; then
+    size=$(du -sb "$d_real" 2>/dev/null | cut -f1) || size='?'
+    echo "WOULD-EVICT $d_real size=$size age=${age}s"
+    continue
+  fi
+  lockfile="$d_real.lock"
+  if [ -L "$lockfile" ]; then
+    echo "SKIP-SYMLINK-LOCK $lockfile"
+    continue
+  fi
+  exec 6>>"$lockfile"
+  if flock -n -x 6; then
+    if [ -f "$d_real/.cargo-slot-owned" ]; then
+      size=$(du -sb "$d_real" 2>/dev/null | cut -f1) || size='?'
+      rm -rf -- "$d_real"
+      echo "EVICT $d_real size=$size age=${age}s"
+    else
+      echo "SKIP-UNMARKED $d_real"
+    fi
+  else
+    echo "SKIP-LOCKED $d_real held-by-running-job"
+  fi
+  exec 6>&-
+done
+TEOF
+}
+
+cargo_slot_evict_render() {
+  local root="$1" trigger="$2" target="$3" minage="$4" dryrun="$5" skip="${6:-}" script
+  script=$(cargo_slot_evict_template)
+  script=${script//__ROOT__/$root}
+  script=${script//__TRIGGER__/$trigger}
+  script=${script//__TARGET__/$target}
+  script=${script//__MINAGE__/$minage}
+  script=${script//__DRYRUN__/$dryrun}
+  script=${script//__SKIP__/$skip}
+  printf '%s' "$script"
+}
+
+# pc guard: ~/.cache/cargo-pc target dirs, triggered under 60G free, evicted
+# by last-use age (no minimum age) until 100G is free. Run over ssh.
+cargo_slot_evict_pc() {
+  local dryrun="${1:-0}" skip="${2:-}" trigger target minage script script_q
+  trigger=$((${CARGO_SLOT_PC_TRIGGER_GB:-60} * 1073741824))
+  target=$((${CARGO_SLOT_PC_TARGET_GB:-100} * 1073741824))
+  minage=0
+  script=$(cargo_slot_evict_render "$CARGO_SLOT_PC_CACHE_ROOT" "$trigger" "$target" "$minage" "$dryrun" "$skip")
+  script_q=$(printf %q "$script")
+  ssh -o BatchMode=yes pc bash -c "$script_q"
+}
+
+if [ "${1:-}" = --seed-target ]; then
+  if [ "$(hostname)" != pc ]; then
+    echo "cargo-slot: target seeding requires pc" >&2
+    exit 1
+  fi
+  cargo_slot_do_seed "${2:-}" "${3:-}"
+  exit 0
+fi
+if [ "${1:-}" = --evict-pc ]; then
+  cargo_slot_evict_pc "${2:-0}" "${3:-}"
+  exit 0
+fi
+
+cargo_slot_run_remote() {
+  local slot="$1" name target_dir
+  shift
+  REVALIDATE_MS=-
+  if [ -n "${CARGO_TARGET_DIR+x}" ]; then
+    target_dir="/home/labile/.cache/cargo-pc/${CARGO_TARGET_DIR//\//_}"
+  else
+    target_dir="/home/labile/.cache/cargo-pc/default"
+  fi
+  if ! ssh -o BatchMode=yes -o ConnectTimeout=5 pc true 2>/dev/null; then
+    echo "cargo-slot: pc unavailable; refusing local compilation" >&2
+    return 255
+  fi
+  cargo_slot_evict_pc "${CARGO_SLOT_PC_EVICT_DRYRUN:-0}" "$(basename "$target_dir")" >>"$dir/evict.log" 2>&1 || true
+  local fwd=()
+  for name in RUST_BACKTRACE RUST_LOG RUST_TEST_THREADS SKIP_SYSTEM_IPV6_CHECK; do
+    [[ -v $name ]] && fwd+=("$(printf %q "$name=${!name}")")
+  done
+  for name in "${!MURMUR_@}"; do
+    fwd+=("$(printf %q "$name=${!name}")")
+  done
+  for name in "${!CARGO_@}"; do
+    [ "$name" = CARGO_TARGET_DIR ] && continue
+    fwd+=("$(printf %q "$name=${!name}")")
+  done
+  local level4 level4_q level3 target_q pwd_q level2 level2_q unit mem level1 level1_q rc lock_q
+  local revalidate revalidate_q rstart rend remote_template_q seed_q target_dirname_q
+  printf -v level4 '%q ' "$@"
+  level4_q=$(printf %q "$level4")
+  level3="nix develop $(printf %q "${rust_root}#default") --command bash -c $level4_q"
+  target_q=$(printf %q "$target_dir")
+  pwd_q=$(printf %q "$PWD")
+  remote_template_q=$(printf %q "/home/labile/.cache/cargo-pc/tgt-template")
+  target_dirname_q=$(printf %q "$(dirname "$target_dir")")
+  lock_q=$(printf %q "$target_dir.lock")
+  seed_q="nix develop $(printf %q "${rust_root}#default") --command bash "$rust_root/tools/cargo-slot" --seed-target $target_q $remote_template_q"
+  revalidate="cd $pwd_q && x=\$PWD; while [ \"\$x\" != / ] && [ ! -f \"\$x/Cargo.toml\" ]; do x=\$(dirname \"\$x\"); done; find \"\$x\" \\( -path '*/target' -prune \\) -o -type f \\( -name '*.rs' -o -name 'Cargo.toml' -o -name 'Cargo.lock' -o -name 'build.rs' -o -path '*/testdata/*' \\) -print0 | xargs -0 cat > /dev/null; find \"\$x\" \\( -path '*/target' -prune \\) -o -type d -exec ls -f {} + >/dev/null"
+  revalidate_q=$(printf %q "$revalidate")
+  rstart=$(date +%s%N)
+  ssh -o BatchMode=yes pc bash -c "$revalidate_q"
+  rend=$(date +%s%N)
+  REVALIDATE_MS=$(((rend - rstart) / 1000000))
+  level2="mkdir -p $target_dirname_q && cd $pwd_q && $seed_q; mkdir -p $target_q && cd $pwd_q && flock -s -o $lock_q env ${fwd[*]} CARGO_TARGET_DIR=$target_q $level3"
+  level2_q=$(printf %q "$level2")
+  unit="cargo-slot-remote-$$-$slot"
+  mem=${CARGO_SLOT_MEM:-11G}
+  level1="systemd-run --user --scope --quiet --collect --unit=$unit -p MemoryMax=$mem -p MemorySwapMax=2G -p KillMode=control-group -- bash -c $level2_q"
+  level1_q=$(printf %q "$level1")
+  ssh -o BatchMode=yes pc bash -c "$level1_q"
+  rc=$?
+  ssh -o BatchMode=yes pc systemctl --user stop "$unit" 2>/dev/null
+  return "$rc"
+}
+
+# A slot is held until the SSH command exits. All normal invocations run on
+# pc, including calls with the historical CARGO_SLOT_LOCAL opt-out set.
+while :; do
+  for j in $(seq 1 "${CARGO_REMOTE_SLOTS:-5}"); do
+    exec 8>"$dir/r$j"
+    if flock -n 8; then
+      acquired_epoch=$(date +%s)
+      cargo_slot_run_remote "$j" "$@"
+      rc=$?
+      finish_epoch=$(date +%s)
+      exec 8>&-
+      cargo_slot_log "r$j" "$acquired_epoch" "$finish_epoch" "$rc" "$REVALIDATE_MS"
+      exit "$rc"
+    fi
+    exec 8>&-
+  done
+  sleep 5
+done

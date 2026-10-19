@@ -1,0 +1,43 @@
+name: Test
+
+# Runs the workspace suite against an explicit commit, tag or branch, so a revision
+# that no longer sits at a branch head can still be proven.
+on:
+  workflow_dispatch:
+    inputs:
+      ref:
+        description: Commit SHA, tag or branch to test
+        required: true
+
+env:
+  CARGO_TERM_COLOR: always
+  # Denying rustc warnings through this variable keeps the build cache valid,
+  # unlike RUSTFLAGS.
+  CARGO_BUILD_WARNINGS: deny
+
+jobs:
+  test:
+    name: test (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 30
+    strategy:
+      fail-fast: false
+      matrix:
+        os:
+          - ubuntu-latest
+          - macos-latest
+          - windows-latest
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          ref: ${{ inputs.ref }}
+          fetch-depth: 0
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy
+      - uses: Swatinem/rust-cache@v2
+      # --no-fail-fast so one crate's failure does not hide the rest of the matrix.
+      - run: cargo test --workspace --no-fail-fast --locked
+      # Lints every target-gated body the runner's platform compiles; the manifest's
+      # workspace lints and clippy.toml set the levels.
+      - run: cargo clippy --workspace --all-targets --locked --keep-going -- -D warnings
