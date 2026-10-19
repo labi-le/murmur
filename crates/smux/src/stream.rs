@@ -316,9 +316,17 @@ impl SmuxStream {
             let mut rb = self.inner.read_buf.lock();
             if !rb.is_empty() {
                 let n = buf.remaining().min(rb.len());
-                let chunk: Vec<u8> = rb.drain(..n).collect();
+                // The queue's two regions go straight into the caller's buffer: the previous
+                // drain/collect built a temporary that existed only to be copied again. The
+                // guard is released before the window update, which awaits.
+                let (head, tail) = rb.as_slices();
+                let head_taken = n.min(head.len());
+                let (head, _) = head.split_at(head_taken);
+                buf.put_slice(head);
+                let (tail, _) = tail.split_at(n - head_taken);
+                buf.put_slice(tail);
+                rb.drain(..n);
                 drop(rb);
-                buf.put_slice(&chunk);
                 if let Some(consumed) = StreamShared::on_read_consumed(&self.inner, n) {
                     let inner = Arc::clone(&self.inner);
                     self.read_state = ReadState::WindowUpdate(Box::pin(async move {
@@ -502,6 +510,7 @@ impl SmuxStream {
 #[cfg(test)]
 mod tests {
     use std::net::{IpAddr, Ipv4Addr};
+    use std::task::Waker;
     use std::time::Duration;
 
     use super::*;
@@ -511,6 +520,139 @@ mod tests {
     fn shared() -> Arc<StreamShared> {
         let addr = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 0);
         new_stream_shared(Weak::new(), 1, &crate::default_config(), addr, addr)
+    }
+
+    fn shared_with_version(version: i32) -> Arc<StreamShared> {
+        let addr = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 0);
+        let mut config = crate::default_config();
+        config.version = version;
+        new_stream_shared(Weak::new(), 1, &config, addr, addr)
+    }
+
+    /// Loads `data` into the stream queue with its head in the middle of the buffer, so
+    /// `as_slices` hands back two non-empty regions.
+    fn prefill_wrapped(inner: &StreamShared, data: &[u8]) {
+        let mut rb = inner.read_buf.lock();
+        *rb = VecDeque::with_capacity(data.len());
+        let capacity = rb.capacity();
+        let gap = data.len() / 4;
+        assert!(gap > 0 && gap < data.len(), "the test payload must have a middle");
+        let prefix = capacity - data.len() + gap;
+        rb.extend((0..prefix).map(|i| (i % 7) as u8));
+        rb.extend(data[..data.len() - gap].iter().copied());
+        rb.drain(..prefix);
+        rb.extend(data[data.len() - gap..].iter().copied());
+        let (head, tail) = rb.as_slices();
+        assert!(!head.is_empty() && !tail.is_empty(), "the queue has to wrap for this case to be the two-region one");
+        assert_eq!(rb.len(), data.len());
+    }
+
+    fn poll_one_read(stream: &mut SmuxStream, storage: &mut [u8]) -> (Poll<io::Result<()>>, Vec<u8>) {
+        let waker = Waker::noop();
+        let mut cx = Context::from_waker(waker);
+        let mut buf = ReadBuf::new(storage);
+        let poll = Pin::new(stream).poll_read(&mut cx, &mut buf);
+        let filled = buf.filled().to_vec();
+        (poll, filled)
+    }
+
+    fn payload(len: usize) -> Vec<u8> {
+        (0..len).map(|i| (i.wrapping_mul(37) % 251) as u8).collect()
+    }
+
+    #[tokio::test]
+    async fn a_wrapped_queue_reads_the_head_then_the_tail_in_order() {
+        use tokio::io::AsyncReadExt;
+
+        let data = payload(64);
+        let inner = shared();
+        prefill_wrapped(&inner, &data);
+        let mut stream = SmuxStream::new(Arc::clone(&inner));
+
+        // 1 byte stays inside the head region; 39 finishes it; 20 spans head (8) and tail
+        // (12); 4 empties the tail.
+        let mut received = Vec::new();
+        for size in [1usize, 39, 20, 4] {
+            let mut buf = vec![0u8; size];
+            let n = stream.read(&mut buf).await.expect("ready read");
+            assert_eq!(n, size);
+            received.extend_from_slice(&buf[..n]);
+        }
+        assert_eq!(received, data);
+        assert!(inner.read_buf.lock().is_empty());
+    }
+
+    #[tokio::test]
+    async fn a_read_larger_than_the_queue_returns_only_the_buffered_bytes() {
+        use tokio::io::AsyncReadExt;
+
+        let data = payload(32);
+        let inner = shared();
+        prefill_wrapped(&inner, &data);
+        let mut stream = SmuxStream::new(Arc::clone(&inner));
+
+        let mut buf = vec![0u8; 1024];
+        let n = stream.read(&mut buf).await.expect("ready read");
+        assert_eq!(n, data.len());
+        assert_eq!(&buf[..n], &data[..]);
+        assert!(inner.read_buf.lock().is_empty());
+    }
+
+    #[test]
+    fn a_zero_length_read_does_not_touch_the_queue_or_the_counters() {
+        let data = payload(8);
+        let inner = shared();
+        prefill_wrapped(&inner, &data);
+        let mut stream = SmuxStream::new(Arc::clone(&inner));
+
+        let (poll, filled) = poll_one_read(&mut stream, &mut []);
+        assert!(matches!(poll, Poll::Ready(Ok(()))));
+        assert!(filled.is_empty());
+        let buffered: Vec<u8> = inner.read_buf.lock().iter().copied().collect();
+        assert_eq!(buffered, data);
+        assert_eq!(inner.num_read.load(Ordering::Acquire), 0);
+    }
+
+    #[tokio::test]
+    async fn version_two_counts_window_consumption_once_per_read() {
+        use tokio::io::AsyncReadExt;
+
+        let data = payload(32);
+        let inner = shared_with_version(2);
+        prefill_wrapped(&inner, &data);
+        let mut stream = SmuxStream::new(Arc::clone(&inner));
+
+        let mut buf = [0u8; 10];
+        let n = stream.read(&mut buf).await.expect("first ready read");
+        assert_eq!(n, 10);
+        assert_eq!(inner.num_read.load(Ordering::Acquire), 10);
+        // The first read reports an update and resets the interval counter.
+        assert_eq!(inner.incr.load(Ordering::Acquire), 0);
+
+        // The first read scheduled a window update; the missing session completes it
+        // without sending, and the second read counts its own ten bytes exactly once.
+        let n = stream.read(&mut buf).await.expect("second ready read");
+        assert_eq!(n, 10);
+        assert_eq!(inner.num_read.load(Ordering::Acquire), 20);
+        assert_eq!(inner.incr.load(Ordering::Acquire), 10);
+    }
+
+    #[tokio::test]
+    async fn fin_after_buffered_data_hands_out_the_remainder_before_eof() {
+        use tokio::io::AsyncReadExt;
+
+        let data = payload(8);
+        let inner = shared();
+        prefill_wrapped(&inner, &data);
+        inner.mark_fin();
+        let mut stream = SmuxStream::new(Arc::clone(&inner));
+
+        let mut buf = vec![0u8; 32];
+        let n = stream.read(&mut buf).await.expect("buffered read");
+        assert_eq!(n, data.len());
+        assert_eq!(&buf[..n], &data[..]);
+        let n = stream.read(&mut buf).await.expect("eof read");
+        assert_eq!(n, 0);
     }
 
     #[tokio::test]
