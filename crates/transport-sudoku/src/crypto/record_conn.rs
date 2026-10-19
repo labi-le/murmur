@@ -5,7 +5,6 @@ use std::sync::Arc;
 use std::task::{ready, Context, Poll};
 
 use anyhow::{anyhow, Result};
-use bytes::BytesMut;
 use hmac::{Hmac, KeyInit as _, Mac as _};
 use rand::rngs::OsRng;
 use rand::TryRngCore;
@@ -37,6 +36,9 @@ struct RecordKeys {
 ///   - uint16 bodyLen
 ///   - `header[12]` = epoch(uint32 BE) || seq(uint64 BE)  (plaintext)
 ///   - ciphertext = AEAD(header as nonce, plaintext, header as AAD)
+///
+/// `recv_body` is reused across records: it holds the ciphertext while the body is read and the
+/// decrypted plaintext in place afterwards, so a steady read loop allocates no per-record buffer.
 pub struct RecordConn {
     conn: Box<dyn Stream>,
     method: String,
@@ -58,16 +60,17 @@ pub struct RecordConn {
     recv_seq: u64,
     recv_initialized: bool,
 
-    read_buf: BytesMut,
-
     write_frame: Vec<u8>,
     write_frame_sent: usize,
     write_frame_plain_len: usize,
 
+    recv_need_len: bool,
     recv_len_buf: [u8; 2],
     recv_len_filled: usize,
     recv_body: Vec<u8>,
     recv_body_filled: usize,
+    recv_plain_off: usize,
+    recv_plain_end: usize,
 }
 
 impl core::fmt::Debug for RecordConn {
@@ -101,14 +104,16 @@ pub fn new_record_conn(conn: Box<dyn Stream>, method: &str, base_send: &[u8], ba
         recv_epoch: 0,
         recv_seq: 0,
         recv_initialized: false,
-        read_buf: BytesMut::new(),
         write_frame: Vec::new(),
         write_frame_sent: 0,
         write_frame_plain_len: 0,
+        recv_need_len: true,
         recv_len_buf: [0u8; 2],
         recv_len_filled: 0,
         recv_body: Vec::new(),
         recv_body_filled: 0,
+        recv_plain_off: 0,
+        recv_plain_end: 0,
     };
     rc.reset_traffic_state()?;
     Ok(rc)
@@ -123,7 +128,6 @@ impl RecordConn {
 
         self.keys = RecordKeys { base_send: clone_bytes(base_send), base_recv: clone_bytes(base_recv) };
         self.reset_traffic_state()?;
-        self.read_buf.clear();
         self.reset_recv_frame();
 
         self.send_aead = None;
@@ -147,9 +151,12 @@ impl RecordConn {
     }
 
     fn reset_recv_frame(&mut self) {
+        self.recv_need_len = true;
         self.recv_len_filled = 0;
         self.recv_body.clear();
         self.recv_body_filled = 0;
+        self.recv_plain_off = 0;
+        self.recv_plain_end = 0;
     }
 
     fn new_aead_for(&self, base: &[u8], epoch: u32) -> Result<Option<Arc<dyn Aead>>> {
@@ -382,16 +389,7 @@ impl AsyncRead for RecordConn {
             return Pin::new(&mut this.conn).poll_read(cx, buf);
         }
 
-        if !this.read_buf.is_empty() {
-            let n = std::cmp::min(buf.remaining(), this.read_buf.len());
-            if n == 0 {
-                return Poll::Ready(Ok(()));
-            }
-            buf.put_slice(&this.read_buf.split_to(n));
-            return Poll::Ready(Ok(()));
-        }
-
-        if this.recv_body.is_empty() {
+        if this.recv_need_len {
             match poll_read_exact(&mut this.conn, cx, &mut this.recv_len_buf, &mut this.recv_len_filled) {
                 Poll::Ready(Ok(true)) => {
                     let body_len = u16::from_be_bytes(this.recv_len_buf) as usize;
@@ -402,8 +400,15 @@ impl AsyncRead for RecordConn {
                     if body_len > MAX_FRAME_BODY_SIZE {
                         return Poll::Ready(Err(io::Error::other("frame too large")));
                     }
-                    this.recv_body = vec![0u8; body_len];
+                    if this.recv_body.len() < body_len {
+                        this.recv_body.resize(body_len, 0);
+                    } else {
+                        this.recv_body.truncate(body_len);
+                    }
                     this.recv_body_filled = 0;
+                    this.recv_plain_off = RECORD_HEADER_SIZE;
+                    this.recv_plain_end = RECORD_HEADER_SIZE;
+                    this.recv_need_len = false;
                 }
                 Poll::Ready(Ok(false)) => return Poll::Ready(Ok(())),
                 Poll::Ready(Err(err)) => return Poll::Ready(Err(err)),
@@ -411,55 +416,68 @@ impl AsyncRead for RecordConn {
             }
         }
 
-        match poll_read_exact(&mut this.conn, cx, &mut this.recv_body, &mut this.recv_body_filled) {
-            Poll::Ready(Ok(true)) => {}
-            Poll::Ready(Ok(false)) => return Poll::Ready(Ok(())),
-            Poll::Ready(Err(err)) => return Poll::Ready(Err(err)),
-            Poll::Pending => return Poll::Pending,
-        }
+        if this.recv_body_filled < this.recv_body.len() {
+            match poll_read_exact(&mut this.conn, cx, &mut this.recv_body, &mut this.recv_body_filled) {
+                Poll::Ready(Ok(true)) => {}
+                Poll::Ready(Ok(false)) => return Poll::Ready(Ok(())),
+                Poll::Ready(Err(err)) => return Poll::Ready(Err(err)),
+                Poll::Pending => return Poll::Pending,
+            }
 
-        let mut body = std::mem::take(&mut this.recv_body);
-        this.recv_body_filled = 0;
-        let mut header = [0u8; RECORD_HEADER_SIZE];
-        let (header_bytes, payload) = body.split_at_mut(RECORD_HEADER_SIZE);
-        header.copy_from_slice(header_bytes);
+            let mut header = [0u8; RECORD_HEADER_SIZE];
+            let (header_bytes, _) = this.recv_body.split_at(RECORD_HEADER_SIZE);
+            header.copy_from_slice(header_bytes);
 
-        let epoch = u32::from_be_bytes([header[0], header[1], header[2], header[3]]);
-        let seq = u64::from_be_bytes([
-            header[4], header[5], header[6], header[7], header[8], header[9], header[10], header[11],
-        ]);
+            let epoch = u32::from_be_bytes([header[0], header[1], header[2], header[3]]);
+            let seq = u64::from_be_bytes([
+                header[4], header[5], header[6], header[7], header[8], header[9], header[10], header[11],
+            ]);
 
-        if let Err(err) = this.validate_recv_position(epoch, seq) {
-            return Poll::Ready(Err(io::Error::other(err)));
-        }
+            if let Err(err) = this.validate_recv_position(epoch, seq) {
+                return Poll::Ready(Err(io::Error::other(err)));
+            }
 
-        if this.recv_aead.is_none() || this.recv_aead_epoch != epoch {
-            match this.new_aead_for(&this.keys.base_recv, epoch) {
-                Ok(aead) => {
-                    this.recv_aead = aead;
-                    this.recv_aead_epoch = epoch;
+            if this.recv_aead.is_none() || this.recv_aead_epoch != epoch {
+                match this.new_aead_for(&this.keys.base_recv, epoch) {
+                    Ok(aead) => {
+                        this.recv_aead = aead;
+                        this.recv_aead_epoch = epoch;
+                    }
+                    Err(err) => return Poll::Ready(Err(io::Error::other(err))),
                 }
-                Err(err) => return Poll::Ready(Err(io::Error::other(err))),
+            }
+            let Some(aead) = this.recv_aead.clone() else {
+                return Poll::Ready(Err(io::Error::other("recv aead unavailable")));
+            };
+
+            let plain_len = {
+                let (_, payload) = this.recv_body.split_at_mut(RECORD_HEADER_SIZE);
+                match aead.open_in_place(&header, payload, &header) {
+                    Ok(plaintext) => plaintext.len(),
+                    Err(err) => {
+                        return Poll::Ready(Err(io::Error::other(anyhow!(
+                            "decryption failed: epoch={epoch} seq={seq}: {err}"
+                        ))));
+                    }
+                }
+            };
+            this.mark_recv_position(epoch, seq);
+            this.recv_plain_end = RECORD_HEADER_SIZE + plain_len;
+            if this.recv_plain_off == this.recv_plain_end {
+                this.recv_need_len = true;
             }
         }
-        let Some(aead) = this.recv_aead.clone() else {
-            return Poll::Ready(Err(io::Error::other("recv aead unavailable")));
-        };
 
-        let plaintext = match aead.open_in_place(&header, payload, &header) {
-            Ok(plaintext) => plaintext,
-            Err(err) => {
-                return Poll::Ready(Err(io::Error::other(anyhow!(
-                    "decryption failed: epoch={epoch} seq={seq}: {err}"
-                ))));
-            }
-        };
-        this.mark_recv_position(epoch, seq);
-
-        this.read_buf.extend_from_slice(plaintext);
-        let n = std::cmp::min(buf.remaining(), this.read_buf.len());
-        if n > 0 {
-            buf.put_slice(&this.read_buf.split_to(n));
+        let n = std::cmp::min(buf.remaining(), this.recv_plain_end - this.recv_plain_off);
+        if n == 0 {
+            return Poll::Ready(Ok(()));
+        }
+        let (_, pending) = this.recv_body.split_at(this.recv_plain_off);
+        let (chunk, _) = pending.split_at(n);
+        buf.put_slice(chunk);
+        this.recv_plain_off += n;
+        if this.recv_plain_off == this.recv_plain_end {
+            this.recv_need_len = true;
         }
         Poll::Ready(Ok(()))
     }
@@ -626,5 +644,34 @@ mod tests {
         let mut got = vec![0u8; want.len()];
         reader.read_exact(&mut got).await.expect("read");
         assert_eq!(got, want.to_vec(), "plaintext mismatch");
+    }
+
+    #[tokio::test]
+    async fn record_conn_reads_consecutive_records_of_different_sizes_through_one_buffer() {
+        let psk_send = Sha256::digest(b"record-send");
+        let psk_recv = Sha256::digest(b"record-recv");
+
+        let raw = Arc::new(CaptureConn::new());
+        let mut writer =
+            new_record_conn(Box::new((*raw).clone()), "chacha20-poly1305", &psk_send, &psk_recv).expect("new writer");
+
+        let payloads = [b"short".to_vec(), vec![0x5a; 1600], b"end".to_vec()];
+        for payload in &payloads {
+            writer.write_all(payload).await.expect("write");
+        }
+        let wire = raw.buf.lock().clone();
+        let mut reader = new_record_conn(Box::new(ReplayConn::new(wire)), "chacha20-poly1305", &psk_recv, &psk_send)
+            .expect("new reader");
+
+        let mut got = Vec::new();
+        let mut scratch = [0u8; 7];
+        loop {
+            let n = reader.read(&mut scratch).await.expect("read");
+            if n == 0 {
+                break;
+            }
+            got.extend_from_slice(&scratch[..n]);
+        }
+        assert_eq!(got, payloads.concat(), "records must survive the shared receive buffer");
     }
 }

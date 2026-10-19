@@ -51,7 +51,12 @@ murmur-log = { path = "../log" }
 
 
 [dev-dependencies]
+dhat.workspace = true
 tokio = { workspace = true, features = ["test-util"] }
+
+[[bench]]
+name = "recv_alloc"
+harness = false
 
 
 [lints]
