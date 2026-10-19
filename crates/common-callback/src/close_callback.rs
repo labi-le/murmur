@@ -176,6 +176,18 @@ impl PacketConn for CloseCallbackPacketConn {
         self.close_once.call_once(|| (self.close_func)());
         self.packet_conn.close()
     }
+
+    fn set_deadline(&self, deadline: Option<tokio::time::Instant>) -> io::Result<()> {
+        self.packet_conn.set_deadline(deadline)
+    }
+
+    fn set_read_deadline(&self, deadline: Option<tokio::time::Instant>) -> io::Result<()> {
+        self.packet_conn.set_read_deadline(deadline)
+    }
+
+    fn set_write_deadline(&self, deadline: Option<tokio::time::Instant>) -> io::Result<()> {
+        self.packet_conn.set_write_deadline(deadline)
+    }
 }
 
 #[async_trait]
@@ -316,5 +328,109 @@ mod tests {
         };
         drop(conn);
         assert_eq!(fired.load(Ordering::SeqCst), 1, "close_func must fire exactly once on drop alone");
+    }
+
+    #[derive(Default)]
+    struct DeadlineRecordingPacketConn {
+        combined: std::sync::Mutex<Vec<Option<tokio::time::Instant>>>,
+        read: std::sync::Mutex<Vec<Option<tokio::time::Instant>>>,
+        write: std::sync::Mutex<Vec<Option<tokio::time::Instant>>>,
+    }
+
+    #[async_trait]
+    impl PacketConn for DeadlineRecordingPacketConn {
+        async fn read_from(&self, _buf: &mut [u8]) -> io::Result<(usize, Box<dyn Addr>)> {
+            Err(io::Error::other("not exercised by this test"))
+        }
+
+        async fn write_to(&self, _buf: &[u8], _addr: &dyn Addr) -> io::Result<usize> {
+            Err(io::Error::other("not exercised by this test"))
+        }
+
+        fn local_addr(&self) -> io::Result<Box<dyn Addr>> {
+            Err(io::Error::other("not exercised by this test"))
+        }
+
+        fn close(&self) -> io::Result<()> {
+            Ok(())
+        }
+
+        fn set_deadline(&self, deadline: Option<tokio::time::Instant>) -> io::Result<()> {
+            self.combined.lock().unwrap_or_else(std::sync::PoisonError::into_inner).push(deadline);
+            Ok(())
+        }
+
+        fn set_read_deadline(&self, deadline: Option<tokio::time::Instant>) -> io::Result<()> {
+            self.read.lock().unwrap_or_else(std::sync::PoisonError::into_inner).push(deadline);
+            Ok(())
+        }
+
+        fn set_write_deadline(&self, deadline: Option<tokio::time::Instant>) -> io::Result<()> {
+            self.write.lock().unwrap_or_else(std::sync::PoisonError::into_inner).push(deadline);
+            Ok(())
+        }
+    }
+
+    #[async_trait]
+    impl WaitReadFrom for DeadlineRecordingPacketConn {
+        async fn wait_read_from(
+            &self,
+        ) -> (Vec<u8>, Option<Box<dyn FnOnce() + Send>>, Option<Box<dyn Addr>>, io::Result<()>) {
+            (Vec::new(), None, None, Err(io::Error::other("not exercised by this test")))
+        }
+    }
+
+    #[async_trait]
+    impl ConstantPacketConn for DeadlineRecordingPacketConn {
+        async fn resolve_udp(&self, _ctx: &CancellationToken, _metadata: &mut Metadata) -> Result<()> {
+            Ok(())
+        }
+    }
+
+    impl Connection for DeadlineRecordingPacketConn {
+        fn chains(&self) -> Chain {
+            Chain::default()
+        }
+
+        fn provider_chains(&self) -> Chain {
+            Chain::default()
+        }
+
+        fn append_to_chains(&self, _adapter: Arc<dyn ProxyAdapter>) {}
+
+        fn remote_destination(&self) -> String {
+            String::new()
+        }
+    }
+
+    /// The loopback detector wraps every packet conn it hands back; a deadline the caller sets on
+    /// that wrapper has to reach the conn underneath, or an idle UDP flow never expires.
+    #[tokio::test]
+    async fn packet_deadlines_reach_the_wrapped_conn() {
+        let recorder = Arc::new(DeadlineRecordingPacketConn::default());
+        let shared = Arc::clone(&recorder);
+        let recorder_conn: Arc<dyn ConstantPacketConn> = shared;
+        let wrapped = new_close_callback_packet_conn(recorder_conn, Box::new(|| {}));
+        let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(60);
+
+        assert!(wrapped.set_deadline(Some(deadline)).is_ok(), "the combined deadline must be accepted");
+        assert!(wrapped.set_read_deadline(Some(deadline)).is_ok(), "the read deadline must be accepted");
+        assert!(wrapped.set_write_deadline(None).is_ok(), "clearing the write deadline must be accepted");
+
+        assert_eq!(
+            *recorder.combined.lock().unwrap_or_else(std::sync::PoisonError::into_inner),
+            vec![Some(deadline)],
+            "the combined deadline did not reach the wrapped conn"
+        );
+        assert_eq!(
+            *recorder.read.lock().unwrap_or_else(std::sync::PoisonError::into_inner),
+            vec![Some(deadline)],
+            "the read deadline did not reach the wrapped conn"
+        );
+        assert_eq!(
+            *recorder.write.lock().unwrap_or_else(std::sync::PoisonError::into_inner),
+            vec![None],
+            "the cleared write deadline did not reach the wrapped conn"
+        );
     }
 }
