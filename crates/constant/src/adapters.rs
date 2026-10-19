@@ -317,6 +317,9 @@ pub trait Proxy: ProxyAdapter {
 
     fn last_delay_for_test_url(&self, url: &str) -> u16;
 
+    // NOT cancel-safe: implementations publish alive/delay state only after their network
+    // operation returns, so a `select!` arm must retain the pinned future and await it again
+    // after cancelling instead of dropping it.
     async fn url_test(&self, ctx: &CancellationToken, url: &str, expected_status: IntRanges<u16>) -> Result<u16>;
 }
 

@@ -232,9 +232,8 @@ impl HealthCheck {
                 debugln!("Health Checking, proxy: {}, url: {url}, id: {{{uid}}}", proxy.name());
                 let test = proxy.url_test(&child, &url, expected_status);
                 tokio::pin!(test);
-                // cancel-safe: the pinned probe future resumes where it left off after the sleep
-                // arm wins, and the timeout arm awaits it instead of dropping it, so the history
-                // publication inside `url_test` still runs.
+                // `url_test` is NOT cancel-safe: it publishes history only after its network call
+                // returns. The pinned future is retained and re-awaited on timeout, never dropped.
                 let finished = tokio::select! {
                     _ = &mut test => true,
                     () = tokio::time::sleep(timeout) => false,
@@ -483,6 +482,8 @@ mod tests {
             0
         }
 
+        // NOT cancel-safe: the completed counter is incremented after the cancellation wait, so
+        // dropping the future early would hide a probe that never finished.
         async fn url_test(
             &self,
             ctx: &CancellationToken,
