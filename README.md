@@ -606,12 +606,13 @@ These are cases where this build intentionally or knowingly differs from the ref
 
 ## Component benchmarks
 
-Eight crate-local [Criterion](https://criterion-rs.github.io/book/) targets exercise production
+Nine crate-local [Criterion](https://criterion-rs.github.io/book/) targets exercise production
 APIs without changing the proxy's public interfaces:
 
 | Target | Workloads |
 | --- | --- |
 | `vless` | IPv4/domain/IPv6/UDP/MUX first-write request framing; established memory-stream writes; Vision padding encode/decode/roundtrip at 64 B, 1 KiB and 16 KiB; VLESS AES-256-GCM and ChaCha20-Poly1305 seal/open/roundtrip |
+| `v4_read` | Snell v4 decode of pre-encoded maximum-length records through the production `AsyncRead` at 1 B, 64 B, 512 B and one-full-record consumer windows; the fixture, salt exchange and AEAD key derivation sit outside the timed region |
 | `domain_match` | DomainSet/DomainMap/DomainTrie lookup over 10,000 generated patterns plus boundary cases; builds at 100/10,000 patterns; IPv4/IPv6 CIDR hit/miss |
 | `fakeip` | In-memory lookup hit and bounded eviction/miss, reverse lookup and existence; the miss workload rotates 8,192 hosts through a 256-entry pool across measurement batches |
 | `rule_match` | Ordered mixed-rule scans with 16/256/1,024 rules, matching first/last or missing; no DNS or network resolution |

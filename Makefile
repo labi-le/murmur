@@ -2,10 +2,10 @@ CARGO ?= cargo
 ACT ?= act
 ACT_BASE_IMAGE ?= rust:latest
 ACT_IMAGE ?= murmur-act-rust
-BENCH_PACKAGES = -p murmur-transport-vless -p murmur-component-trie \
+BENCH_PACKAGES = -p murmur-transport-vless -p murmur-transport-snell -p murmur-component-trie \
 	-p murmur-component-fakeip -p murmur-rules-common -p murmur-common-pool -p murmur-tunnel \
 	-p murmur-rules
-BENCH_TARGETS = --bench vless --bench domain_match --bench fakeip --bench rule_match \
+BENCH_TARGETS = --bench vless --bench v4_read --bench domain_match --bench fakeip --bench rule_match \
 	--bench buffer_pool --bench geodata_bridge --bench udp_path --bench rule_wrapper
 # Prints heap allocations per operation rather than timings, so it is kept out of the Criterion sweep.
 bench-alloc:

@@ -287,7 +287,11 @@ enum ReadStage {
 pub(crate) struct V4Reader {
     aead: Box<dyn Aead>,
     nonce: [u8; V4_NONCE_SIZE],
+    /// The current frame's plaintext, cleared only once `buf_offset` has consumed all of it.
     buf: Vec<u8>,
+    /// Bytes of `buf` already handed to the caller. Advancing this instead of draining the prefix
+    /// keeps a partial read from moving the plaintext the caller has not consumed yet.
+    buf_offset: usize,
     stage: ReadStage,
     header_cipher: Vec<u8>,
     header_filled: usize,
@@ -303,6 +307,7 @@ impl V4Reader {
             aead,
             nonce: [0; V4_NONCE_SIZE],
             buf: Vec::new(),
+            buf_offset: 0,
             stage: ReadStage::Header,
             header_cipher: Vec::new(),
             header_filled: 0,
@@ -320,12 +325,14 @@ impl V4Reader {
         R: AsyncRead + Unpin + ?Sized,
     {
         poll_fn(|cx| {
-            if self.buf.is_empty() && !ready!(self.poll_read_frame(conn, cx))? {
+            if self.buf_offset == self.buf.len() && !ready!(self.poll_read_frame(conn, cx))? {
                 return Poll::Ready(Ok(0));
             }
-            let n = b.len().min(self.buf.len());
-            b[..n].copy_from_slice(&self.buf[..n]);
-            self.buf.drain(..n);
+            let n = b.len().min(self.buf.len() - self.buf_offset);
+            let (_, rest) = self.buf.split_at(self.buf_offset);
+            let (chunk, _) = rest.split_at(n);
+            b[..n].copy_from_slice(chunk);
+            self.buf_offset += n;
             Poll::Ready(Ok(n))
         })
         .await
@@ -335,13 +342,14 @@ impl V4Reader {
     where
         R: AsyncRead + Unpin + ?Sized,
     {
-        if self.buf.is_empty() && !ready!(self.poll_read_frame(conn, cx))? {
+        if self.buf_offset == self.buf.len() && !ready!(self.poll_read_frame(conn, cx))? {
             return Poll::Ready(Ok(()));
         }
-        let n = out.remaining().min(self.buf.len());
-        let (chunk, _) = self.buf.split_at(n);
+        let n = out.remaining().min(self.buf.len() - self.buf_offset);
+        let (_, rest) = self.buf.split_at(self.buf_offset);
+        let (chunk, _) = rest.split_at(n);
         out.put_slice(chunk);
-        self.buf.drain(..n);
+        self.buf_offset += n;
         Poll::Ready(Ok(()))
     }
 
@@ -401,7 +409,10 @@ impl V4Reader {
                         self.aead.open_in_place(&self.nonce, payload_cipher, &[]).map_err(to_io_error)?.len();
                     increment_v4_nonce(&mut self.nonce);
 
+                    // Reached only once the previous record's plaintext is exhausted, so this
+                    // clear neither discards nor shifts bytes the caller has not read.
                     self.buf.clear();
+                    self.buf_offset = 0;
                     let (plaintext, _) = payload_cipher.split_at(payload_len);
                     self.buf.extend_from_slice(plaintext);
                     self.frame_filled = 0;
@@ -1126,6 +1137,34 @@ mod tests {
         let mut expected = vec![0x11u8; FIRST];
         expected.extend_from_slice(&second);
         assert_eq!(decoded, expected, "the abandoned frame must reach the wire before the new write's bytes");
+    }
+
+    /// A consumer with a small window must receive the record in order: the unread tail stays
+    /// where it is instead of being shifted by every partial read, and the next frame is opened
+    /// only after the current record is exhausted.
+    #[tokio::test]
+    async fn test_snell_v4_small_reads_preserve_the_unread_record_tail() {
+        const RECORDS: usize = 3;
+        let payload: Vec<u8> = (0..RECORDS * MAX_LENGTH).map(|i| (i % 251) as u8).collect();
+
+        let mut raw = BufferConn::default();
+        let mut writer = new_v4_writer(b"password").expect("v4 writer");
+        for record in payload.chunks(MAX_LENGTH) {
+            writer.write_frame(&mut raw, record, 0).await.expect("frame");
+        }
+        let data = raw.buf.clone();
+
+        for window in [1usize, 7, 64, 512, 1024, MAX_LENGTH] {
+            let mut conn = new_v4_conn(Box::new(OldConnAsStream(BufferConn::with(&data))), b"password");
+            let mut decoded = Vec::with_capacity(payload.len());
+            let mut buf = vec![0u8; window];
+            while decoded.len() < payload.len() {
+                let want = window.min(payload.len() - decoded.len());
+                conn.read_exact(&mut buf[..want]).await.expect("decode a window");
+                decoded.extend_from_slice(&buf[..want]);
+            }
+            assert_eq!(payload, decoded, "window {window} corrupted the record stream");
+        }
     }
 
     #[tokio::test]

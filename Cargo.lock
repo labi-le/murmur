@@ -5400,6 +5400,7 @@ dependencies = [
  "async-trait",
  "bytes",
  "chacha20poly1305 0.11.0",
+ "criterion",
  "hex",
  "murmur-common-net",
  "murmur-common-pool",
