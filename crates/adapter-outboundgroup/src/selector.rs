@@ -22,11 +22,23 @@ pub struct SelectorOption {
     pub default_selected: String,
 }
 
+/// The last resolved selection, keyed by the member snapshot it came from and the selected name.
+///
+/// Keeping `snapshot` here holds that allocation alive, so a later snapshot cannot be allocated
+/// at the same address and mistaken for this one; `Arc::ptr_eq` is therefore a valid generation
+/// key without a separate counter.
+struct ResolvedSelection {
+    snapshot: Arc<[Arc<dyn Proxy>]>,
+    name: String,
+    proxy: Arc<dyn Proxy>,
+}
+
 pub struct Selector {
     self_weak: Weak<Self>,
     group_base: GroupBase,
     disable_udp: bool,
     selected: Mutex<String>,
+    resolved: Mutex<Option<ResolvedSelection>>,
     test_url: String,
 }
 
@@ -67,6 +79,7 @@ impl Selector {
             group_base,
             disable_udp: option.disable_udp,
             selected: Mutex::new(selector_option.default_selected),
+            resolved: Mutex::new(None),
             test_url: option.url,
         }))
     }
@@ -76,14 +89,30 @@ impl Selector {
     }
 
     fn selected_proxy(&self, touch: bool) -> Arc<dyn Proxy> {
-        let proxies = self.group_base.get_proxies(touch);
+        let proxies = self.group_base.get_proxies_shared(touch);
         let selected = self.selected.lock();
-        for proxy in &proxies {
-            if proxy.name() == *selected {
-                return Arc::clone(proxy);
+        let mut resolved = self.resolved.lock();
+
+        if let Some(entry) = resolved.as_ref() {
+            if entry.name == *selected && Arc::ptr_eq(&entry.snapshot, &proxies) {
+                return Arc::clone(&entry.proxy);
             }
         }
-        proxies.first().map_or_else(|| self.group_base.empty_fallback(), Arc::clone)
+
+        let proxy = proxies
+            .iter()
+            .find(|proxy| proxy.name() == *selected)
+            .map(Arc::clone)
+            .or_else(|| proxies.first().map(Arc::clone))
+            .unwrap_or_else(|| self.group_base.empty_fallback());
+
+        *resolved = Some(ResolvedSelection {
+            snapshot: Arc::clone(&proxies),
+            name: selected.clone(),
+            proxy: Arc::clone(&proxy),
+        });
+
+        proxy
     }
 }
 
@@ -200,7 +229,8 @@ impl ProxyGroup for Selector {
 #[async_trait]
 impl SelectAble for Selector {
     async fn set(&self, name: &str) -> Result<()> {
-        for proxy in self.group_base.get_proxies(false) {
+        let proxies = self.group_base.get_proxies_shared(false);
+        for proxy in proxies.iter() {
             if proxy.name() == name {
                 name.clone_into(&mut self.selected.lock());
                 return Ok(());
