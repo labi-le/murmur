@@ -4514,6 +4514,7 @@ dependencies = [
  "murmur-ntp",
  "murmur-std-compat",
  "murmur-tunnel",
+ "murmur-ws",
  "notify",
  "parking_lot",
  "pprof",
