@@ -1,16 +1,17 @@
-//! Benchmarks for the per-datagram metadata preparation in the UDP connection loop
-//! (`src/tunnel.rs`, around lines 534 to 548).
+//! Benchmarks for the metadata preparation in the UDP connection loop (`handle_udp_conn` in
+//! `src/tunnel.rs`).
 //!
 //! This is NOT an end-to-end measurement of `handle_udp_conn`. That function needs a live socket,
 //! a NAT table and a runtime, so it belongs in an integration test, not in a benchmark. What is
-//! measured here is the allocation behaviour of the individual operations the loop performs on every
-//! datagram, so the cost of the redundant `Metadata` clones can be attributed.
+//! measured here is the allocation behaviour of the individual operations the loop performs, so
+//! the cost of a `Metadata` clone can be attributed.
 //!
-//! One clone happens per datagram today: the NAT cell is built from
-//! `packet_adapter.metadata().clone()` at `src/tunnel.rs:544`, and `pre_handle_metadata` at
-//! `:536` mutates the packet adapter's own metadata in place through `metadata_mut()`, so it
-//! clones nothing. The per-dial `starting_metadata.clone()` at `:594` belongs to
-//! `handle_udp_dial` and runs once per dial, not once per datagram.
+//! On an established NAT key the clone no longer runs: `handle_udp_conn` borrows the key and asks
+//! the table for the stored sender before building the metadata cell, and `udp_hit_path` measures
+//! that path. The clone remains the first-packet cost — the cell the sniffer may mutate and the
+//! dial task consumes — and `pre_handle_metadata` mutates the packet adapter's own metadata in
+//! place through `metadata_mut()`, so it clones nothing. The per-dial
+//! `starting_metadata.clone()` in `handle_udp_dial` runs once per dial, not once per datagram.
 //!
 //! Allocation count per clone: `crates/constant/src/metadata.rs` carries **14** heap-backed
 //! fields, being twelve `String` and two `Option<Vec<String>>`, plus two address arcs that are
@@ -102,8 +103,9 @@ fn metadata_clone(criterion: &mut Criterion) {
     group.finish();
 }
 
-/// The candidate optimisation: today every datagram pays for a clone; hoisting one clone out of
-/// the loop and reusing it pays once. The gap between the two benches is what the fix would save.
+/// The clone-versus-reuse shape: a miss pays for the clone once per flow, while the same clone
+/// reused across datagrams pays once. The gap bounds what a miss-path clone costs; it is not a
+/// candidate saving on the established path, which no longer clones (`udp_hit_path`).
 fn clone_versus_reuse(criterion: &mut Criterion) {
     let metadata = populated_metadata();
     let iterations = u64::try_from(LOOP_ITERATIONS).unwrap_or(1);

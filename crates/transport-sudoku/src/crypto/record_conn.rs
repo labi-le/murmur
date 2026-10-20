@@ -5,7 +5,6 @@ use std::sync::Arc;
 use std::task::{ready, Context, Poll};
 
 use anyhow::{anyhow, Result};
-use bytes::BytesMut;
 use hmac::{Hmac, KeyInit as _, Mac as _};
 use rand::rngs::OsRng;
 use rand::TryRngCore;
@@ -37,6 +36,9 @@ struct RecordKeys {
 ///   - uint16 bodyLen
 ///   - `header[12]` = epoch(uint32 BE) || seq(uint64 BE)  (plaintext)
 ///   - ciphertext = AEAD(header as nonce, plaintext, header as AAD)
+///
+/// `recv_body` is reused across records: it holds the ciphertext while the body is read and the
+/// decrypted plaintext in place afterwards, so a steady read loop allocates no per-record buffer.
 pub struct RecordConn {
     conn: Box<dyn Stream>,
     method: String,
@@ -58,16 +60,17 @@ pub struct RecordConn {
     recv_seq: u64,
     recv_initialized: bool,
 
-    read_buf: BytesMut,
-
     write_frame: Vec<u8>,
     write_frame_sent: usize,
     write_frame_plain_len: usize,
 
+    recv_need_len: bool,
     recv_len_buf: [u8; 2],
     recv_len_filled: usize,
     recv_body: Vec<u8>,
     recv_body_filled: usize,
+    recv_plain_off: usize,
+    recv_plain_end: usize,
 }
 
 impl core::fmt::Debug for RecordConn {
@@ -101,20 +104,31 @@ pub fn new_record_conn(conn: Box<dyn Stream>, method: &str, base_send: &[u8], ba
         recv_epoch: 0,
         recv_seq: 0,
         recv_initialized: false,
-        read_buf: BytesMut::new(),
         write_frame: Vec::new(),
         write_frame_sent: 0,
         write_frame_plain_len: 0,
+        recv_need_len: true,
         recv_len_buf: [0u8; 2],
         recv_len_filled: 0,
         recv_body: Vec::new(),
         recv_body_filled: 0,
+        recv_plain_off: 0,
+        recv_plain_end: 0,
     };
     rc.reset_traffic_state()?;
     Ok(rc)
 }
 
 impl RecordConn {
+    /// Allocated capacity of the reusable receive frame buffer, in bytes.
+    ///
+    /// Bounded by the 65,535-byte protocol maximum; the `recv_alloc` bench reports it separately
+    /// from the allocations made while constructing the connection.
+    #[must_use]
+    pub fn recv_buffer_capacity(&self) -> usize {
+        self.recv_body.capacity()
+    }
+
     pub fn rekey(&mut self, base_send: &[u8], base_recv: &[u8]) -> Result<()> {
         if self.method != "none" {
             validate_base_key(base_send).map_err(|err| anyhow!("invalid send base key: {err}"))?;
@@ -123,7 +137,6 @@ impl RecordConn {
 
         self.keys = RecordKeys { base_send: clone_bytes(base_send), base_recv: clone_bytes(base_recv) };
         self.reset_traffic_state()?;
-        self.read_buf.clear();
         self.reset_recv_frame();
 
         self.send_aead = None;
@@ -147,9 +160,12 @@ impl RecordConn {
     }
 
     fn reset_recv_frame(&mut self) {
+        self.recv_need_len = true;
         self.recv_len_filled = 0;
         self.recv_body.clear();
         self.recv_body_filled = 0;
+        self.recv_plain_off = 0;
+        self.recv_plain_end = 0;
     }
 
     fn new_aead_for(&self, base: &[u8], epoch: u32) -> Result<Option<Arc<dyn Aead>>> {
@@ -382,16 +398,7 @@ impl AsyncRead for RecordConn {
             return Pin::new(&mut this.conn).poll_read(cx, buf);
         }
 
-        if !this.read_buf.is_empty() {
-            let n = std::cmp::min(buf.remaining(), this.read_buf.len());
-            if n == 0 {
-                return Poll::Ready(Ok(()));
-            }
-            buf.put_slice(&this.read_buf.split_to(n));
-            return Poll::Ready(Ok(()));
-        }
-
-        if this.recv_body.is_empty() {
+        if this.recv_need_len {
             match poll_read_exact(&mut this.conn, cx, &mut this.recv_len_buf, &mut this.recv_len_filled) {
                 Poll::Ready(Ok(true)) => {
                     let body_len = u16::from_be_bytes(this.recv_len_buf) as usize;
@@ -402,8 +409,15 @@ impl AsyncRead for RecordConn {
                     if body_len > MAX_FRAME_BODY_SIZE {
                         return Poll::Ready(Err(io::Error::other("frame too large")));
                     }
-                    this.recv_body = vec![0u8; body_len];
+                    if this.recv_body.capacity() < body_len {
+                        this.recv_body.clear();
+                        this.recv_body.reserve_exact(body_len);
+                    }
+                    this.recv_body.resize(body_len, 0);
                     this.recv_body_filled = 0;
+                    this.recv_plain_off = RECORD_HEADER_SIZE;
+                    this.recv_plain_end = RECORD_HEADER_SIZE;
+                    this.recv_need_len = false;
                 }
                 Poll::Ready(Ok(false)) => return Poll::Ready(Ok(())),
                 Poll::Ready(Err(err)) => return Poll::Ready(Err(err)),
@@ -411,55 +425,74 @@ impl AsyncRead for RecordConn {
             }
         }
 
-        match poll_read_exact(&mut this.conn, cx, &mut this.recv_body, &mut this.recv_body_filled) {
-            Poll::Ready(Ok(true)) => {}
-            Poll::Ready(Ok(false)) => return Poll::Ready(Ok(())),
-            Poll::Ready(Err(err)) => return Poll::Ready(Err(err)),
-            Poll::Pending => return Poll::Pending,
-        }
+        if this.recv_body_filled < this.recv_body.len() {
+            match poll_read_exact(&mut this.conn, cx, &mut this.recv_body, &mut this.recv_body_filled) {
+                Poll::Ready(Ok(true)) => {}
+                Poll::Ready(Ok(false)) => return Poll::Ready(Ok(())),
+                Poll::Ready(Err(err)) => return Poll::Ready(Err(err)),
+                Poll::Pending => return Poll::Pending,
+            }
 
-        let mut body = std::mem::take(&mut this.recv_body);
-        this.recv_body_filled = 0;
-        let mut header = [0u8; RECORD_HEADER_SIZE];
-        let (header_bytes, payload) = body.split_at_mut(RECORD_HEADER_SIZE);
-        header.copy_from_slice(header_bytes);
+            let mut header = [0u8; RECORD_HEADER_SIZE];
+            let (header_bytes, _) = this.recv_body.split_at(RECORD_HEADER_SIZE);
+            header.copy_from_slice(header_bytes);
 
-        let epoch = u32::from_be_bytes([header[0], header[1], header[2], header[3]]);
-        let seq = u64::from_be_bytes([
-            header[4], header[5], header[6], header[7], header[8], header[9], header[10], header[11],
-        ]);
+            let epoch = u32::from_be_bytes([header[0], header[1], header[2], header[3]]);
+            let seq = u64::from_be_bytes([
+                header[4], header[5], header[6], header[7], header[8], header[9], header[10], header[11],
+            ]);
 
-        if let Err(err) = this.validate_recv_position(epoch, seq) {
-            return Poll::Ready(Err(io::Error::other(err)));
-        }
+            if let Err(err) = this.validate_recv_position(epoch, seq) {
+                this.reset_recv_frame();
+                return Poll::Ready(Err(io::Error::other(err)));
+            }
 
-        if this.recv_aead.is_none() || this.recv_aead_epoch != epoch {
-            match this.new_aead_for(&this.keys.base_recv, epoch) {
-                Ok(aead) => {
-                    this.recv_aead = aead;
-                    this.recv_aead_epoch = epoch;
+            if this.recv_aead.is_none() || this.recv_aead_epoch != epoch {
+                match this.new_aead_for(&this.keys.base_recv, epoch) {
+                    Ok(aead) => {
+                        this.recv_aead = aead;
+                        this.recv_aead_epoch = epoch;
+                    }
+                    Err(err) => {
+                        this.reset_recv_frame();
+                        return Poll::Ready(Err(io::Error::other(err)));
+                    }
                 }
-                Err(err) => return Poll::Ready(Err(io::Error::other(err))),
+            }
+            let Some(aead) = this.recv_aead.clone() else {
+                this.reset_recv_frame();
+                return Poll::Ready(Err(io::Error::other("recv aead unavailable")));
+            };
+
+            let plain_len = {
+                let (_, payload) = this.recv_body.split_at_mut(RECORD_HEADER_SIZE);
+                match aead.open_in_place(&header, payload, &header) {
+                    Ok(plaintext) => plaintext.len(),
+                    Err(err) => {
+                        this.reset_recv_frame();
+                        return Poll::Ready(Err(io::Error::other(anyhow!(
+                            "decryption failed: epoch={epoch} seq={seq}: {err}"
+                        ))));
+                    }
+                }
+            };
+            this.mark_recv_position(epoch, seq);
+            this.recv_plain_end = RECORD_HEADER_SIZE + plain_len;
+            if this.recv_plain_off == this.recv_plain_end {
+                this.recv_need_len = true;
             }
         }
-        let Some(aead) = this.recv_aead.clone() else {
-            return Poll::Ready(Err(io::Error::other("recv aead unavailable")));
-        };
 
-        let plaintext = match aead.open_in_place(&header, payload, &header) {
-            Ok(plaintext) => plaintext,
-            Err(err) => {
-                return Poll::Ready(Err(io::Error::other(anyhow!(
-                    "decryption failed: epoch={epoch} seq={seq}: {err}"
-                ))));
-            }
-        };
-        this.mark_recv_position(epoch, seq);
-
-        this.read_buf.extend_from_slice(plaintext);
-        let n = std::cmp::min(buf.remaining(), this.read_buf.len());
-        if n > 0 {
-            buf.put_slice(&this.read_buf.split_to(n));
+        let n = std::cmp::min(buf.remaining(), this.recv_plain_end - this.recv_plain_off);
+        if n == 0 {
+            return Poll::Ready(Ok(()));
+        }
+        let (_, pending) = this.recv_body.split_at(this.recv_plain_off);
+        let (chunk, _) = pending.split_at(n);
+        buf.put_slice(chunk);
+        this.recv_plain_off += n;
+        if this.recv_plain_off == this.recv_plain_end {
+            this.recv_need_len = true;
         }
         Poll::Ready(Ok(()))
     }
@@ -626,5 +659,232 @@ mod tests {
         let mut got = vec![0u8; want.len()];
         reader.read_exact(&mut got).await.expect("read");
         assert_eq!(got, want.to_vec(), "plaintext mismatch");
+    }
+
+    #[tokio::test]
+    async fn record_conn_reads_consecutive_records_of_different_sizes_through_one_buffer() {
+        let psk_send = Sha256::digest(b"record-send");
+        let psk_recv = Sha256::digest(b"record-recv");
+
+        let raw = Arc::new(CaptureConn::new());
+        let mut writer =
+            new_record_conn(Box::new((*raw).clone()), "chacha20-poly1305", &psk_send, &psk_recv).expect("new writer");
+
+        let payloads = [b"short".to_vec(), vec![0x5a; 1600], b"end".to_vec()];
+        for payload in &payloads {
+            writer.write_all(payload).await.expect("write");
+        }
+        let wire = raw.buf.lock().clone();
+        let mut reader = new_record_conn(Box::new(ReplayConn::new(wire)), "chacha20-poly1305", &psk_recv, &psk_send)
+            .expect("new reader");
+
+        let mut got = Vec::new();
+        let mut scratch = [0u8; 7];
+        loop {
+            let n = reader.read(&mut scratch).await.expect("read");
+            if n == 0 {
+                break;
+            }
+            got.extend_from_slice(&scratch[..n]);
+        }
+        assert_eq!(got, payloads.concat(), "records must survive the shared receive buffer");
+    }
+
+    /// Delivers one byte per poll and forces a `Pending` between polls, so the frame header and
+    /// body are completed across several `poll_read` calls.
+    struct TrickleConn {
+        reader: io::Cursor<Vec<u8>>,
+        yield_next: bool,
+    }
+
+    impl TrickleConn {
+        fn new(data: Vec<u8>) -> Self {
+            Self { reader: io::Cursor::new(data), yield_next: false }
+        }
+    }
+
+    impl AsyncRead for TrickleConn {
+        fn poll_read(self: Pin<&mut Self>, cx: &mut Context<'_>, buf: &mut ReadBuf<'_>) -> Poll<io::Result<()>> {
+            let this = self.get_mut();
+            if this.yield_next {
+                this.yield_next = false;
+                cx.waker().wake_by_ref();
+                return Poll::Pending;
+            }
+            if buf.remaining() == 0 {
+                return Poll::Ready(Ok(()));
+            }
+            let mut one = [0u8; 1];
+            let n = io::Read::read(&mut this.reader, &mut one)?;
+            buf.put_slice(&one[..n]);
+            this.yield_next = n > 0;
+            Poll::Ready(Ok(()))
+        }
+    }
+
+    impl AsyncWrite for TrickleConn {
+        fn poll_write(self: Pin<&mut Self>, _cx: &mut Context<'_>, buf: &[u8]) -> Poll<io::Result<usize>> {
+            Poll::Ready(Ok(buf.len()))
+        }
+
+        fn poll_flush(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+            Poll::Ready(Ok(()))
+        }
+
+        fn poll_shutdown(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+            Poll::Ready(Ok(()))
+        }
+    }
+
+    impl Stream for TrickleConn {
+        fn local_addr(&self) -> io::Result<SocketAddr> {
+            Ok(test_addr())
+        }
+
+        fn peer_addr(&self) -> io::Result<SocketAddr> {
+            Ok(test_addr())
+        }
+    }
+
+    async fn record_receive_fixture(payloads: &[Vec<u8>]) -> (Vec<u8>, Vec<u8>) {
+        let psk_send = Sha256::digest(b"record-send");
+        let psk_recv = Sha256::digest(b"record-recv");
+        let raw = Arc::new(CaptureConn::new());
+        let mut writer =
+            new_record_conn(Box::new((*raw).clone()), "chacha20-poly1305", &psk_send, &psk_recv).expect("new writer");
+        for payload in payloads {
+            writer.write_all(payload).await.expect("write");
+        }
+        let wire = raw.buf.lock().clone();
+        (wire, psk_send.to_vec())
+    }
+
+    #[tokio::test]
+    async fn record_conn_reuses_the_receive_buffer_instead_of_reallocating() {
+        let payloads: Vec<Vec<u8>> =
+            (0..12).map(|i| if i % 2 == 0 { vec![0x11; 1_024] } else { vec![0x22; 16 * 1_024] }).collect();
+        let (wire, psk_send) = record_receive_fixture(&payloads).await;
+        let psk_recv = Sha256::digest(b"record-recv");
+        let mut reader = new_record_conn(Box::new(ReplayConn::new(wire)), "chacha20-poly1305", &psk_recv, &psk_send)
+            .expect("new reader");
+
+        let mut settled_capacity = 0usize;
+        for (index, payload) in payloads.iter().enumerate() {
+            let mut got = vec![0u8; payload.len()];
+            reader.read_exact(&mut got).await.expect("read");
+            assert_eq!(&got, payload, "payload {index} mismatch");
+            if index == 1 {
+                settled_capacity = reader.recv_body.capacity();
+                assert!(
+                    settled_capacity >= 16 * 1_024 + RECORD_HEADER_SIZE + 16,
+                    "receive buffer must cover the largest body, got {settled_capacity}"
+                );
+            } else if index > 1 {
+                assert_eq!(
+                    reader.recv_body.capacity(),
+                    settled_capacity,
+                    "alternating frame sizes must not grow the receive buffer after record {index}"
+                );
+            }
+        }
+        assert!(
+            reader.recv_body.capacity() <= MAX_FRAME_BODY_SIZE,
+            "retained receive capacity must stay within one protocol maximum"
+        );
+    }
+
+    #[tokio::test]
+    async fn record_conn_caps_retained_capacity_at_one_protocol_maximum() {
+        let max_plain = MAX_FRAME_BODY_SIZE - RECORD_HEADER_SIZE - 16;
+        let payloads = vec![vec![0x51; 40 * 1_024], vec![0x52; 50 * 1_024], vec![0x53; max_plain]];
+        let (wire, psk_send) = record_receive_fixture(&payloads).await;
+        let psk_recv = Sha256::digest(b"record-recv");
+        let mut reader = new_record_conn(Box::new(ReplayConn::new(wire)), "chacha20-poly1305", &psk_recv, &psk_send)
+            .expect("new reader");
+
+        for payload in &payloads {
+            let mut got = vec![0u8; payload.len()];
+            reader.read_exact(&mut got).await.expect("read");
+            assert_eq!(&got, payload, "payload of {} bytes mismatch", payload.len());
+            assert!(
+                reader.recv_body.capacity() <= MAX_FRAME_BODY_SIZE,
+                "retained capacity {} exceeded the protocol maximum after a {} byte plaintext",
+                reader.recv_body.capacity(),
+                payload.len()
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn record_conn_decodes_a_frame_whose_header_and_body_arrive_in_segments() {
+        let payloads = vec![vec![0x3c; 37], vec![0x4d; 1_500]];
+        let (wire, psk_send) = record_receive_fixture(&payloads).await;
+        let psk_recv = Sha256::digest(b"record-recv");
+        let mut reader = new_record_conn(Box::new(TrickleConn::new(wire)), "chacha20-poly1305", &psk_recv, &psk_send)
+            .expect("new reader");
+
+        for (index, payload) in payloads.iter().enumerate() {
+            let mut got = vec![0u8; payload.len()];
+            reader.read_exact(&mut got).await.expect("segmented read");
+            assert_eq!(&got, payload, "segmented payload {index} mismatch");
+        }
+    }
+
+    #[tokio::test]
+    async fn record_conn_rejects_a_tampered_tag_and_resumes_at_the_next_record() {
+        let first = b"authenticated record".to_vec();
+        let second = b"record after the failure".to_vec();
+        let (mut wire, psk_send) = record_receive_fixture(&[first.clone(), second.clone()]).await;
+        let body_len = u16::from_be_bytes([wire[0], wire[1]]) as usize;
+        let tag_byte = 2 + body_len - 1;
+        wire[tag_byte] ^= 0xff;
+
+        let psk_recv = Sha256::digest(b"record-recv");
+        let mut reader = new_record_conn(Box::new(ReplayConn::new(wire)), "chacha20-poly1305", &psk_recv, &psk_send)
+            .expect("new reader");
+
+        let mut rejected = vec![0u8; first.len()];
+        let err = reader.read_exact(&mut rejected).await.expect_err("tampered tag must fail");
+        assert!(err.to_string().contains("decryption failed"), "unexpected error: {err}");
+
+        let mut got = vec![0u8; second.len()];
+        reader.read_exact(&mut got).await.expect("next record after a tag failure");
+        assert_eq!(got, second, "receive state must be reset to the next frame boundary");
+    }
+
+    #[tokio::test]
+    async fn record_conn_decodes_across_an_epoch_transition() {
+        let psk_send = Sha256::digest(b"record-send");
+        let psk_recv = Sha256::digest(b"record-recv");
+        let raw = Arc::new(CaptureConn::new());
+        let mut writer =
+            new_record_conn(Box::new((*raw).clone()), "chacha20-poly1305", &psk_send, &psk_recv).expect("new writer");
+
+        let first = b"epoch one".to_vec();
+        let second = b"epoch two".to_vec();
+        writer.write_all(&first).await.expect("write first");
+        writer.send_epoch = writer.send_epoch.wrapping_add(1);
+        writer.send_seq = 7;
+        writer.write_all(&second).await.expect("write second");
+
+        let mut reader = new_record_conn(
+            Box::new(ReplayConn::new(raw.buf.lock().clone())),
+            "chacha20-poly1305",
+            &psk_recv,
+            &psk_send,
+        )
+        .expect("new reader");
+        let mut got = vec![0u8; first.len() + second.len()];
+        reader.read_exact(&mut got).await.expect("read across epochs");
+        assert_eq!(got, [first, second].concat(), "epoch transition must keep the plaintext stream intact");
+    }
+
+    #[tokio::test]
+    async fn record_conn_method_none_is_a_passthrough() {
+        let raw = b"plain sudoku payload".to_vec();
+        let mut reader = new_record_conn(Box::new(ReplayConn::new(raw.clone())), "none", &[], &[]).expect("new reader");
+        let mut got = vec![0u8; raw.len()];
+        reader.read_exact(&mut got).await.expect("passthrough read");
+        assert_eq!(got, raw, "method none must not frame or decrypt");
     }
 }

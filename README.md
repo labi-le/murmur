@@ -119,7 +119,12 @@ Health checks send HEAD requests to the configured origin, with an origin-form
 path/query and a `Host` header carrying its authority, including a nondefault
 port or bracketed IPv6 literal. An HTTP response outside `expected-status` can
 still produce a measured delay, but its per-URL health state is unhealthy; use
-that state rather than a nonzero delay alone to validate node availability.
+that state rather than a nonzero delay alone to validate node availability. At
+the configured test timeout the probe is asked to cancel; the check awaits its
+completion so the failed measurement is published instead of leaving the node's
+previous state in place. Adapters that do not observe the cancellation token can
+delay that publication past the deadline. The timeout watch is owned by the probe
+and is retired as soon as the probe finishes.
 
 File-provider watchers schedule updates on their owning Tokio runtime, not on
 notify's OS thread. They watch the provider's parent directory and filter by
@@ -379,7 +384,7 @@ trips over those four dialers (TLS 1.3 and TLS 1.2 each), including a camouflage
 the client's byte stream as TLS records and requires the ClientHello's SNI to match the configured
 name. The TLS 1.3 master-secret salt defect that made the engine's TLS 1.3 records undecryptable was
 fixed — RFC 8446 §7.1 derives the master secret from the *handshake* secret's `derived` value —
-leaving `murmur-restls` at 59 lib tests plus its interop tests green. The superseded
+leaving `murmur-restls` at 66 lib tests plus its interop tests green. The superseded
 `trojan::restls_stream_tests` module was deleted.
 
 Mieru is implemented: `crates/mieru` (the chacha20poly1305-authenticated multiplexed TCP/UDP engine)
@@ -615,16 +620,19 @@ APIs without changing the proxy's public interfaces:
 | `v4_read` | Snell v4 decode of pre-encoded maximum-length records through the production `AsyncRead` at 1 B, 64 B, 512 B and one-full-record consumer windows; the fixture, salt exchange and AEAD key derivation sit outside the timed region |
 | `domain_match` | DomainSet/DomainMap/DomainTrie lookup over 10,000 generated patterns plus boundary cases; builds at 100/10,000 patterns; IPv4/IPv6 CIDR hit/miss |
 | `fakeip` | In-memory lookup hit and bounded eviction/miss, reverse lookup and existence; the miss workload rotates 8,192 hosts through a 256-entry pool across measurement batches |
-| `rule_match` | Ordered mixed-rule scans with 16/256/1,024 rules, matching first/last or missing; no DNS or network resolution |
+| `rule_match` | Ordered mixed-rule scans with 16/256/1,024 rules, matching first/last or missing; no DNS or network resolution. Also the `DomainKeyword` needle-search A/B: `str::contains` against the rule's cached `memchr::memmem::Finder` over 14/64/253-byte hosts, empty/one-byte/ASCII/non-ASCII needles, early/late/miss/shared-prefix cases, and keyword chains of 0/1/16/51/256 rules |
 | `buffer_pool` | Buffer get/put, fill, and cold allocation/free at 64 B through 128 KiB, including an unpooled size above the 64 KiB ceiling; BytesMut recycling |
 | `rule_wrapper` | A bare rule chain against the same chain inside the production `RuleWrapper`, at 16/256/1,024 rules, on a full-chain miss and on a steady all-hit streak. The miss case pays a clock reading per rule because the streak gate is cold; the hit case pays it once per 256 matches |
 | `udp_path` | The per-datagram metadata path the UDP entry point walks |
 
-Three further targets are not Criterion and are not part of `make bench`:
+Five further targets are not Criterion and are not part of `make bench`:
 
 | Target | Output |
 | --- | --- |
 | `alloc_census` (`make bench-alloc`) | Heap allocations per operation from `dhat` as the global allocator: `Metadata::clone`, `DomainSet::has` and `DomainMap::lookup` in ASCII and upper-case, and rule-chain scans at 16/256/1,024 rules on a first-rule hit and a full-chain miss. Prints the measured figure beside the hand count for `Metadata::clone` so a disagreement between arithmetic and measurement is visible |
+| `recv_alloc` (`cargo bench -p murmur-transport-sudoku --bench recv_alloc`) | The same `dhat` accounting for the sudoku receive paths, `RecordConn` and `AEADConn`: heap blocks and bytes per decrypted frame, plus the exact receive-buffer capacity reported by the connection after a warm-up frame, at 1 KiB and 16 KiB stable and alternating sizes and at the 65,507 B protocol maximum. Both readers keep one frame buffer per connection and decrypt in place, so after one warm-up frame the measured loop must report zero blocks and the buffer capacity must stay within one protocol maximum |
+| `udp_hit_path` (`make bench-alloc`) | Heap allocations per datagram on an established NAT key, before and after the borrowed-key fast path: the key clone, `Metadata` clone, metadata-cell `Arc`, maker box and `get_or_create` key copy against `key_ref` + `NatTable::get` + the packet `Arc`. This is the modeled subset; `metadata_clone` calibrates the clone against its hand count |
+| `udp_dispatch` (`make bench-alloc`) | The real `handle_udp_conn` called once per datum, with fixture construction outside the window: established hits against an installed key, misses through the real `get_or_create`/maker path, both with sniffing off and with a QUIC dispatcher installed. Reports `dhat` blocks and wall-clock nanoseconds per dispatch, so the miss-side cost of the added lookup is visible; the failed dial is drained outside the miss window |
 | `dialer_alloc_census` | The same shape for the dialer and resolver: option application, the address helpers each attempt runs, the hosts-table search each lookup starts with, and the literal-IP short circuit. Every connect path is reported as unmeasured, because each ends in a real connect; the upstream DNS leg is reported as unmeasured too, because a bench can only supply a trait stub whose own allocations would be inside every figure |
 | the metrics pair | Documented under [Measurement](measurement) |
 | `unsafe_removal_parity` | The descriptor open and close the `anet` ioctl paths perform today, as the cost a socket2 replacement would carry: TCP stream, datagram and raw netlink opens, an owned-descriptor close, an open-then-close pair, and bind-plus-listen for scale. The current implementations cannot appear in the bench at all, because the workspace denies unsafe code and a benchmark target inherits that lint, so every figure is a socket2 formulation; the two TCP fastopen option sites are reported as not removable rather than given a fabricated ratio |
@@ -659,7 +667,10 @@ VLESS/Vision cases include the memory transport and per-iteration connection/buf
 they are not isolated codec instruction timings.
 The rule suite includes both the original empty-helper groups and
 `rule_chain_populated/{16,256,1024}/{first,last,miss}` with populated cached-resolution hooks.
-The suite currently declares **49 `bench_function` sites** across the eight Criterion targets; several
+`domain_keyword/*` and `domain_keyword_chain/*` compare the pre-change `str::contains` needle
+search with the cached `memchr::memmem::Finder` in one process, so their point estimates are a
+direct implementation delta rather than a cross-run comparison. The suite currently declares
+**53 `bench_function` sites** across the eight Criterion targets; several
 sit inside loops, so the number of workloads Criterion actually runs is higher than that. The
 populated groups still exclude DNS and OS process I/O.
 
@@ -681,14 +692,15 @@ Criterion point estimates (not deployment guarantees):
 
 ### Additional measurement suite
 
-`tools/bench_metrics.py` runs 19 isolated workloads through two optimized, `harness = false`
+`tools/bench_metrics.py` runs 30 isolated workloads through two optimized, `harness = false`
 targets: `metrics_cpu` uses the normal allocator, while `metrics_heap` installs
 [dhat](https://docs.rs/dhat/latest/dhat/) only in that benchmark executable. These two targets
 are built by `make bench-metrics`, not by `make bench` or `make bench-smoke`; the Criterion
 target list in `Makefile` deliberately omits them because this runner needs to harvest
 executable paths itself and to keep the `dhat` allocator confined to `metrics_heap`. Production
 binaries and Criterion targets do not use its allocator. The suite covers VLESS first/established
-writes, fresh Vision encode/decode, AEAD, domain/IP lookup, fake-IP hit/eviction, rule scans and
+writes, fresh Vision encode/decode, AEAD, domain/IP lookup, fake-IP forward hits, reverse hits and
+eviction at 256- and 1,000-entry capacities in lowercase and mixed-case forms, rule scans and
 buffer reuse, plus a zero-work control and a separately named stateful pipe diagnostic.
 `rule_chain_256_miss_populated` complements the original empty-helper miss without changing it.
 
@@ -1219,6 +1231,42 @@ by the unit test suite.
   `crates/hub/src/route/server.rs` now keeps the accept loop's `JoinHandle`, aborts and awaits it,
   and drops the listener before rebinding. Verified live: after SIGHUP the API answers again on the
   same port, the mixed proxy relays, zero error lines, and the re-listen line is logged.
+
+- **A quiet `/logs` stream kept its subscription after the client left.** Closed. `get_logs`
+  waited only on the event channel, so a client that disconnected while no record met `?level=`
+  was noticed on the next qualifying write, if ever; the handler also ran detached from the
+  connection, and the websocket sink never read, so an idle peer's close was invisible.
+  `crates/hub/src/route/server.rs` now selects the sink's closure against the channel and releases
+  through a guard that also covers an aborted or panicking task; `crates/hub/src/route/common.rs`
+  watches the HTTP body receiver and the upgraded websocket's control frames (ping answered, valid
+  close echoed, invalid close answered with a 1002 protocol error, data discarded). `/traffic`,
+  `/memory` and `/connections` select the same closure against their ticker, and every websocket
+  write shares the writer mutex with the close path: the close sets a flag before it writes, so no
+  data frame can follow the close frame even if the ticker fires in between. A close also cancels
+  the stream before it waits for that mutex, so a handler blocked on a peer that stopped reading
+  still releases its subscription; that in-flight write is abandoned and marks the stream poisoned
+  while the writer guard is still held, so a concurrent close or pong cannot acquire the mutex and
+  write onto the partial frame; the connection is dropped rather than reused or followed by a close
+  frame. A control frame (pong, close echo) bounds its lock acquisition and write, and its own
+  timeout sets the poison before releasing the guard, so a ping that cannot be answered does not
+  hide the close that follows it. Tests:
+  `a_closed_logs_stream_releases_its_subscription_without_a_qualifying_record`,
+  `a_websocket_logs_client_is_answered_and_released_on_close`,
+  `an_invalid_close_payload_is_answered_with_a_protocol_error`,
+  `an_empty_close_payload_is_echoed`,
+  `a_close_frame_stops_the_traffic_stream_before_its_next_frame`,
+  `a_close_frame_stops_an_hour_interval_connection_stream`,
+  `a_close_frame_releases_a_log_subscription_blocked_on_backpressure` and
+  `a_ping_before_close_releases_a_log_subscription_blocked_on_backpressure`; all but the
+  empty-close case fail on the previous form. A loopback `level=error` probe opened and closed
+  1,000 plain HTTP streams and 1,000 websocket streams with no qualifying record: the process held
+  11 descriptors and no `CLOSE_WAIT` sockets before, between and after the churn, against 112
+  descriptors and 101 `CLOSE_WAIT` sockets for 100 websocket disconnects with only the old
+  receive loop restored. A second probe sent a close frame to `/traffic`, `/memory`,
+  `/logs?level=error` and
+  `/connections?interval=3600000` and read only the echoed close followed by EOF; payloads
+  `78`, `03ed` and `03e8ff` drew `03ea`, and an empty close was echoed empty
+  ([#192](https://github.com/labi-le/murmur/issues/192)).
 
 ## Licence
 

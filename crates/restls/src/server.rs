@@ -933,6 +933,9 @@ struct RestlsConn {
     parrot_gcm: bool,
 
     read_buf: Vec<u8>,
+    /// Delivery cursor into `read_buf`: bytes below it have already been handed to the caller.
+    /// Small reads advance this instead of draining (and shifting) the unread suffix.
+    read_offset: usize,
     pending_raw: Vec<u8>,
 
     write_buf: Vec<u8>,
@@ -980,6 +983,7 @@ impl RestlsConn {
             is_tls12_gcm,
             parrot_gcm,
             read_buf: Vec::new(),
+            read_offset: 0,
             pending_raw,
             write_buf: Vec::new(),
             write_pos: 0,
@@ -1208,6 +1212,38 @@ impl RestlsConn {
     }
 }
 
+impl RestlsConn {
+    fn deliver_read_buf(&mut self, buf: &mut ReadBuf<'_>) {
+        let unread = self.read_buf.len().saturating_sub(self.read_offset);
+        let n = unread.min(buf.remaining());
+        let end = self.read_offset + n;
+        if let Some(bytes) = self.read_buf.get(self.read_offset..end) {
+            buf.put_slice(bytes);
+        }
+        self.read_offset = end;
+        if self.read_offset >= self.read_buf.len() {
+            self.read_buf.clear();
+            self.read_offset = 0;
+        }
+    }
+
+    /// Drops already-delivered bytes before another payload is appended. The read loop always
+    /// drains `read_buf` before decoding the next record or moving `pending_read_payload`, so
+    /// this normally finds no prefix; it keeps the cursor a plain offset if a future caller
+    /// appends while a payload is partly consumed.
+    fn compact_read_buf(&mut self) {
+        if self.read_offset == 0 {
+            return;
+        }
+        if self.read_offset >= self.read_buf.len() {
+            self.read_buf.clear();
+        } else {
+            self.read_buf.drain(..self.read_offset);
+        }
+        self.read_offset = 0;
+    }
+}
+
 impl AsyncRead for RestlsConn {
     fn poll_read(self: Pin<&mut Self>, cx: &mut Context<'_>, buf: &mut ReadBuf<'_>) -> Poll<io::Result<()>> {
         let this = self.get_mut();
@@ -1220,10 +1256,8 @@ impl AsyncRead for RestlsConn {
             Poll::Pending => return Poll::Pending,
         }
         loop {
-            if !this.read_buf.is_empty() {
-                let n = this.read_buf.len().min(buf.remaining());
-                buf.put_slice(this.read_buf.get(..n).unwrap_or_default());
-                this.read_buf.drain(..n);
+            if this.read_offset < this.read_buf.len() {
+                this.deliver_read_buf(buf);
                 return Poll::Ready(Ok(()));
             }
 
@@ -1236,6 +1270,7 @@ impl AsyncRead for RestlsConn {
             }
 
             if !this.pending_read_payload.is_empty() {
+                this.compact_read_buf();
                 this.read_buf.append(&mut this.pending_read_payload);
                 continue;
             }
@@ -1249,6 +1284,7 @@ impl AsyncRead for RestlsConn {
                             continue;
                         }
                     }
+                    this.compact_read_buf();
                     this.read_buf.extend_from_slice(&data);
                 }
                 Poll::Ready(Ok(None)) => return Poll::Ready(Ok(())),
@@ -1619,6 +1655,24 @@ mod tests {
             [9; 32],
             None,
             crate::script::parse_record_script(script).unwrap(),
+            15,
+            false,
+            false,
+            Vec::new(),
+            0,
+        );
+        (conn, peer)
+    }
+
+    /// A connection whose peer can queue a whole record before the read side is polled.
+    fn delivery_connection() -> (RestlsConn, tokio::io::DuplexStream) {
+        let (inner, peer) = tokio::io::duplex(16 * 1024);
+        let conn = RestlsConn::new(
+            SharedConn::from_boxed(Box::new(TinySocket(inner))),
+            [7; 32],
+            [9; 32],
+            None,
+            Vec::new(),
             15,
             false,
             false,
@@ -2366,5 +2420,86 @@ mod tests {
         drop(disguise);
         drop(client);
         assert!(timeout(Duration::from_secs(2), server).await.unwrap().unwrap().is_err());
+    }
+
+    /// Small caller reads must deliver each record's payload exactly once, in order, with the
+    /// next record starting at its own payload.
+    #[tokio::test]
+    async fn small_reads_deliver_records_in_order() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        for chunk in [1usize, 64, 1024] {
+            let first: Vec<u8> = (0..4 * 1024).map(|i| (i % 251) as u8).collect();
+            let second: Vec<u8> = (0..3 * 1024).map(|i| (i % 239) as u8).collect();
+            let (mut conn, mut peer) = delivery_connection();
+            peer.write_all(&framing::write_record(
+                &[7; 32],
+                &[9; 32],
+                false,
+                0,
+                None,
+                &first,
+                first.len(),
+                Command::Noop,
+            ))
+            .await
+            .unwrap();
+            peer.write_all(&framing::write_record(
+                &[7; 32],
+                &[9; 32],
+                false,
+                1,
+                None,
+                &second,
+                second.len(),
+                Command::Noop,
+            ))
+            .await
+            .unwrap();
+
+            let mut out = vec![0u8; chunk];
+            let mut got = Vec::with_capacity(first.len() + second.len());
+            while got.len() < first.len() + second.len() {
+                let n = conn.read(&mut out).await.expect("small read must deliver payload");
+                assert!(n > 0, "delivery stalled at {} bytes with chunk {chunk}", got.len());
+                got.extend_from_slice(&out[..n]);
+            }
+            let mut expected = first;
+            expected.extend_from_slice(&second);
+            assert_eq!(got, expected, "chunk size {chunk}");
+        }
+    }
+
+    /// The record MAC is checked before anything is queued for delivery: a corrupted record is
+    /// an error, never plaintext.
+    #[tokio::test]
+    async fn a_record_with_a_bad_mac_delivers_no_plaintext() {
+        use tokio::io::AsyncWriteExt;
+
+        let (mut conn, mut peer) = delivery_connection();
+        let mut record = framing::write_record(&[7; 32], &[9; 32], false, 0, None, b"authentic", 9, Command::Noop);
+        if let Some(last) = record.last_mut() {
+            *last ^= 1;
+        }
+        peer.write_all(&record).await.unwrap();
+
+        let mut out = [0u8; 32];
+        let mut read_buf = ReadBuf::new(&mut out);
+        let result = std::future::poll_fn(|cx| Pin::new(&mut conn).poll_read(cx, &mut read_buf)).await;
+        let err = result.expect_err("a corrupted record must fail the read");
+        assert_eq!(err.kind(), io::ErrorKind::InvalidData);
+        assert!(read_buf.filled().is_empty(), "a rejected record exposed plaintext");
+    }
+
+    /// Compaction must keep only the undelivered suffix, so an append after a partial read
+    /// cannot replay already-delivered bytes.
+    #[tokio::test]
+    async fn compacting_a_partially_consumed_payload_keeps_the_unread_suffix() {
+        let (mut conn, _peer) = delivery_connection();
+        conn.read_buf = vec![1, 2, 3, 4];
+        conn.read_offset = 2;
+        conn.compact_read_buf();
+        assert_eq!(conn.read_buf, [3, 4]);
+        assert_eq!(conn.read_offset, 0);
     }
 }
