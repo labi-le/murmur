@@ -1231,11 +1231,12 @@ by the unit test suite.
   write shares the writer mutex with the close path: the close sets a flag before it writes, so no
   data frame can follow the close frame even if the ticker fires in between. A close also cancels
   the stream before it waits for that mutex, so a handler blocked on a peer that stopped reading
-  still releases its subscription; that in-flight write is abandoned and marks the stream poisoned,
-  and the connection is dropped rather than reusing it or appending a close frame after a partial
-  frame. A control frame (pong, close echo) bounds its lock acquisition and write together, so a
-  ping that cannot be answered because a data write owns the mutex does not hide the close that
-  follows it; a timeout cancels the stream and drops the connection. Tests:
+  still releases its subscription; that in-flight write is abandoned and marks the stream poisoned
+  while the writer guard is still held, so a concurrent close or pong cannot acquire the mutex and
+  write onto the partial frame; the connection is dropped rather than reused or followed by a close
+  frame. A control frame (pong, close echo) bounds its lock acquisition and write, and its own
+  timeout sets the poison before releasing the guard, so a ping that cannot be answered does not
+  hide the close that follows it. Tests:
   `a_closed_logs_stream_releases_its_subscription_without_a_qualifying_record`,
   `a_websocket_logs_client_is_answered_and_released_on_close`,
   `an_invalid_close_payload_is_answered_with_a_protocol_error`,
