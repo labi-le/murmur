@@ -114,6 +114,14 @@ pub fn fakeip_cold_hosts() -> Vec<String> {
     (0..FAKEIP_MISS_HOSTS).map(|index| format!("cold{index}.example.com")).collect()
 }
 
+pub fn fakeip_hit_hosts_mixed() -> Vec<String> {
+    (0..FAKEIP_HIT_HOSTS).map(|index| format!("Hit{index}.Example.COM")).collect()
+}
+
+pub fn fakeip_cold_hosts_mixed() -> Vec<String> {
+    (0..FAKEIP_MISS_HOSTS).map(|index| format!("Cold{index}.Example.COM")).collect()
+}
+
 fn build_rule_chain(count: usize) -> Vec<Arc<dyn Rule>> {
     let mut chain: Vec<Arc<dyn Rule>> = Vec::with_capacity(count);
     chain.push(Arc::new(DomainSuffix::new("probe-first.example.com", "FIRST")));

@@ -7,9 +7,11 @@ BENCH_PACKAGES = -p murmur-transport-vless -p murmur-component-trie \
 	-p murmur-rules
 BENCH_TARGETS = --bench vless --bench domain_match --bench fakeip --bench rule_match \
 	--bench buffer_pool --bench geodata_bridge --bench udp_path --bench rule_wrapper
-# Prints heap allocations per operation rather than timings, so it is kept out of the Criterion sweep.
+# Prints heap allocations per operation rather than timings, so these are kept out of the Criterion sweep.
 bench-alloc:
 	$(CARGO) bench -j 2 -p murmur-rules-common --bench alloc_census
+	$(CARGO) bench -j 2 -p murmur-tunnel --bench udp_hit_path
+	$(CARGO) bench -j 2 -p murmur-tunnel --bench udp_dispatch
 BENCH_ARGS ?=
 METRICS_ARGS ?=
 

@@ -25,6 +25,9 @@ pub(crate) use super::datagram_posix::EnhanceUdpDatagram;
 pub(crate) use super::datagram_windows::EnhanceUdpDatagram;
 
 /// [`SocketAddr`]-keyed counterpart to [`WaitReadFrom`].
+///
+/// `put == None` means `data` is the transferred pooled block, to be returned with
+/// `murmur_common_pool::put(data)` by the caller that consumes it.
 #[async_trait]
 pub trait WaitReadFromDatagram: Send + Sync {
     async fn wait_read_from(&self) -> (Vec<u8>, Option<Box<dyn FnOnce() + Send>>, Option<SocketAddr>, io::Result<()>);
@@ -113,7 +116,10 @@ pub fn new_enhance_datagram(pc: Arc<dyn Datagram>) -> Arc<dyn EnhanceDatagram> {
     Arc::new(EnhanceDatagramImpl { inner: pc })
 }
 
-/// [`Socksaddr`]-keyed counterpart to [`WaitReadFromDatagram`], for the FQDN-carrying sites.
+/// [`Socksaddr`]-keyed counterpart to [`WaitReadFrom`].
+///
+/// `put == None` means `data` is the transferred pooled block, to be returned with
+/// `murmur_common_pool::put(data)` by the caller that consumes it.
 #[async_trait]
 pub trait WaitReadFromNamedDatagram: Send + Sync {
     async fn wait_read_from(&self) -> (Vec<u8>, Option<Box<dyn FnOnce() + Send>>, Option<Socksaddr>, io::Result<()>);

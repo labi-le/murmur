@@ -219,6 +219,10 @@ pub(crate) struct VerifiedConn {
     hmac_verify: HmacSha1,
     hmac_ignore: Option<HmacSha1>,
     pending: Vec<u8>,
+    /// Delivery cursor into `pending`: bytes below it have already been handed to the caller. A
+    /// verified record keeps its TLS/HMAC header in place and starts here, so stripping the
+    /// header and every small delivery advance a cursor instead of shifting the unread suffix.
+    pending_offset: usize,
     /// The record header, assembled in place rather than in a heap buffer of its own.
     read_header: [u8; TLS_HEADER_SIZE],
     /// The frame being assembled: the header copied in once its length is known, then the body
@@ -248,6 +252,7 @@ pub(crate) fn new_verified_conn(
         hmac_verify,
         hmac_ignore,
         pending: Vec::new(),
+        pending_offset: 0,
         read_header: [0u8; TLS_HEADER_SIZE],
         read_buf: Vec::new(),
         read_offset: 0,
@@ -270,10 +275,17 @@ fn poll_read_into(conn: &mut Box<dyn NetConn>, cx: &mut Context<'_>, dst: &mut [
 
 impl VerifiedConn {
     fn deliver_pending(&mut self, buf: &mut ReadBuf<'_>) {
-        let n = self.pending.len().min(buf.remaining());
-        let (head, _) = self.pending.split_at(n);
-        buf.put_slice(head);
-        self.pending.drain(..n);
+        let unread = self.pending.len().saturating_sub(self.pending_offset);
+        let n = unread.min(buf.remaining());
+        let end = self.pending_offset + n;
+        if let Some(bytes) = self.pending.get(self.pending_offset..end) {
+            buf.put_slice(bytes);
+        }
+        self.pending_offset = end;
+        if self.pending_offset >= self.pending.len() {
+            self.pending.clear();
+            self.pending_offset = 0;
+        }
     }
 
     /// Sends a TLS alert. Best-effort: a single non-blocking write attempt, errors ignored,
@@ -429,12 +441,12 @@ impl AsyncRead for VerifiedConn {
         if this.torn {
             return Poll::Ready(Err(torn_err()));
         }
-        if !this.pending.is_empty() {
+        if this.pending_offset < this.pending.len() {
             this.deliver_pending(buf);
             return Poll::Ready(Ok(()));
         }
         loop {
-            let mut frame = match this.poll_read_record(cx) {
+            let frame = match this.poll_read_record(cx) {
                 Poll::Pending => return Poll::Pending,
                 Poll::Ready(Ok(frame)) => frame,
                 Poll::Ready(Err(err)) => {
@@ -469,11 +481,14 @@ impl AsyncRead for VerifiedConn {
                         this.send_alert(cx);
                         return Poll::Ready(Err(io::Error::from(io::ErrorKind::UnexpectedEof)));
                     }
-                    // The verified frame's buffer *becomes* the pending payload, so a record is
-                    // delivered out of the allocation it was read into instead of a copy of it.
-                    frame.drain(..TLS_HMAC_HEADER_SIZE);
+                    // The verified frame's buffer *becomes* the pending payload. Its TLS/HMAC
+                    // header stays in place and `pending_offset` starts past it, so neither the
+                    // header removal nor a small delivery moves the unread suffix.
                     this.pending = frame;
-                    if this.pending.is_empty() {
+                    this.pending_offset = TLS_HMAC_HEADER_SIZE;
+                    if this.pending_offset >= this.pending.len() {
+                        this.pending.clear();
+                        this.pending_offset = 0;
                         continue;
                     }
                     this.deliver_pending(buf);
@@ -1337,5 +1352,78 @@ pub(crate) mod tests {
             io::ErrorKind::BrokenPipe,
             "the conn must tear down the moment a sealed record is dropped, even with zero bytes sent"
         );
+    }
+
+    /// A record delivered through byte- and block-sized caller buffers must arrive once, in
+    /// order, and the next record must start at its own payload rather than inheriting the
+    /// previous record's delivery cursor.
+    #[tokio::test]
+    async fn verified_conn_small_reads_deliver_records_in_order() {
+        for chunk in [1usize, 64, 1024] {
+            let first: Vec<u8> = (0..4 * 1024).map(|i| (i % 251) as u8).collect();
+            let second: Vec<u8> = (0..3 * 1024).map(|i| (i % 239) as u8).collect();
+            let mut hmac_state = new_hmac_sha1(TEST_PASSWORD);
+            let mut wire = build_verified_record(&mut hmac_state, &first);
+            wire.extend_from_slice(&build_verified_record(&mut hmac_state, &second));
+
+            let mut verified = new_verified_conn(
+                Box::new(CursorConn { data: wire, pos: 0 }),
+                new_hmac_sha1(TEST_PASSWORD),
+                new_hmac_sha1(TEST_PASSWORD),
+                None,
+            );
+            let mut out = vec![0u8; chunk];
+            let mut got = Vec::with_capacity(first.len() + second.len());
+            while got.len() < first.len() + second.len() {
+                let n = verified.read(&mut out).await.expect("small read must deliver payload");
+                assert!(n > 0, "delivery stalled at {} bytes with chunk {chunk}", got.len());
+                got.extend_from_slice(&out[..n]);
+            }
+            let mut expected = first;
+            expected.extend_from_slice(&second);
+            assert_eq!(got, expected, "chunk size {chunk}");
+        }
+    }
+
+    /// Authentication covers the whole retained frame before any byte is exposed: a corrupted
+    /// MAC is an error, not a partial delivery of the payload behind it.
+    #[tokio::test]
+    async fn a_record_with_a_bad_mac_delivers_no_plaintext() {
+        let payload = b"authenticated plaintext";
+        let mut hmac_state = new_hmac_sha1(TEST_PASSWORD);
+        let mut wire = build_verified_record(&mut hmac_state, payload);
+        if let Some(last) = wire.last_mut() {
+            *last ^= 0x01;
+        }
+
+        let mut verified = new_verified_conn(
+            Box::new(CursorConn { data: wire, pos: 0 }),
+            new_hmac_sha1(TEST_PASSWORD),
+            new_hmac_sha1(TEST_PASSWORD),
+            None,
+        );
+        let mut out = [0u8; 64];
+        let mut read_buf = ReadBuf::new(&mut out);
+        let result = std::future::poll_fn(|cx| Pin::new(&mut verified).poll_read(cx, &mut read_buf)).await;
+        let err = result.expect_err("a corrupted MAC must fail the read");
+        assert_eq!(err.kind(), io::ErrorKind::InvalidData);
+        assert!(read_buf.filled().is_empty(), "a rejected frame exposed plaintext");
+    }
+
+    #[tokio::test]
+    async fn a_truncated_record_is_an_unexpected_eof() {
+        let mut hmac_state = new_hmac_sha1(TEST_PASSWORD);
+        let mut wire = build_verified_record(&mut hmac_state, b"truncated record");
+        wire.truncate(TLS_HEADER_SIZE + 4);
+
+        let mut verified = new_verified_conn(
+            Box::new(CursorConn { data: wire, pos: 0 }),
+            new_hmac_sha1(TEST_PASSWORD),
+            new_hmac_sha1(TEST_PASSWORD),
+            None,
+        );
+        let mut out = [0u8; 16];
+        let err = verified.read(&mut out).await.expect_err("a truncated record must fail");
+        assert_eq!(err.kind(), io::ErrorKind::UnexpectedEof);
     }
 }
