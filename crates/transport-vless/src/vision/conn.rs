@@ -1690,6 +1690,63 @@ mod tests {
         assert_eq!(second.2, payload[cut..]);
     }
 
+    /// The reverse search still reports a last marker past the frame-size boundary, where
+    /// `reshape_buffer` must discard it and fall back to the fixed half-buffer cut instead of
+    /// splitting at an earlier marker.
+    #[tokio::test]
+    async fn write_discards_a_last_marker_past_the_frame_boundary() {
+        let (inner, mut peer) = pipe();
+        let mut conn = vision(inner, None);
+        let payload_len = XRAY_BUF_SIZE + 808;
+        let mut payload = vec![0x41u8; payload_len];
+        payload[4103..4106].copy_from_slice(&[0x17, 0x03, 0x03]);
+        payload[8500..8503].copy_from_slice(&[0x17, 0x03, 0x03]);
+
+        let write = async {
+            conn.write_all(&payload).await.expect("vision write");
+        };
+        let read = async {
+            let first = read_uuid_frame(&mut peer).await;
+            let second = read_continuation_frame(&mut peer).await;
+            (first, second)
+        };
+        let ((), (first, second)) = tokio::join!(write, read);
+
+        assert_eq!(first.1, CONTENT_AFTER_SPLIT, "the marker past BUFFER_LIMIT must be discarded");
+        assert_eq!(first.2, payload[..CONTENT_AFTER_SPLIT]);
+        assert_eq!(second.1, payload_len - CONTENT_AFTER_SPLIT);
+        assert_eq!(second.2, payload[CONTENT_AFTER_SPLIT..]);
+    }
+
+    /// Four later first-byte candidates that do not complete the marker must not hide an earlier
+    /// true marker: the bounded reverse scan must fall back to the remaining prefix.
+    #[tokio::test]
+    async fn write_finds_a_marker_before_four_false_first_byte_candidates() {
+        let (inner, mut peer) = pipe();
+        let mut conn = vision(inner, None);
+        let payload_len = XRAY_BUF_SIZE + 808;
+        let mut payload = vec![0x41u8; payload_len];
+        payload[4103..4106].copy_from_slice(&[0x17, 0x03, 0x03]);
+        for index in [7000, 7200, 7400, 7600] {
+            payload[index..index + 3].copy_from_slice(&[0x17, 0x41, 0x41]);
+        }
+
+        let write = async {
+            conn.write_all(&payload).await.expect("vision write");
+        };
+        let read = async {
+            let first = read_uuid_frame(&mut peer).await;
+            let second = read_continuation_frame(&mut peer).await;
+            (first, second)
+        };
+        let ((), (first, second)) = tokio::join!(write, read);
+
+        assert_eq!(first.1, 4103, "the true marker must win over later false candidates");
+        assert_eq!(first.2, payload[..4103]);
+        assert_eq!(second.1, payload_len - 4103);
+        assert_eq!(second.2, payload[4103..]);
+    }
+
     /// A split frame that parks mid-queue must resume at the next segment, which carries its own
     /// header and no second UUID.
     #[tokio::test]
