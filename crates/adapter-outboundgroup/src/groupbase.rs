@@ -599,7 +599,8 @@ mod tests {
     }
 
     fn as_provider(provider: &Arc<MockProvider>) -> Arc<dyn ProxyProvider> {
-        Arc::clone(provider)
+        let cloned: Arc<MockProvider> = Arc::clone(provider);
+        cloned
     }
 
     fn selector_with(provider: Arc<MockProvider>, selected: &str) -> Arc<Selector> {
@@ -647,8 +648,8 @@ mod tests {
         let selector = selector_with(provider, "beta");
         let metadata = Metadata::default();
 
-        let first = selector.unwrap(&metadata, false);
-        let second = selector.unwrap(&metadata, false);
+        let first = selector.unwrap(&metadata, false).expect("selector resolves");
+        let second = selector.unwrap(&metadata, false).expect("selector resolves");
         assert_eq!(first.name(), "beta");
         assert!(Arc::ptr_eq(&first, &second), "a warm selection must not rescan the member list");
     }
@@ -658,13 +659,13 @@ mod tests {
         let provider = MockProvider::new(vec![adapter("alpha"), adapter("beta")]);
         let selector = selector_with(Arc::clone(&provider), "beta");
         let metadata = Metadata::default();
-        let before = selector.unwrap(&metadata, false);
+        let before = selector.unwrap(&metadata, false).expect("selector resolves");
 
         let replacement = vec![adapter("alpha"), adapter("beta")];
         let expected = Arc::clone(&replacement[1]);
         provider.replace(replacement);
 
-        let after = selector.unwrap(&metadata, false);
+        let after = selector.unwrap(&metadata, false).expect("selector resolves");
         assert!(Arc::ptr_eq(&after, &expected), "a new provider generation must be resolved, not a stale snapshot");
         assert!(!Arc::ptr_eq(&before, &after));
     }
@@ -674,13 +675,17 @@ mod tests {
         let provider = MockProvider::new(vec![adapter("alpha"), adapter("beta")]);
         let selector = selector_with(provider, "beta");
         let metadata = Metadata::default();
-        assert_eq!(selector.unwrap(&metadata, false).name(), "beta");
+        assert_eq!(selector.unwrap(&metadata, false).expect("selector resolves").name(), "beta");
 
         selector.force_set("alpha");
-        assert_eq!(selector.unwrap(&metadata, false).name(), "alpha");
+        assert_eq!(selector.unwrap(&metadata, false).expect("selector resolves").name(), "alpha");
 
         selector.force_set("absent");
-        assert_eq!(selector.unwrap(&metadata, false).name(), "alpha", "an absent name keeps the first-member fallback");
+        assert_eq!(
+            selector.unwrap(&metadata, false).expect("selector resolves").name(),
+            "alpha",
+            "an absent name keeps the first-member fallback"
+        );
     }
 
     #[test]
@@ -690,7 +695,7 @@ mod tests {
         let provider = MockProvider::new(vec![first, adapter("dup")]);
         let selector = selector_with(provider, "dup");
 
-        let selected = selector.unwrap(&Metadata::default(), false);
+        let selected = selector.unwrap(&Metadata::default(), false).expect("selector resolves");
         assert!(Arc::ptr_eq(&selected, &expected), "duplicate names must resolve to the first member");
     }
 
@@ -706,7 +711,7 @@ mod tests {
         )
         .expect("selector construction");
 
-        let selected = selector.unwrap(&Metadata::default(), false);
+        let selected = selector.unwrap(&Metadata::default(), false).expect("selector resolves");
         assert!(Arc::ptr_eq(&selected, &fallback), "an empty group must return the empty fallback");
     }
 }
