@@ -6,6 +6,7 @@ use async_trait::async_trait;
 use parking_lot::Mutex;
 
 use murmur_common_net::io::Datagram;
+use murmur_common_pool as pool;
 use murmur_constant::adapters::{UDPPacket, WriteBack};
 
 pub(crate) struct Packet {
@@ -17,6 +18,9 @@ pub(crate) struct Packet {
     payload: Vec<u8>,
     len: AtomicUsize,
     put: Mutex<Option<Box<dyn FnOnce() + Send>>>,
+    /// `payload` is the transferred pooled block itself, so `put` is `None` and this struct owes
+    /// the block back to the pool at drop time.
+    pooled: bool,
 }
 
 impl Packet {
@@ -28,7 +32,19 @@ impl Packet {
         put: Option<Box<dyn FnOnce() + Send>>,
     ) -> Self {
         let len = AtomicUsize::new(payload.len());
-        Self { pc, r_addr, nat_key, payload, len, put: Mutex::new(put) }
+        let pooled = put.is_none();
+        Self { pc, r_addr, nat_key, payload, len, put: Mutex::new(put), pooled }
+    }
+}
+
+impl Drop for Packet {
+    fn drop(&mut self) {
+        if self.pooled {
+            // No callback owns the transferred block; `drop_` cannot move it out of `&self`, so
+            // the owner returns it here, exactly once.
+            let payload = std::mem::take(&mut self.payload);
+            let _ = pool::put(payload);
+        }
     }
 }
 
@@ -110,5 +126,38 @@ mod tests {
 
         assert_eq!(one.local_addr(), two.local_addr());
         assert_ne!(one.nat_key(), two.nat_key());
+    }
+
+    #[test]
+    fn a_transfer_read_packet_returns_its_pooled_block_on_drop() {
+        let mut block = pool::get(8192);
+        block.truncate(6);
+        let ptr = block.as_ptr();
+        let r_addr: SocketAddr = "198.51.100.9:4433".parse().unwrap();
+        let pc: Arc<dyn Datagram> = Arc::new(NullDatagram);
+
+        let packet = Arc::new(Packet::new(pc, r_addr, "transfer".to_owned(), block, None));
+        drop(packet);
+
+        let recycled = pool::get(8192);
+        assert_eq!(recycled.capacity(), 8192, "the dropped packet must return a poolable block");
+        assert_eq!(recycled.as_ptr(), ptr, "the block must be the one the packet owned");
+    }
+
+    #[test]
+    fn a_callback_packet_still_releases_through_its_callback() {
+        let calls = Arc::new(AtomicUsize::new(0));
+        let counter = Arc::clone(&calls);
+        let put: Box<dyn FnOnce() + Send> = Box::new(move || {
+            counter.fetch_add(1, Ordering::SeqCst);
+        });
+        let r_addr: SocketAddr = "198.51.100.9:4433".parse().unwrap();
+        let pc: Arc<dyn Datagram> = Arc::new(NullDatagram);
+
+        let packet = Packet::new(pc, r_addr, "callback".to_owned(), vec![1, 2, 3], Some(put));
+        packet.drop_();
+        drop(packet);
+
+        assert_eq!(calls.load(Ordering::SeqCst), 1, "the callback must run exactly once");
     }
 }

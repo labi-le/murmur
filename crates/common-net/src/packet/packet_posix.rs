@@ -72,13 +72,13 @@ impl WaitReadFrom for EnhanceUDPConn {
             })
             .await;
         match result {
-            Ok((read_n, read_from, read_buf)) => {
+            Ok((read_n, read_from, mut read_buf)) => {
                 if read_n > 0 {
-                    let data = read_buf.get(..read_n).unwrap_or_default().to_vec();
-                    let put: Option<Box<dyn FnOnce() + Send>> = Some(Box::new(move || {
-                        let _ = pool::put(read_buf);
-                    }));
-                    (data, put, read_from, Ok(()))
+                    // Hand the pooled block itself to the caller, truncated to the datagram; the
+                    // caller owns it and returns it with `pool::put(data)`. No payload copy and no
+                    // callback retaining a second reference to the same allocation.
+                    read_buf.truncate(read_n);
+                    (read_buf, None, read_from, Ok(()))
                 } else {
                     let _ = pool::put(read_buf);
                     (Vec::new(), None, read_from, Ok(()))
@@ -232,5 +232,28 @@ mod tests {
         let (data, _put, _addr, res) = conn.wait_read_from().await;
         res.unwrap();
         assert_eq!(b"hello", data.as_slice(), "the datagram must survive the dropped read");
+    }
+
+    #[tokio::test]
+    async fn wait_read_from_transfers_the_pooled_buffer_without_an_extra_copy() {
+        let server = tokio::net::UdpSocket::bind((Ipv4Addr::LOCALHOST, 0)).await.unwrap();
+        let server_addr = server.local_addr().unwrap();
+        let client = tokio::net::UdpSocket::bind((Ipv4Addr::LOCALHOST, 0)).await.unwrap();
+        client.send_to(b"pooled", server_addr).await.unwrap();
+
+        let conn = EnhanceUDPConn::new(Arc::new(server));
+        let (data, put, _addr, res) = conn.wait_read_from().await;
+        res.unwrap();
+        assert_eq!(b"pooled", data.as_slice());
+        assert!(put.is_none(), "the pooled block itself is returned as `data`; there is nothing left for `put`");
+        assert_eq!(data.capacity(), pool::UDP_BUFFER_SIZE, "the transferred block must remain poolable");
+        pool::put(data).expect("caller must be able to recycle the returned buffer");
+
+        client.send_to(b"", server_addr).await.unwrap();
+        let (data, put, _addr, res) = conn.wait_read_from().await;
+        res.unwrap();
+        assert!(data.is_empty());
+        assert!(put.is_none(), "a zero-length datagram releases its buffer internally");
+        assert_eq!(data.capacity(), 0, "a zero-length datagram hands back no pooled block");
     }
 }

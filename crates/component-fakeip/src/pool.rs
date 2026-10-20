@@ -15,6 +15,7 @@
 
 use std::borrow::Cow;
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
+use std::sync::Arc;
 
 use anyhow::{anyhow, Result};
 use ipnet::IpNet;
@@ -46,10 +47,16 @@ impl Store {
         }
     }
 
-    fn put_by_host(&self, host: &str, ip: IpAddr) {
+    /// Inserts both directions. The in-memory store shares one hostname allocation between the
+    /// forward key, its LRU entry key and the reverse value; the cachefile store keeps its two
+    /// independent writes in the same order as before.
+    fn put_pair(&self, host: Arc<str>, ip: IpAddr) {
         match self {
-            Self::Memory(s) => s.put_by_host(host, ip),
-            Self::Cachefile(s) => s.put_by_host(host, ip),
+            Self::Memory(s) => s.put_pair(host, ip),
+            Self::Cachefile(s) => {
+                s.put_by_ip(ip, host.as_ref());
+                s.put_by_host(host.as_ref(), ip);
+            }
         }
     }
 
@@ -57,13 +64,6 @@ impl Store {
         match self {
             Self::Memory(s) => s.by_ip(ip),
             Self::Cachefile(s) => s.by_ip(ip),
-        }
-    }
-
-    fn put_by_ip(&self, ip: IpAddr, host: &str) {
-        match self {
-            Self::Memory(s) => s.put_by_ip(ip, host),
-            Self::Cachefile(s) => s.put_by_ip(ip, host),
         }
     }
 
@@ -148,8 +148,8 @@ impl Pool {
             None
         };
 
-        let ip = get_locked(&mut state, self.first, self.last, &host);
-        state.store.put_by_host(&host, ip);
+        let ip = get_locked(&mut state, self.first, self.last);
+        state.store.put_pair(Arc::from(host.as_ref()), ip);
         ip
     }
 
@@ -230,7 +230,7 @@ fn lower_host(host: &str) -> Cow<'_, str> {
     }
 }
 
-fn get_locked(state: &mut PoolState, first: IpAddr, last: IpAddr, host: &str) -> IpAddr {
+fn get_locked(state: &mut PoolState, first: IpAddr, last: IpAddr) -> IpAddr {
     loop {
         state.offset = addr_next(state.offset);
 
@@ -249,7 +249,6 @@ fn get_locked(state: &mut PoolState, first: IpAddr, last: IpAddr, host: &str) ->
         state.store.del_by_ip(state.offset);
     }
 
-    state.store.put_by_ip(state.offset, host);
     state.offset
 }
 
@@ -554,6 +553,38 @@ mod tests {
             assert_eq!(reloaded.lookup(host), ip);
             assert_eq!(reloaded.look_back(ip).as_deref(), Some(*host));
         }
+    }
+
+    #[test]
+    fn look_back_returns_an_owned_host_after_mapping_eviction() {
+        let options = Options { ip_net: "192.0.2.0/24".parse().unwrap(), size: 2, persistence: false };
+        let pool = new(options).unwrap();
+
+        let ip = pool.lookup("Mixed.Example.COM");
+        let host: String = pool.look_back(ip).expect("reverse hit");
+        assert_eq!(host, "mixed.example.com");
+
+        pool.lookup("second.example");
+        pool.lookup("third.example");
+        assert_eq!(pool.look_back(ip), None);
+        assert_eq!(host, "mixed.example.com", "the public reverse result owns its buffer");
+    }
+
+    #[test]
+    fn small_subnet_wrap_replaces_both_mapping_directions() {
+        let options = Options { ip_net: "192.0.2.0/29".parse().unwrap(), size: 8, persistence: false };
+        let pool = new(options).unwrap();
+
+        let first = pool.lookup("one.example");
+        let second = pool.lookup("two.example");
+        pool.lookup("three.example");
+        let wrapped = pool.lookup("four.example");
+
+        assert_eq!(wrapped, first);
+        assert_eq!(pool.look_back(first).as_deref(), Some("four.example"));
+        assert_eq!(pool.look_back(second).as_deref(), Some("two.example"));
+        assert_eq!(pool.lookup("one.example"), second);
+        assert_eq!(pool.look_back(second).as_deref(), Some("one.example"));
     }
 
     #[test]

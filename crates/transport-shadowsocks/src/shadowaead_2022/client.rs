@@ -34,6 +34,7 @@ use super::sliding_window::SlidingWindow;
 use crate::shadowaead::cipher::Aead;
 use murmur_common_net::io::Stream as NetStream;
 use murmur_common_net::{EnhancePacketConn, WaitReadFrom};
+use murmur_common_pool as pool;
 use murmur_sing::metadata::Socksaddr;
 use murmur_std_compat::net::{Addr, PacketConn, TcpAddr, UdpAddr};
 
@@ -890,11 +891,28 @@ impl WaitReadFrom for ClientPacketConn {
     ) -> (Vec<u8>, Option<Box<dyn FnOnce() + Send>>, Option<Box<dyn Addr>>, io::Result<()>) {
         let (data, put, _addr, result) = self.inner.wait_read_from().await;
         if result.is_err() {
-            return (data, put, None, result);
+            if put.is_some() {
+                return (data, put, None, result);
+            }
+            let _ = pool::put(data);
+            return (Vec::new(), None, None, result);
         }
         match self.open_packet(&data) {
-            Ok((destination, payload)) => (payload, put, Some(socksaddr_to_addr(&destination)), Ok(())),
-            Err(err) => (Vec::new(), put, None, Err(to_io_error(err))),
+            Ok((destination, payload)) => {
+                // `payload` is a fresh Vec: the transferred pooled block is no longer needed.
+                if put.is_none() {
+                    let _ = pool::put(data);
+                }
+                (payload, put, Some(socksaddr_to_addr(&destination)), Ok(()))
+            }
+            Err(err) => {
+                if let Some(put) = put {
+                    put();
+                } else {
+                    let _ = pool::put(data);
+                }
+                (Vec::new(), None, None, Err(to_io_error(err)))
+            }
         }
     }
 }

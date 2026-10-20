@@ -36,6 +36,7 @@ use super::sliding_window::SlidingWindow;
 use crate::shadowaead::cipher::Aead;
 use murmur_common_net::io::Stream as NetStream;
 use murmur_common_net::{EnhancePacketConn, WaitReadFrom};
+use murmur_common_pool as pool;
 use murmur_sing::metadata::Socksaddr;
 use murmur_std_compat::net::{Addr, PacketConn};
 
@@ -843,22 +844,49 @@ impl WaitReadFrom for ServicePacketConn {
     ) -> (Vec<u8>, Option<Box<dyn FnOnce() + Send>>, Option<Box<dyn Addr>>, io::Result<()>) {
         let (data, put, from, result) = self.inner.wait_read_from().await;
         if result.is_err() {
-            return (data, put, from, result);
+            if put.is_some() {
+                return (data, put, from, result);
+            }
+            let _ = pool::put(data);
+            return (Vec::new(), None, from, result);
         }
         let Some(from) = from else {
-            return (Vec::new(), put, None, Err(io::Error::other("shadowsocks 2022: udp source missing")));
+            if let Some(put) = put {
+                put();
+            } else {
+                let _ = pool::put(data);
+            }
+            return (Vec::new(), None, None, Err(io::Error::other("shadowsocks 2022: udp source missing")));
         };
         let Some(from_socket) = socket_addr_of(from.as_ref()) else {
+            if let Some(put) = put {
+                put();
+            } else {
+                let _ = pool::put(data);
+            }
             return (
                 Vec::new(),
-                put,
+                None,
                 None,
                 Err(io::Error::other("shadowsocks 2022: udp source has no socket address")),
             );
         };
         match self.open_packet(&data, from_socket) {
-            Ok(out) => (out, put, Some(from), Ok(())),
-            Err(err) => (Vec::new(), put, None, Err(to_io_error(err))),
+            Ok(out) => {
+                // `out` is a fresh Vec: the transferred pooled block is no longer needed.
+                if put.is_none() {
+                    let _ = pool::put(data);
+                }
+                (out, put, Some(from), Ok(()))
+            }
+            Err(err) => {
+                if let Some(put) = put {
+                    put();
+                } else {
+                    let _ = pool::put(data);
+                }
+                (Vec::new(), None, None, Err(to_io_error(err)))
+            }
         }
     }
 }

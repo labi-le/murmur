@@ -66,7 +66,12 @@ fn get_connections(req: Req) -> Response<RespBody> {
         let mut tick = tokio::time::interval(Duration::from_millis(interval_ms));
         tick.tick().await;
         loop {
-            tick.tick().await;
+            // cancel-safe: `closed` only observes the sink's token, and a dropped `Interval::tick`
+            // leaves the next tick pending rather than losing it.
+            tokio::select! {
+                () = sink.closed() => break,
+                _ = tick.tick() => {}
+            }
             if !send_snapshot(&mut sink).await {
                 break;
             }
@@ -164,7 +169,7 @@ mod tests {
         }
     }
 
-    fn text_frames(bytes: &[u8]) -> Vec<Vec<u8>> {
+    fn frames(bytes: &[u8]) -> Vec<(u8, Vec<u8>)> {
         let mut frames = Vec::new();
         let mut i = 0;
         while i + 2 <= bytes.len() {
@@ -174,12 +179,39 @@ mod tests {
                 other => (other as usize, i + 2),
             };
             assert!(start + length <= bytes.len(), "partial websocket frame");
-            if opcode == 0x1 {
-                frames.push(bytes[start..start + length].to_vec());
-            }
+            frames.push((opcode, bytes[start..start + length].to_vec()));
             i = start + length;
         }
         frames
+    }
+
+    fn text_frames(bytes: &[u8]) -> Vec<Vec<u8>> {
+        frames(bytes).into_iter().filter_map(|(opcode, payload)| (opcode == 0x1).then_some(payload)).collect()
+    }
+
+    async fn write_close(stream: &mut TcpStream, payload: &[u8]) {
+        const MASK: [u8; 4] = [0x11, 0x22, 0x33, 0x44];
+        let length = u8::try_from(payload.len()).expect("control payload fits in one byte");
+        let mut frame = vec![0x88, 0x80 | length];
+        frame.extend_from_slice(&MASK);
+        frame.extend(payload.iter().enumerate().map(|(index, byte)| byte ^ MASK[index % 4]));
+        stream.write_all(&frame).await.expect("write close frame");
+    }
+
+    /// An hour-long interval must not outlive the client: the close is echoed and the socket
+    /// closes promptly, with no frame after the close.
+    #[tokio::test]
+    async fn a_close_frame_stops_an_hour_interval_connection_stream() {
+        let (mut stream, head, rest) = open(&handshake("3600000")).await;
+        assert!(head.starts_with("HTTP/1.1 101 Switching Protocols"), "{head}");
+
+        write_close(&mut stream, &[0x03, 0xe8]).await;
+        let (bytes, closed) = drain(&mut stream, rest, Duration::from_secs(2)).await;
+        assert!(closed, "the server must close the upgraded socket after the close frame");
+        let frames = frames(&bytes);
+        let close = frames.iter().position(|(opcode, _)| *opcode == 0x8).expect("server must echo the close");
+        assert_eq!(frames[close].1, [0x03, 0xe8]);
+        assert!(frames[close + 1..].is_empty(), "no frame may follow the close: {frames:?}");
     }
 
     /// A bad `interval` is only noticed after the upgrade: the peer sees the handshake, no frames,
