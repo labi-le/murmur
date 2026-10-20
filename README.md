@@ -119,7 +119,12 @@ Health checks send HEAD requests to the configured origin, with an origin-form
 path/query and a `Host` header carrying its authority, including a nondefault
 port or bracketed IPv6 literal. An HTTP response outside `expected-status` can
 still produce a measured delay, but its per-URL health state is unhealthy; use
-that state rather than a nonzero delay alone to validate node availability.
+that state rather than a nonzero delay alone to validate node availability. At
+the configured test timeout the probe is asked to cancel; the check awaits its
+completion so the failed measurement is published instead of leaving the node's
+previous state in place. Adapters that do not observe the cancellation token can
+delay that publication past the deadline. The timeout watch is owned by the probe
+and is retired as soon as the probe finishes.
 
 File-provider watchers schedule updates on their owning Tokio runtime, not on
 notify's OS thread. They watch the provider's parent directory and filter by
@@ -619,11 +624,13 @@ APIs without changing the proxy's public interfaces:
 | `rule_wrapper` | A bare rule chain against the same chain inside the production `RuleWrapper`, at 16/256/1,024 rules, on a full-chain miss and on a steady all-hit streak. The miss case pays a clock reading per rule because the streak gate is cold; the hit case pays it once per 256 matches |
 | `udp_path` | The per-datagram metadata path the UDP entry point walks |
 
-Three further targets are not Criterion and are not part of `make bench`:
+Four further targets are not Criterion and are not part of `make bench`:
 
 | Target | Output |
 | --- | --- |
 | `alloc_census` (`make bench-alloc`) | Heap allocations per operation from `dhat` as the global allocator: `Metadata::clone`, `DomainSet::has` and `DomainMap::lookup` in ASCII and upper-case, and rule-chain scans at 16/256/1,024 rules on a first-rule hit and a full-chain miss. Prints the measured figure beside the hand count for `Metadata::clone` so a disagreement between arithmetic and measurement is visible |
+| `udp_hit_path` (`make bench-alloc`) | Heap allocations per datagram on an established NAT key, before and after the borrowed-key fast path: the key clone, `Metadata` clone, metadata-cell `Arc`, maker box and `get_or_create` key copy against `key_ref` + `NatTable::get` + the packet `Arc`. This is the modeled subset; `metadata_clone` calibrates the clone against its hand count |
+| `udp_dispatch` (`make bench-alloc`) | The real `handle_udp_conn` called once per datum, with fixture construction outside the window: established hits against an installed key, misses through the real `get_or_create`/maker path, both with sniffing off and with a QUIC dispatcher installed. Reports `dhat` blocks and wall-clock nanoseconds per dispatch, so the miss-side cost of the added lookup is visible; the failed dial is drained outside the miss window |
 | `dialer_alloc_census` | The same shape for the dialer and resolver: option application, the address helpers each attempt runs, the hosts-table search each lookup starts with, and the literal-IP short circuit. Every connect path is reported as unmeasured, because each ends in a real connect; the upstream DNS leg is reported as unmeasured too, because a bench can only supply a trait stub whose own allocations would be inside every figure |
 | the metrics pair | Documented under [Measurement](measurement) |
 | `unsafe_removal_parity` | The descriptor open and close the `anet` ioctl paths perform today, as the cost a socket2 replacement would carry: TCP stream, datagram and raw netlink opens, an owned-descriptor close, an open-then-close pair, and bind-plus-listen for scale. The current implementations cannot appear in the bench at all, because the workspace denies unsafe code and a benchmark target inherits that lint, so every figure is a socket2 formulation; the two TCP fastopen option sites are reported as not removable rather than given a fabricated ratio |
