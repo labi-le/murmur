@@ -614,7 +614,7 @@ APIs without changing the proxy's public interfaces:
 | `vless` | IPv4/domain/IPv6/UDP/MUX first-write request framing; established memory-stream writes; Vision padding encode/decode/roundtrip at 64 B, 1 KiB and 16 KiB; VLESS AES-256-GCM and ChaCha20-Poly1305 seal/open/roundtrip |
 | `domain_match` | DomainSet/DomainMap/DomainTrie lookup over 10,000 generated patterns plus boundary cases; builds at 100/10,000 patterns; IPv4/IPv6 CIDR hit/miss |
 | `fakeip` | In-memory lookup hit and bounded eviction/miss, reverse lookup and existence; the miss workload rotates 8,192 hosts through a 256-entry pool across measurement batches |
-| `rule_match` | Ordered mixed-rule scans with 16/256/1,024 rules, matching first/last or missing; no DNS or network resolution |
+| `rule_match` | Ordered mixed-rule scans with 16/256/1,024 rules, matching first/last or missing; no DNS or network resolution. Also the `DomainKeyword` needle-search A/B: `str::contains` against the rule's cached `memchr::memmem::Finder` over 14/64/253-byte hosts, empty/one-byte/ASCII/non-ASCII needles, early/late/miss/shared-prefix cases, and keyword chains of 0/1/16/51/256 rules |
 | `buffer_pool` | Buffer get/put, fill, and cold allocation/free at 64 B through 128 KiB, including an unpooled size above the 64 KiB ceiling; BytesMut recycling |
 | `rule_wrapper` | A bare rule chain against the same chain inside the production `RuleWrapper`, at 16/256/1,024 rules, on a full-chain miss and on a steady all-hit streak. The miss case pays a clock reading per rule because the streak gate is cold; the hit case pays it once per 256 matches |
 | `udp_path` | The per-datagram metadata path the UDP entry point walks |
@@ -658,7 +658,10 @@ VLESS/Vision cases include the memory transport and per-iteration connection/buf
 they are not isolated codec instruction timings.
 The rule suite includes both the original empty-helper groups and
 `rule_chain_populated/{16,256,1024}/{first,last,miss}` with populated cached-resolution hooks.
-The suite currently declares **49 `bench_function` sites** across the eight Criterion targets; several
+`domain_keyword/*` and `domain_keyword_chain/*` compare the pre-change `str::contains` needle
+search with the cached `memchr::memmem::Finder` in one process, so their point estimates are a
+direct implementation delta rather than a cross-run comparison. The suite currently declares
+**53 `bench_function` sites** across the eight Criterion targets; several
 sit inside loops, so the number of workloads Criterion actually runs is higher than that. The
 populated groups still exclude DNS and OS process I/O.
 

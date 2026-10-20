@@ -4880,6 +4880,7 @@ dependencies = [
  "fancy-regex",
  "futures-util",
  "ipnet",
+ "memchr",
  "murmur-common",
  "murmur-component",
  "murmur-component-geodata",
