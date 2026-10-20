@@ -2324,15 +2324,9 @@ mod tests {
         assert_socket_closed(&mut stream).await;
     }
 
-    /// A client that never reads leaves the handler blocked inside a frame write, holding the
-    /// writer mutex. The Close frame must still release the handler and its subscription instead of
-    /// waiting for that write; the abandoned connection is dropped rather than reused after a
-    /// partial frame.
-    #[tokio::test]
-    async fn a_close_frame_releases_a_log_subscription_blocked_on_backpressure() {
-        let _guard = LOG_STREAM_TESTS.lock().await;
-        murmur_log::set_level(murmur_log::LogLevel::ERROR);
-
+    /// Upgrades `/logs?level=debug` with a client that never reads, then pushes enough records
+    /// that the handler is parked inside a blocked frame write holding the writer mutex.
+    async fn log_stream_under_backpressure() -> TcpStream {
         let (mut stream, _done) =
             open_stream_with_receive_buffer(&websocket_request("/logs?level=debug"), get_logs, Some(4096)).await;
         let head = read_response_head(&mut stream).await;
@@ -2351,24 +2345,62 @@ mod tests {
             tokio::time::sleep(std::time::Duration::from_millis(2)).await;
         }
         tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+        stream
+    }
 
-        write_client_frame(&mut stream, murmur_ws::OP_CLOSE.0, &[0x03, 0xe8]).await;
-        tokio::time::timeout(std::time::Duration::from_secs(2), async {
+    /// Waits for the `/logs` subscription to disappear, allowing for the bounded control write.
+    async fn wait_for_subscription_release() {
+        tokio::time::timeout(std::time::Duration::from_secs(3), async {
             while murmur_log::enabled(murmur_log::LogLevel::DEBUG) {
                 tokio::time::sleep(std::time::Duration::from_millis(10)).await;
             }
         })
         .await
-        .expect("a close must release a subscription whose write is blocked");
+        .expect("the close must release the log subscription");
+    }
 
-        // The handler is gone; drain the buffered frames and require the connection to end.
+    async fn drain_to_eof(stream: &mut TcpStream) {
         use tokio::io::AsyncReadExt as _;
         let mut buf = vec![0u8; 64 * 1024];
         tokio::time::timeout(std::time::Duration::from_secs(4), async {
-            while stream.read(&mut buf).await.expect("read buffered frames") > 0 {}
+            // A dropped connection with unread data in the client's buffer surfaces as a reset
+            // rather than a clean EOF; both mean the server is gone.
+            while matches!(stream.read(&mut buf).await, Ok(read) if read > 0) {}
         })
         .await
         .expect("the connection abandoned under backpressure must be dropped");
+    }
+
+    /// A client that never reads leaves the handler blocked inside a frame write, holding the
+    /// writer mutex. The Close frame must still release the handler and its subscription instead of
+    /// waiting for that write; the abandoned connection is dropped rather than reused after a
+    /// partial frame.
+    #[tokio::test]
+    async fn a_close_frame_releases_a_log_subscription_blocked_on_backpressure() {
+        let _guard = LOG_STREAM_TESTS.lock().await;
+        murmur_log::set_level(murmur_log::LogLevel::ERROR);
+
+        let mut stream = log_stream_under_backpressure().await;
+        write_client_frame(&mut stream, murmur_ws::OP_CLOSE.0, &[0x03, 0xe8]).await;
+        wait_for_subscription_release().await;
+        drain_to_eof(&mut stream).await;
+    }
+
+    /// A Ping that cannot be answered because a data write holds the mutex must not hide the Close
+    /// after it: the lock and the pong are one bounded operation, so the timeout cancels the
+    /// stream and releases the subscription even though the pong never completed.
+    #[tokio::test]
+    async fn a_ping_before_close_releases_a_log_subscription_blocked_on_backpressure() {
+        let _guard = LOG_STREAM_TESTS.lock().await;
+        murmur_log::set_level(murmur_log::LogLevel::ERROR);
+
+        let mut stream = log_stream_under_backpressure().await;
+        write_client_frame(&mut stream, murmur_ws::OP_PING.0, b"hi").await;
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        write_client_frame(&mut stream, murmur_ws::OP_CLOSE.0, &[0x03, 0xe8]).await;
+
+        wait_for_subscription_release().await;
+        drain_to_eof(&mut stream).await;
     }
 
     /// `/traffic` used to write its next tick after the close was echoed. The shared sink must

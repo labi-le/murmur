@@ -14,6 +14,7 @@
 use std::convert::Infallible;
 use std::future::Future;
 use std::pin::Pin;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::task::{Context as TaskContext, Poll};
 
@@ -861,24 +862,32 @@ pub(crate) struct StreamSink {
     watcher: Option<JoinHandle<()>>,
 }
 
-/// An upgraded websocket's writer and the flags that order its frames.
+/// An upgraded websocket's writer and the flag that orders its frames.
 ///
 /// The watcher also writes control frames, so both sides take this mutex. `closed` stops data
-/// writes before the close frame goes out; `poisoned` records a data write that was abandoned
-/// part-way because the peer stopped reading, after which the byte stream cannot take a close
-/// frame and the connection is dropped instead.
+/// writes before the close frame goes out.
 struct WsWriter {
     writer: tokio::io::WriteHalf<TokioIo<hyper::upgrade::Upgraded>>,
     closed: bool,
-    poisoned: bool,
 }
 
-/// Bounds a control-frame write so a peer that stopped reading cannot pin the socket forever.
+/// The writer lock plus the poison flag.
+///
+/// `poisoned` records a frame that may have been emitted part-way because the peer stopped
+/// reading, after which the byte stream cannot take a close frame and the connection is dropped
+/// instead. It is atomic so a control write that times out can set it without re-taking the lock
+/// it may have just lost.
+struct WsSink {
+    writer: tokio::sync::Mutex<WsWriter>,
+    poisoned: AtomicBool,
+}
+
+/// Bounds one control-frame lock-and-write so a peer that stopped reading cannot pin the socket.
 const CONTROL_WRITE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(1);
 
 enum SinkDest {
     Http(mpsc::Sender<Bytes>),
-    Ws(Arc<tokio::sync::Mutex<WsWriter>>),
+    Ws(Arc<WsSink>),
 }
 
 impl StreamSink {
@@ -897,22 +906,23 @@ impl StreamSink {
                 }
                 // cancel-safe: both arms only wait, and a dropped lock future leaves nothing
                 // queued.
-                let mut sink = tokio::select! {
+                let mut writer = tokio::select! {
                     () = shutdown.cancelled() => return false,
-                    sink = sink.lock() => sink,
+                    writer = sink.writer.lock() => writer,
                 };
-                if sink.closed {
+                if writer.closed || sink.poisoned.load(Ordering::SeqCst) {
                     return false;
                 }
                 {
-                    let WsWriter { writer, .. } = &mut *sink;
+                    let WsWriter { writer: inner, .. } = &mut *writer;
                     tokio::select! {
                         biased;
-                        result = ws_write_server_text(writer, data) => return result.is_ok(),
+                        result = ws_write_server_text(inner, data) => return result.is_ok(),
                         () = shutdown.cancelled() => {}
                     }
                 }
-                sink.poisoned = true;
+                drop(writer);
+                sink.poisoned.store(true, Ordering::SeqCst);
                 false
             }
         }
@@ -959,11 +969,7 @@ impl Drop for StreamSink {
 /// close (or EOF, or an I/O error) into [`StreamSink::closed`]. Ping is answered with a pong
 /// carrying the same payload, a valid close frame is echoed, an invalid one is answered with a
 /// protocol-error close, and data frames are discarded.
-async fn watch_websocket<R: AsyncRead + Unpin>(
-    mut reader: R,
-    writer: Arc<tokio::sync::Mutex<WsWriter>>,
-    shutdown: CancellationToken,
-) {
+async fn watch_websocket<R: AsyncRead + Unpin>(mut reader: R, sink: Arc<WsSink>, shutdown: CancellationToken) {
     let mut fragmented = false;
     loop {
         let Ok(Some(header)) = murmur_ws::read_header(&mut reader).await else { break };
@@ -974,36 +980,40 @@ async fn watch_websocket<R: AsyncRead + Unpin>(
         };
         if murmur_ws::check_header(&header, state).is_err() {
             let body = murmur_ws::new_close_frame_body(murmur_ws::STATUS_PROTOCOL_ERROR, b"");
-            close_websocket(&writer, &shutdown, &body).await;
+            close_websocket(&sink, &shutdown, &body).await;
             break;
         }
 
         if header.op_code.is_control() {
             let Some(payload) = read_ws_payload(&mut reader, &header).await else { break };
             if header.op_code == murmur_ws::OP_PING {
-                let mut sink = writer.lock().await;
-                if sink.closed {
-                    break;
-                }
-                let written = tokio::time::timeout(
-                    CONTROL_WRITE_TIMEOUT,
-                    ws_write_server_message(&mut sink.writer, murmur_ws::OP_PONG.0, &payload),
-                )
-                .await;
-                let failed = !matches!(written, Ok(Ok(())));
-                if failed {
-                    sink.poisoned = true;
-                }
-                drop(sink);
-                if failed {
-                    break;
+                // The lock and the pong are one bounded operation: a data write can hold the
+                // writer mutex while the peer stops reading, and waiting for it unbounded would
+                // also stop this loop from seeing the following Close or EOF.
+                let pong = async {
+                    let mut writer = sink.writer.lock().await;
+                    if writer.closed || sink.poisoned.load(Ordering::SeqCst) {
+                        return false;
+                    }
+                    ws_write_server_message(&mut writer.writer, murmur_ws::OP_PONG.0, &payload).await.is_ok()
+                };
+                match tokio::time::timeout(CONTROL_WRITE_TIMEOUT, pong).await {
+                    Ok(true) => {}
+                    Ok(false) => break,
+                    Err(_) => {
+                        // The pong could not complete inside the bound. Nothing may be appended
+                        // after a partial frame: mark the stream and drop the connection.
+                        sink.poisoned.store(true, Ordering::SeqCst);
+                        shutdown.cancel();
+                        break;
+                    }
                 }
             } else if header.op_code == murmur_ws::OP_CLOSE {
                 if close_payload_is_valid(&payload) {
-                    close_websocket(&writer, &shutdown, &payload).await;
+                    close_websocket(&sink, &shutdown, &payload).await;
                 } else {
                     let body = murmur_ws::new_close_frame_body(murmur_ws::STATUS_PROTOCOL_ERROR, b"");
-                    close_websocket(&writer, &shutdown, &body).await;
+                    close_websocket(&sink, &shutdown, &body).await;
                 }
                 break;
             }
@@ -1025,21 +1035,21 @@ async fn watch_websocket<R: AsyncRead + Unpin>(
 /// still owns the lock; that write is interrupted by [`StreamSink::write_text`], which also marks
 /// the stream poisoned, and a poisoned stream is dropped rather than followed by a close frame.
 /// The close write itself is bounded so a peer that stopped reading cannot pin the socket.
-async fn close_websocket(writer: &tokio::sync::Mutex<WsWriter>, shutdown: &CancellationToken, payload: &[u8]) {
+async fn close_websocket(sink: &WsSink, shutdown: &CancellationToken, payload: &[u8]) {
     shutdown.cancel();
-    let mut sink = writer.lock().await;
-    if sink.closed {
+    let mut writer = sink.writer.lock().await;
+    if writer.closed {
         return;
     }
-    sink.closed = true;
-    if !sink.poisoned {
+    writer.closed = true;
+    if !sink.poisoned.load(Ordering::SeqCst) {
         let _ = tokio::time::timeout(
             CONTROL_WRITE_TIMEOUT,
-            ws_write_server_message(&mut sink.writer, murmur_ws::OP_CLOSE.0, payload),
+            ws_write_server_message(&mut writer.writer, murmur_ws::OP_CLOSE.0, payload),
         )
         .await;
     }
-    drop(sink);
+    drop(writer);
 }
 
 /// RFC 6455 §5.5.1: an empty close payload is valid, a single byte is malformed, and any other
@@ -1100,10 +1110,13 @@ where
                 tokio::spawn(async move {
                     let Ok(upgraded) = hyper::upgrade::on(req).await else { return };
                     let (reader, writer) = tokio::io::split(TokioIo::new(upgraded));
-                    let writer = Arc::new(tokio::sync::Mutex::new(WsWriter { writer, closed: false, poisoned: false }));
+                    let sink = Arc::new(WsSink {
+                        writer: tokio::sync::Mutex::new(WsWriter { writer, closed: false }),
+                        poisoned: AtomicBool::new(false),
+                    });
                     let shutdown = CancellationToken::new();
-                    let watcher = tokio::spawn(watch_websocket(reader, Arc::clone(&writer), shutdown.clone()));
-                    run(StreamSink { dest: SinkDest::Ws(writer), shutdown, watcher: Some(watcher) }).await;
+                    let watcher = tokio::spawn(watch_websocket(reader, Arc::clone(&sink), shutdown.clone()));
+                    run(StreamSink { dest: SinkDest::Ws(sink), shutdown, watcher: Some(watcher) }).await;
                 });
                 resp
             }
