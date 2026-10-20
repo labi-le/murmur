@@ -318,6 +318,7 @@ mod tests {
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
     use tokio::net::{TcpListener, TcpStream};
     use tokio::runtime::Handle;
+    use tokio::sync::Notify;
     use tokio_util::sync::CancellationToken;
 
     use super::new_health_check;
@@ -393,11 +394,12 @@ mod tests {
         name: String,
         mode: ProbeMode,
         completed: AtomicUsize,
+        started: Notify,
     }
 
     impl StubProxy {
         fn new(name: &str, mode: ProbeMode) -> Arc<Self> {
-            Arc::new(Self { name: name.to_owned(), mode, completed: AtomicUsize::new(0) })
+            Arc::new(Self { name: name.to_owned(), mode, completed: AtomicUsize::new(0), started: Notify::new() })
         }
     }
 
@@ -490,6 +492,7 @@ mod tests {
             _url: &str,
             _expected_status: IntRanges<u16>,
         ) -> anyhow::Result<u16> {
+            self.started.notify_one();
             if matches!(self.mode, ProbeMode::Stall) {
                 ctx.cancelled().await;
             }
@@ -555,13 +558,16 @@ mod tests {
             let hc = Arc::clone(&hc);
             tokio::spawn(async move { hc.check().await })
         };
-        for _ in 0..8 {
-            tokio::task::yield_now().await;
-        }
+        tokio::time::timeout(Duration::from_secs(1), proxy.started.notified())
+            .await
+            .expect("the probe must start before the provider is closed");
         let started = tokio::time::Instant::now();
 
         hc.close();
-        checking.await.unwrap();
+        tokio::time::timeout(Duration::from_secs(1), checking)
+            .await
+            .expect("the check must finish after close instead of hanging")
+            .unwrap();
 
         assert_eq!(proxy.completed.load(Ordering::SeqCst), 1, "provider close must complete the in-flight probe");
         assert!(
@@ -594,36 +600,68 @@ mod tests {
         let proxy_dyn: Arc<dyn Proxy> = proxy_arc;
         let hc = new_health_check(vec![proxy_dyn], &url, 5000, 0, false, expected);
 
-        hc.check().await;
+        tokio::time::timeout(Duration::from_secs(5), hc.check()).await.expect("the health check must finish");
 
         assert!(proxy.alive_for_test_url(&url), "a 200 response must publish an alive state");
         assert_ne!(proxy.last_delay_for_test_url(&url), 0, "a successful probe must publish a measured delay");
-        responder.await.unwrap();
+        tokio::time::timeout(Duration::from_secs(5), responder).await.expect("the responder must finish").unwrap();
     }
 
     #[tokio::test]
     async fn a_real_stalled_probe_is_cancelled_at_the_deadline_and_publishes_an_unhealthy_state() {
-        let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).await.unwrap();
-        let addr = listener.local_addr().unwrap();
-        let responder = tokio::spawn(async move {
-            let _stream = accept_head(listener).await;
+        let alive_listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).await.unwrap();
+        let alive_addr = alive_listener.local_addr().unwrap();
+        let alive_responder = tokio::spawn(async move {
+            let mut stream = accept_head(alive_listener).await;
+            stream.write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 0\r\n\r\n").await.unwrap();
+        });
+        let stalled_listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).await.unwrap();
+        let stalled_addr = stalled_listener.local_addr().unwrap();
+        let stalled_responder = tokio::spawn(async move {
+            let _stream = accept_head(stalled_listener).await;
             tokio::time::sleep(Duration::from_secs(60)).await;
         });
 
         let proxy = AdapterProxy::new(new_direct());
-        let url = format!("http://{addr}/health");
-        let expected = new_unsigned_ranges::<u16>("200").unwrap();
-        let proxy_arc: Arc<AdapterProxy> = Arc::clone(&proxy);
-        let proxy_dyn: Arc<dyn Proxy> = proxy_arc;
-        let hc = new_health_check(vec![proxy_dyn], &url, 200, 0, false, expected);
+        let alive_url = format!("http://{alive_addr}/alive");
+        let alive_proxy: Arc<dyn Proxy> = {
+            let proxy_arc: Arc<AdapterProxy> = Arc::clone(&proxy);
+            proxy_arc
+        };
+        let alive_expected = new_unsigned_ranges::<u16>("200").unwrap();
+        let alive_hc = new_health_check(vec![alive_proxy], &alive_url, 5000, 0, false, alive_expected);
+        tokio::time::timeout(Duration::from_secs(5), alive_hc.check())
+            .await
+            .expect("the control health check must finish");
+        assert!(
+            proxy.alive_for_test_url(&alive_url),
+            "the control probe must establish an alive state before the timeout case"
+        );
+        tokio::time::timeout(Duration::from_secs(5), alive_responder)
+            .await
+            .expect("the control responder must finish")
+            .unwrap();
+
+        let stalled_url = format!("http://{stalled_addr}/stalled");
+        let stalled_proxy: Arc<dyn Proxy> = {
+            let proxy_arc: Arc<AdapterProxy> = Arc::clone(&proxy);
+            proxy_arc
+        };
+        let stalled_expected = new_unsigned_ranges::<u16>("200").unwrap();
+        let stalled_hc = new_health_check(vec![stalled_proxy], &stalled_url, 200, 0, false, stalled_expected);
         let started = Instant::now();
 
-        hc.check().await;
+        tokio::time::timeout(Duration::from_secs(5), stalled_hc.check())
+            .await
+            .expect("the stalled health check must finish shortly after its timeout");
 
         assert!(
-            !proxy.alive_for_test_url(&url),
-            "the timed-out probe must publish an unhealthy state instead of leaving the previous one"
+            !proxy.alive_for_test_url(&stalled_url),
+            "the timed-out probe must publish an unhealthy per-URL state instead of leaving the previous one"
         );
+        let history = proxy.delay_history_for_test_url(&stalled_url);
+        assert_eq!(history.len(), 1, "the timed-out probe must publish a new history entry");
+        assert_eq!(history[0].delay, 0, "a timed-out probe records a zero delay");
         assert!(
             started.elapsed() >= Duration::from_millis(200),
             "the probe must be cancelled by the configured timeout, not earlier"
@@ -632,7 +670,7 @@ mod tests {
             started.elapsed() < Duration::from_secs(5),
             "the probe must finish shortly after its own timeout, without waiting for the client timeout"
         );
-        responder.abort();
-        let _ = responder.await;
+        stalled_responder.abort();
+        let _ = tokio::time::timeout(Duration::from_secs(5), stalled_responder).await;
     }
 }
