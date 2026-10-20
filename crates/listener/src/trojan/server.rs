@@ -39,6 +39,7 @@ use murmur_common_net::new_cached_conn;
 use murmur_common_net::packet::datagram::WaitReadFromDatagram;
 use murmur_common_net::sing::ExtendedConn as SingExtendedConn;
 use murmur_common_net::websocket::get_websocket_sec_accept;
+use murmur_common_pool as pool;
 use murmur_component_ca::auth::{
     client_auth_type_from_string, NO_CLIENT_CERT, REQUIRE_AND_VERIFY_CLIENT_CERT, VERIFY_CLIENT_CERT_IF_GIVEN,
 };
@@ -480,12 +481,16 @@ impl Listener {
                         if err.is_err() {
                             if let Some(put) = put {
                                 put();
+                            } else {
+                                let _ = pool::put(data);
                             }
                             break;
                         }
                         let Some(addr) = addr else {
                             if let Some(put) = put {
                                 put();
+                            } else {
+                                let _ = pool::put(data);
                             }
                             continue;
                         };
@@ -493,6 +498,8 @@ impl Listener {
                         let Some(target) = socks5::parse_addr_to_socks_addr(&udp_addr) else {
                             if let Some(put) = put {
                                 put();
+                            } else {
+                                let _ = pool::put(data);
                             }
                             continue;
                         };
