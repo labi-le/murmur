@@ -120,6 +120,14 @@ pub fn new_record_conn(conn: Box<dyn Stream>, method: &str, base_send: &[u8], ba
 }
 
 impl RecordConn {
+    /// Allocated capacity of the reusable receive frame buffer, in bytes.
+    ///
+    /// Bounded by the 65,535-byte protocol maximum; the `recv_alloc` bench reports it separately
+    /// from the allocations made while constructing the connection.
+    pub fn recv_buffer_capacity(&self) -> usize {
+        self.recv_body.capacity()
+    }
+
     pub fn rekey(&mut self, base_send: &[u8], base_recv: &[u8]) -> Result<()> {
         if self.method != "none" {
             validate_base_key(base_send).map_err(|err| anyhow!("invalid send base key: {err}"))?;

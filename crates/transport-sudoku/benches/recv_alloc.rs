@@ -4,9 +4,8 @@
 //! into a second buffer. Both `RecordConn` and `AEADConn` now keep one frame buffer per
 //! connection and serve plaintext in place, so after the first frame a steady read must not
 //! allocate. `dhat` is the global allocator: the steady-state delta is taken inside the async
-//! loop after a warm-up frame, and the retained figure is the live heap growth caused by
-//! constructing the reader and decrypting that first frame, which is the receive buffer the
-//! connection keeps.
+//! loop after a warm-up frame, and the buffer column is read from the connection itself after
+//! that warm-up, so connection-construction allocations are not folded into the buffer figure.
 #![allow(
     unreachable_pub,
     clippy::unwrap_used,
@@ -35,8 +34,8 @@ use parking_lot::Mutex;
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt, ReadBuf};
 
 use murmur_common_net::io::Stream;
-use murmur_transport_sudoku::crypto::aead::new_aead_conn;
-use murmur_transport_sudoku::crypto::record_conn::new_record_conn;
+use murmur_transport_sudoku::crypto::aead::{new_aead_conn, AEADConn};
+use murmur_transport_sudoku::crypto::record_conn::{new_record_conn, RecordConn};
 
 #[global_allocator]
 static ALLOC: dhat::Alloc = dhat::Alloc;
@@ -136,6 +135,29 @@ impl Stream for ReplayConn {
     }
 }
 
+enum Reader {
+    Record(RecordConn),
+    Aead(AEADConn),
+}
+
+impl Reader {
+    fn recv_buffer_capacity(&self) -> usize {
+        match self {
+            Self::Record(conn) => conn.recv_buffer_capacity(),
+            Self::Aead(conn) => conn.recv_buffer_capacity(),
+        }
+    }
+}
+
+impl AsyncRead for Reader {
+    fn poll_read(self: Pin<&mut Self>, cx: &mut Context<'_>, buf: &mut ReadBuf<'_>) -> Poll<io::Result<()>> {
+        match self.get_mut() {
+            Self::Record(conn) => Pin::new(conn).poll_read(cx, buf),
+            Self::Aead(conn) => Pin::new(conn).poll_read(cx, buf),
+        }
+    }
+}
+
 #[derive(Clone, Copy)]
 enum Sizes {
     Stable(usize),
@@ -193,15 +215,14 @@ fn run_case(
     label: &str,
     lens: &[usize],
     wire: Vec<u8>,
-    make_reader: impl FnOnce(Vec<u8>) -> Box<dyn AsyncRead + Unpin>,
+    make_reader: impl FnOnce(Vec<u8>) -> Reader,
 ) {
     let mut buf = vec![0u8; lens.iter().copied().max().expect("nonempty frame list")];
-    let before = dhat::HeapStats::get();
     let mut reader = make_reader(wire);
     rt.block_on(async {
         reader.read_exact(&mut buf[..lens[0]]).await.expect("warm frame");
     });
-    let retained = dhat::HeapStats::get().curr_bytes as i64 - before.curr_bytes as i64;
+    let buffer = reader.recv_buffer_capacity();
 
     let (blocks, bytes) = rt.block_on(async {
         let before = dhat::HeapStats::get();
@@ -214,11 +235,11 @@ fn run_case(
     });
     let operations = (lens.len() - 1) as f64;
     println!(
-        "{label:<34} {:>6} {:>12.3} {:>12.1} {:>14}",
+        "{label:<34} {:>6} {:>12.3} {:>12.1} {:>12}",
         lens.len(),
         blocks as f64 / operations,
         bytes as f64 / operations,
-        retained
+        buffer
     );
 }
 
@@ -228,7 +249,7 @@ fn main() -> ExitCode {
     rt.block_on(async {});
 
     println!("recv_alloc: heap allocations per decrypted frame, after one warm-up frame");
-    println!("{:<34} {:>6} {:>12} {:>12} {:>14}", "case", "frames", "blocks/op", "bytes/op", "retained bytes");
+    println!("{:<34} {:>6} {:>12} {:>12} {:>12}", "case", "frames", "blocks/op", "bytes/op", "buffer bytes");
 
     let cases = [
         ("record stable 1 KiB", Sizes::Stable(1_024), 2_048),
@@ -245,7 +266,7 @@ fn main() -> ExitCode {
         if label.starts_with("record ") {
             let wire = build_record_wire(&rt, &lens);
             run_case(&rt, label, &lens, wire, |wire| {
-                Box::new(
+                Reader::Record(
                     new_record_conn(Box::new(ReplayConn::new(wire)), METHOD, &RECV_KEY, &SEND_KEY)
                         .expect("record reader"),
                 )
@@ -253,7 +274,9 @@ fn main() -> ExitCode {
         } else {
             let wire = build_aead_wire(&rt, &lens);
             run_case(&rt, label, &lens, wire, |wire| {
-                Box::new(new_aead_conn(Box::new(ReplayConn::new(wire)), "shared-secret", METHOD).expect("aead reader"))
+                Reader::Aead(
+                    new_aead_conn(Box::new(ReplayConn::new(wire)), "shared-secret", METHOD).expect("aead reader"),
+                )
             });
         }
     }

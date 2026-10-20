@@ -156,6 +156,14 @@ pub struct AEADConn {
 }
 
 impl AEADConn {
+    /// Allocated capacity of the reusable receive frame buffer, in bytes.
+    ///
+    /// Bounded by the 65,535-byte protocol maximum; the `recv_alloc` bench reports it separately
+    /// from the allocations made while constructing the connection.
+    pub fn recv_buffer_capacity(&self) -> usize {
+        self.recv_body.capacity()
+    }
+
     /// Drops the frame in progress while keeping its allocation.
     ///
     /// Authentication and replay failures leave the completed frame in `recv_body`; resetting
