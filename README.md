@@ -1233,17 +1233,20 @@ by the unit test suite.
   the stream before it waits for that mutex, so a handler blocked on a peer that stopped reading
   still releases its subscription; that in-flight write is abandoned and marks the stream poisoned,
   and the connection is dropped rather than reusing it or appending a close frame after a partial
-  frame. Tests:
+  frame. A control frame (pong, close echo) bounds its lock acquisition and write together, so a
+  ping that cannot be answered because a data write owns the mutex does not hide the close that
+  follows it; a timeout cancels the stream and drops the connection. Tests:
   `a_closed_logs_stream_releases_its_subscription_without_a_qualifying_record`,
   `a_websocket_logs_client_is_answered_and_released_on_close`,
   `an_invalid_close_payload_is_answered_with_a_protocol_error`,
   `an_empty_close_payload_is_echoed`,
   `a_close_frame_stops_the_traffic_stream_before_its_next_frame`,
-  `a_close_frame_stops_an_hour_interval_connection_stream` and
-  `a_close_frame_releases_a_log_subscription_blocked_on_backpressure`; all but the empty-close
-  case fail on the previous form. A loopback `level=error` probe opened and closed 1,000 plain
-  HTTP streams and 1,000 websocket streams with no qualifying record: the process held 11
-  descriptors and no `CLOSE_WAIT` sockets before, between and after the churn, against 112
+  `a_close_frame_stops_an_hour_interval_connection_stream`,
+  `a_close_frame_releases_a_log_subscription_blocked_on_backpressure` and
+  `a_ping_before_close_releases_a_log_subscription_blocked_on_backpressure`; all but the
+  empty-close case fail on the previous form. A loopback `level=error` probe opened and closed
+  1,000 plain HTTP streams and 1,000 websocket streams with no qualifying record: the process held
+  11 descriptors and no `CLOSE_WAIT` sockets before, between and after the churn, against 112
   descriptors and 101 `CLOSE_WAIT` sockets for 100 websocket disconnects with only the old
   receive loop restored. A second probe sent a close frame to `/traffic`, `/memory`,
   `/logs?level=error` and
