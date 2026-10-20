@@ -56,6 +56,7 @@ murmur-listener-tproxy = { path = "../listener-tproxy" }
 murmur-log = { path = "../log" }
 murmur-ntp = { path = "../ntp" }
 murmur-tunnel = { path = "../tunnel" }
+murmur-ws = { path = "../ws" }
 
 # `/debug/pprof` needs a CPU sampler and a symbolizer the Rust std does not ship. The crate is
 # SIGPROF-based but only builds where `nix`/`findshlibs` do, so the profiling endpoints are

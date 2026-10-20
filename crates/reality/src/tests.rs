@@ -468,6 +468,47 @@ async fn a_padded_handshake_record_still_yields_its_message() {
     assert_eq!(layer.read_handshake_message().await.expect("read the padded record"), message);
 }
 
+/// The same padding rule on the application-data path: the content type sits ahead of the padding,
+/// and only the bytes before it reach the caller.
+#[tokio::test]
+async fn a_padded_application_data_record_yields_only_its_payload() {
+    let suite = CipherSuite::Aes128GcmSha256;
+    let key = [0x2eu8; 16];
+    let iv = [0x4au8; 12];
+    let (client, mut server) = tokio::io::duplex(1024);
+    let mut layer = RecordLayer::new(client);
+    layer.set_read_keys(suite, key.to_vec(), iv);
+
+    let mut inner = b"payload".to_vec();
+    inner.push(crate::handshake::CONTENT_TYPE_APPLICATION_DATA);
+    inner.extend_from_slice(&[0u8; 48]);
+    write_encrypted_record(&mut server, suite, &key, &iv, 0, &inner).await;
+
+    let (content_type, payload) = layer.read_record().await.expect("read the padded record");
+    assert_eq!(content_type, crate::handshake::CONTENT_TYPE_APPLICATION_DATA);
+    assert_eq!(payload, b"payload");
+}
+
+/// An inner plaintext made only of zeroes has no content type to strip padding at, so the record
+/// fails closed rather than surfacing as an empty application-data record.
+#[tokio::test]
+async fn an_all_zero_inner_plaintext_is_rejected() {
+    let suite = CipherSuite::Aes128GcmSha256;
+    let key = [0x63u8; 16];
+    let iv = [0x35u8; 12];
+    let (client, mut server) = tokio::io::duplex(1024);
+    let mut layer = RecordLayer::new(client);
+    layer.set_read_keys(suite, key.to_vec(), iv);
+
+    write_encrypted_record(&mut server, suite, &key, &iv, 0, &[0u8; 32]).await;
+
+    let error = layer.read_record().await.expect_err("an all-zero inner plaintext is not a record");
+    assert!(
+        error.to_string().contains("without a content type"),
+        "the error must name the missing content type, got: {error}"
+    );
+}
+
 /// The throttle starts full, so the burst allowance costs nothing and only the bytes past it are
 /// held back.
 #[test]

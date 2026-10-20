@@ -1,13 +1,16 @@
 use std::net::IpAddr;
+use std::sync::Arc;
 
 use murmur_common::lru;
 use murmur_common::lru::LruCache;
 
-/// The in-memory store. The cached IP's value is `Option<IpAddr>` (always `Some`) because
-/// `LruCache::get` requires `V: Default`, which `IpAddr` does not implement.
+/// The in-memory store. Both indexes hold the same `Arc<str>` handle for a hostname, so one
+/// insertion pair allocates the hostname once. The cached IP's value is `Option<IpAddr>` (always
+/// `Some`) because `LruCache::get` requires `V: Default`, which `IpAddr` does not implement; the
+/// reverse cache stores `Arc<str>`, whose `Default` is the empty string but is never written.
 pub(crate) struct MemoryStore {
-    cache_ip: LruCache<String, Option<IpAddr>>,
-    cache_host: LruCache<IpAddr, String>,
+    cache_ip: LruCache<Arc<str>, Option<IpAddr>>,
+    cache_host: LruCache<IpAddr, Arc<str>>,
 }
 
 impl MemoryStore {
@@ -18,15 +21,18 @@ impl MemoryStore {
         }
         #[expect(
             clippy::expect_used,
-            reason = "`cache_ip` is written only through `put_by_host`, which always stores `Some`, so the entry is present here"
+            reason = "`cache_ip` is written only through `put_pair`, which always stores `Some`, so the entry is present here"
         )]
         let ip = ip.expect("memoryStore.cache_ip always stores Some(ip)");
         self.cache_host.touch(&ip);
         Some(ip)
     }
 
-    pub(crate) fn put_by_host(&self, host: &str, ip: IpAddr) {
-        self.cache_ip.set(host.to_owned(), Some(ip));
+    /// Stores both directions with one hostname allocation shared by the forward key, its LRU
+    /// entry key and the reverse value.
+    pub(crate) fn put_pair(&self, host: Arc<str>, ip: IpAddr) {
+        self.cache_ip.set(Arc::clone(&host), Some(ip));
+        self.cache_host.set(ip, host);
     }
 
     pub(crate) fn by_ip(&self, ip: IpAddr) -> Option<String> {
@@ -34,12 +40,9 @@ impl MemoryStore {
         if !exist {
             return None;
         }
-        self.cache_ip.touch(&host);
+        let host = String::from(&*host);
+        self.cache_ip.touch(host.as_str());
         Some(host)
-    }
-
-    pub(crate) fn put_by_ip(&self, ip: IpAddr, host: &str) {
-        self.cache_host.set(ip, host.to_owned());
     }
 
     pub(crate) fn del_by_ip(&self, ip: IpAddr) {
@@ -80,8 +83,7 @@ mod tests {
     }
 
     fn put_pair(store: &MemoryStore, host: &str, ip: IpAddr) {
-        store.put_by_host(host, ip);
-        store.put_by_ip(ip, host);
+        store.put_pair(Arc::from(host), ip);
     }
 
     #[test]

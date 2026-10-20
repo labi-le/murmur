@@ -9,6 +9,7 @@ use murmur_adapter_inbound::packet::new_packet;
 use murmur_common::sockopt::reuse_common::udp_reuseaddr;
 use murmur_common_net::packet::packet::EnhancePacketConn;
 use murmur_common_net::packet_file::new_enhance_packet_conn;
+use murmur_common_pool as pool;
 use murmur_constant::listener::InboundListenConfig;
 use murmur_constant::metadata::Type;
 use murmur_constant::tunnel::Tunnel;
@@ -58,6 +59,8 @@ impl BoundUdp {
                 if result.is_err() {
                     if let Some(put) = put {
                         put();
+                    } else {
+                        let _ = pool::put(data);
                     }
                     if listener.closed.load(Ordering::SeqCst) {
                         break;
@@ -67,16 +70,25 @@ impl BoundUdp {
                 let Some(remote_addr) = remote_addr else {
                     if let Some(put) = put {
                         put();
+                    } else {
+                        let _ = pool::put(data);
                     }
                     continue;
                 };
                 let Ok(remote_addr) = murmur_common_net::io::old_addr_to_socket_addr(remote_addr.as_ref()) else {
                     if let Some(put) = put {
                         put();
+                    } else {
+                        let _ = pool::put(data);
                     }
                     continue;
                 };
+                let pooled = put.is_none();
                 handle_socks_udp(Arc::clone(&conn).into_packet_conn(), &tunnel, &data, put, remote_addr, &additions);
+                // `handle_socks_udp` copies the payload out; a transferred block is free again.
+                if pooled {
+                    let _ = pool::put(data);
+                }
             }
         });
     }
