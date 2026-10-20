@@ -11,6 +11,13 @@ use murmur_std_compat::net::{Addr, PacketConn};
 use super::packet_posix::EnhanceUDPConn;
 #[cfg(target_os = "windows")]
 use super::packet_windows::EnhanceUDPConn;
+
+/// A pooled datagram read.
+///
+/// `put == Some` means `data` is an ordinary payload and the callback releases the pooled block
+/// behind it. `put == None` means `data` **is** the pooled block, owned by the caller, which must
+/// return it with `murmur_common_pool::put(data)` once done; dropping it instead is safe but loses
+/// the block for reuse.
 #[async_trait]
 pub trait WaitReadFrom: Send + Sync {
     async fn wait_read_from(

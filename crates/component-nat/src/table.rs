@@ -24,6 +24,10 @@ pub(crate) struct Entry {
 }
 
 impl NatTable for Table {
+    fn get(&self, key: &str) -> Option<Arc<dyn PacketSender>> {
+        self.get_entry(key).map(|entry| Arc::clone(&entry.packet_sender))
+    }
+
     fn get_or_create(
         &self,
         key: &str,
@@ -110,6 +114,8 @@ pub fn new() -> Table {
 #[cfg(test)]
 mod tests {
     use std::net::{IpAddr, Ipv4Addr};
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::Barrier;
 
     use murmur_constant::adapters::{PacketAdapter, PacketConn, WriteBackProxy};
     use murmur_constant::metadata::Metadata;
@@ -159,5 +165,90 @@ mod tests {
             table.get_for_local_conn("entry.example:1", "192.0.2.10:5353").is_none(),
             "an unstored remote address was found"
         );
+    }
+
+    #[tokio::test]
+    async fn an_established_entry_is_visible_to_the_borrowed_lookup_until_deleted() {
+        let table = Table::default();
+        assert!(table.get("lookup.example:1").is_none(), "an absent key produced a sender");
+
+        let (sender, loaded) = table.get_or_create("lookup.example:1", Box::new(|| Arc::new(NoopSender)));
+        assert!(!loaded, "the first get_or_create stores the entry");
+
+        let found = table.get("lookup.example:1").expect("the established key is not visible to the fast lookup");
+        assert!(Arc::ptr_eq(&sender, &found), "the fast lookup built or found another sender");
+
+        table.delete("lookup.example:1");
+        assert!(table.get("lookup.example:1").is_none(), "a deleted key remains visible to the fast lookup");
+    }
+
+    /// The established fast path misses first and then falls back to `get_or_create`, which is what
+    /// the UDP loop does. Concurrent misses on one key must still run one maker and hand every
+    /// caller the same sender.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn concurrent_fast_path_misses_build_one_sender() {
+        const THREADS: usize = 8;
+        let table = Arc::new(Table::default());
+        let made = Arc::new(AtomicUsize::new(0));
+        let barrier = Arc::new(Barrier::new(THREADS));
+        let mut handles = Vec::with_capacity(THREADS);
+        for _ in 0..THREADS {
+            let table = Arc::clone(&table);
+            let made = Arc::clone(&made);
+            let barrier = Arc::clone(&barrier);
+            handles.push(std::thread::spawn(move || {
+                barrier.wait();
+                // The fast lookup may miss or may observe another thread's entry; either way the
+                // create below is the only path that can build a sender.
+                let _ = table.get("race.example:1");
+                let (sender, _) = table.get_or_create(
+                    "race.example:1",
+                    Box::new(move || {
+                        made.fetch_add(1, Ordering::SeqCst);
+                        Arc::new(NoopSender)
+                    }),
+                );
+                sender
+            }));
+        }
+        let senders: Vec<_> =
+            handles.into_iter().map(|handle| handle.join().expect("a racing thread panicked")).collect();
+
+        assert_eq!(made.load(Ordering::SeqCst), 1, "the maker ran more than once for one key");
+        let first = table.get("race.example:1").expect("the winning entry is stored");
+        assert!(senders.iter().all(|sender| Arc::ptr_eq(sender, &first)), "callers saw different senders");
+    }
+
+    #[tokio::test]
+    async fn deleting_and_recreating_a_key_produces_a_new_sender() {
+        let table = Table::default();
+        let made = Arc::new(AtomicUsize::new(0));
+
+        let count = Arc::clone(&made);
+        let (first, loaded) = table.get_or_create(
+            "recreate.example:1",
+            Box::new(move || {
+                count.fetch_add(1, Ordering::SeqCst);
+                Arc::new(NoopSender)
+            }),
+        );
+        assert!(!loaded, "the first get_or_create stores the entry");
+
+        table.delete("recreate.example:1");
+        assert!(table.get("recreate.example:1").is_none(), "a deleted key remains visible to the fast lookup");
+
+        let count = Arc::clone(&made);
+        let (second, loaded) = table.get_or_create(
+            "recreate.example:1",
+            Box::new(move || {
+                count.fetch_add(1, Ordering::SeqCst);
+                Arc::new(NoopSender)
+            }),
+        );
+        assert!(!loaded, "the deleted entry was reused");
+        assert_eq!(made.load(Ordering::SeqCst), 2, "the deleted entry did not require a second maker");
+        assert!(!Arc::ptr_eq(&first, &second), "recreation returned the deleted sender");
+        let found = table.get("recreate.example:1").expect("the recreated key is not visible to the fast lookup");
+        assert!(Arc::ptr_eq(&second, &found), "the fast lookup returned the deleted sender");
     }
 }
