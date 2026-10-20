@@ -989,6 +989,7 @@ async fn close_websocket(writer: &tokio::sync::Mutex<WsWriter>, payload: &[u8]) 
     }
     sink.closed = true;
     let _ = ws_write_server_message(&mut sink.writer, murmur_ws::OP_CLOSE.0, payload).await;
+    drop(sink);
 }
 
 /// RFC 6455 §5.5.1: an empty close payload is valid, a single byte is malformed, and any other
