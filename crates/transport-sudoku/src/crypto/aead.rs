@@ -5,7 +5,6 @@ use std::task::{ready, Context, Poll};
 use aes_gcm::aead::{AeadInOut, Key, Nonce, Tag};
 use aes_gcm::{Aes128Gcm, KeyInit as _};
 use anyhow::{anyhow, Result};
-use bytes::BytesMut;
 use chacha20poly1305::ChaCha20Poly1305;
 use rand::rngs::OsRng;
 use rand::TryRngCore;
@@ -133,20 +132,43 @@ impl Aead for ChaCha20Poly1305Aead {
 /// The per-frame cap is `65535` minus the nonce size and the AEAD overhead.
 const MAX_FRAME_BODY_SIZE: usize = 65535;
 
+/// Framed AEAD connection without record headers or replay protection.
+///
+/// `recv_body` is reused across frames: it holds the nonce and ciphertext while the body is read
+/// and the decrypted plaintext in place afterwards. Capacity is bounded by the frame length field
+/// (`u16`), so a connection that once saw a maximum-size frame keeps one such buffer.
 pub struct AEADConn {
     conn: Box<dyn Stream>,
     aead: Option<Arc<dyn Aead>>,
-    read_buf: BytesMut,
     nonce_size: usize,
 
     write_frame: Vec<u8>,
     write_frame_sent: usize,
     write_frame_plain_len: usize,
 
+    recv_need_len: bool,
     recv_header: [u8; 2],
     recv_header_filled: usize,
     recv_body: Vec<u8>,
     recv_body_filled: usize,
+    recv_plain_off: usize,
+    recv_plain_end: usize,
+}
+
+impl AEADConn {
+    /// Drops the frame in progress while keeping its allocation.
+    ///
+    /// Authentication and replay failures leave the completed frame in `recv_body`; resetting
+    /// before returning the error keeps the next `poll_read` on a frame boundary, as it was when
+    /// every record owned its buffer.
+    fn reset_recv_frame(&mut self) {
+        self.recv_need_len = true;
+        self.recv_header_filled = 0;
+        self.recv_body.clear();
+        self.recv_body_filled = 0;
+        self.recv_plain_off = 0;
+        self.recv_plain_end = 0;
+    }
 }
 
 impl core::fmt::Debug for AEADConn {
@@ -206,15 +228,17 @@ pub fn new_aead_conn(conn: Box<dyn Stream>, key: &str, method: &str) -> Result<A
         return Ok(AEADConn {
             conn,
             aead: None,
-            read_buf: BytesMut::new(),
             nonce_size: 0,
             write_frame: Vec::new(),
             write_frame_sent: 0,
             write_frame_plain_len: 0,
+            recv_need_len: true,
             recv_header: [0u8; 2],
             recv_header_filled: 0,
             recv_body: Vec::new(),
             recv_body_filled: 0,
+            recv_plain_off: 0,
+            recv_plain_end: 0,
         });
     }
 
@@ -236,15 +260,17 @@ pub fn new_aead_conn(conn: Box<dyn Stream>, key: &str, method: &str) -> Result<A
     Ok(AEADConn {
         conn,
         aead: Some(aead),
-        read_buf: BytesMut::new(),
         nonce_size,
         write_frame: Vec::new(),
         write_frame_sent: 0,
         write_frame_plain_len: 0,
+        recv_need_len: true,
         recv_header: [0u8; 2],
         recv_header_filled: 0,
         recv_body: Vec::new(),
         recv_body_filled: 0,
+        recv_plain_off: 0,
+        recv_plain_end: 0,
     })
 }
 
@@ -325,22 +351,24 @@ impl AsyncRead for AEADConn {
             return Pin::new(&mut this.conn).poll_read(cx, buf);
         };
 
-        if !this.read_buf.is_empty() {
-            let n = std::cmp::min(buf.remaining(), this.read_buf.len());
-            if n == 0 {
-                return Poll::Ready(Ok(()));
-            }
-            buf.put_slice(&this.read_buf.split_to(n));
-            return Poll::Ready(Ok(()));
-        }
-
-        if this.recv_body.is_empty() {
+        if this.recv_need_len {
             match poll_read_exact(&mut this.conn, cx, &mut this.recv_header, &mut this.recv_header_filled) {
                 Poll::Ready(Ok(true)) => {
                     let frame_len = u16::from_be_bytes(this.recv_header) as usize;
                     this.recv_header_filled = 0;
-                    this.recv_body = vec![0u8; frame_len];
+                    if frame_len < this.nonce_size {
+                        this.reset_recv_frame();
+                        return Poll::Ready(Err(std::io::Error::other("frame too short")));
+                    }
+                    if this.recv_body.len() < frame_len {
+                        this.recv_body.resize(frame_len, 0);
+                    } else {
+                        this.recv_body.truncate(frame_len);
+                    }
                     this.recv_body_filled = 0;
+                    this.recv_plain_off = this.nonce_size;
+                    this.recv_plain_end = this.nonce_size;
+                    this.recv_need_len = false;
                 }
                 Poll::Ready(Ok(false)) => return Poll::Ready(Ok(())),
                 Poll::Ready(Err(err)) => return Poll::Ready(Err(err)),
@@ -348,33 +376,47 @@ impl AsyncRead for AEADConn {
             }
         }
 
-        match poll_read_exact(&mut this.conn, cx, &mut this.recv_body, &mut this.recv_body_filled) {
-            Poll::Ready(Ok(true)) => {}
-            Poll::Ready(Ok(false)) => return Poll::Ready(Ok(())),
-            Poll::Ready(Err(err)) => return Poll::Ready(Err(err)),
-            Poll::Pending => return Poll::Pending,
+        if this.recv_body_filled < this.recv_body.len() {
+            match poll_read_exact(&mut this.conn, cx, &mut this.recv_body, &mut this.recv_body_filled) {
+                Poll::Ready(Ok(true)) => {}
+                Poll::Ready(Ok(false)) => return Poll::Ready(Ok(())),
+                Poll::Ready(Err(err)) => return Poll::Ready(Err(err)),
+                Poll::Pending => return Poll::Pending,
+            }
+
+            if this.nonce_size != 12 {
+                this.reset_recv_frame();
+                return Poll::Ready(Err(std::io::Error::other("unsupported aead nonce size")));
+            }
+
+            let plain_len = {
+                let (nonce_bytes, payload) = this.recv_body.split_at_mut(12);
+                let mut nonce = [0u8; 12];
+                nonce.copy_from_slice(nonce_bytes);
+                match aead.open_in_place(&nonce, payload, &[]) {
+                    Ok(plaintext) => plaintext.len(),
+                    Err(_) => {
+                        this.reset_recv_frame();
+                        return Poll::Ready(Err(std::io::Error::other("decryption failed")));
+                    }
+                }
+            };
+            this.recv_plain_end = this.nonce_size + plain_len;
+            if this.recv_plain_off == this.recv_plain_end {
+                this.recv_need_len = true;
+            }
         }
 
-        let mut body = std::mem::take(&mut this.recv_body);
-        this.recv_body_filled = 0;
-        if body.len() < this.nonce_size {
-            return Poll::Ready(Err(std::io::Error::other("frame too short")));
+        let n = std::cmp::min(buf.remaining(), this.recv_plain_end - this.recv_plain_off);
+        if n == 0 {
+            return Poll::Ready(Ok(()));
         }
-        if this.nonce_size != 12 {
-            return Poll::Ready(Err(std::io::Error::other("unsupported aead nonce size")));
-        }
-        let (nonce_bytes, payload) = body.split_at_mut(12);
-        let mut nonce = [0u8; 12];
-        nonce.copy_from_slice(nonce_bytes);
-        let Ok(plaintext) = aead.open_in_place(&nonce, payload, &[]) else {
-            return Poll::Ready(Err(std::io::Error::other("decryption failed")));
-        };
-
-        this.read_buf.extend_from_slice(plaintext);
-
-        let n = std::cmp::min(buf.remaining(), this.read_buf.len());
-        if n > 0 {
-            buf.put_slice(&this.read_buf.split_to(n));
+        let (_, pending) = this.recv_body.split_at(this.recv_plain_off);
+        let (chunk, _) = pending.split_at(n);
+        buf.put_slice(chunk);
+        this.recv_plain_off += n;
+        if this.recv_plain_off == this.recv_plain_end {
+            this.recv_need_len = true;
         }
         Poll::Ready(Ok(()))
     }
@@ -473,6 +515,118 @@ mod tests {
         for method in ["chacha20-poly1305", "aes-128-gcm", "none"] {
             round_trip(method).await;
         }
+    }
+
+    struct ReplayConn {
+        reader: std::io::Cursor<Vec<u8>>,
+    }
+
+    impl ReplayConn {
+        fn new(data: Vec<u8>) -> Self {
+            Self { reader: std::io::Cursor::new(data) }
+        }
+    }
+
+    impl AsyncRead for ReplayConn {
+        fn poll_read(self: Pin<&mut Self>, _cx: &mut Context<'_>, buf: &mut ReadBuf<'_>) -> Poll<std::io::Result<()>> {
+            let n = std::io::Read::read(&mut self.get_mut().reader, buf.initialize_unfilled())?;
+            buf.advance(n);
+            Poll::Ready(Ok(()))
+        }
+    }
+
+    impl AsyncWrite for ReplayConn {
+        fn poll_write(self: Pin<&mut Self>, _cx: &mut Context<'_>, buf: &[u8]) -> Poll<std::io::Result<usize>> {
+            Poll::Ready(Ok(buf.len()))
+        }
+
+        fn poll_flush(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<std::io::Result<()>> {
+            Poll::Ready(Ok(()))
+        }
+
+        fn poll_shutdown(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<std::io::Result<()>> {
+            Poll::Ready(Ok(()))
+        }
+    }
+
+    impl Stream for ReplayConn {
+        fn local_addr(&self) -> std::io::Result<SocketAddr> {
+            Ok(SocketAddr::new(IpAddr::V4(Ipv4Addr::UNSPECIFIED), 0))
+        }
+
+        fn peer_addr(&self) -> std::io::Result<SocketAddr> {
+            Ok(SocketAddr::new(IpAddr::V4(Ipv4Addr::UNSPECIFIED), 0))
+        }
+    }
+
+    fn aead_frame(aead: &dyn Aead, nonce: [u8; 12], payload: &[u8]) -> Vec<u8> {
+        let body_len = 12 + payload.len() + aead.overhead();
+        let mut frame = Vec::with_capacity(2 + body_len);
+        frame.extend_from_slice(&(body_len as u16).to_be_bytes());
+        frame.extend_from_slice(&nonce);
+        aead.seal(&mut frame, &nonce, payload, &[]).expect("seal frame");
+        frame
+    }
+
+    fn aead_wire(payloads: &[Vec<u8>]) -> Vec<u8> {
+        let digest = Sha256::digest(b"shared-secret");
+        let aead = ChaCha20Poly1305Aead::new(&digest).expect("chacha20-poly1305 key");
+        let mut wire = Vec::new();
+        for (index, payload) in payloads.iter().enumerate() {
+            let mut nonce = [0u8; 12];
+            nonce[..8].copy_from_slice(&(index as u64).to_be_bytes());
+            wire.extend_from_slice(&aead_frame(&aead, nonce, payload));
+        }
+        wire
+    }
+
+    #[tokio::test]
+    async fn aead_conn_reuses_the_receive_buffer_across_frames() {
+        let payloads: Vec<Vec<u8>> =
+            (0..10).map(|i| if i % 2 == 0 { vec![0x11; 1_024] } else { vec![0x22; 16 * 1_024] }).collect();
+        let mut reader =
+            new_aead_conn(Box::new(ReplayConn::new(aead_wire(&payloads))), "shared-secret", "chacha20-poly1305")
+                .expect("reader");
+
+        let mut settled_capacity = 0usize;
+        for (index, payload) in payloads.iter().enumerate() {
+            let mut got = vec![0u8; payload.len()];
+            reader.read_exact(&mut got).await.expect("read");
+            assert_eq!(&got, payload, "payload {index} mismatch");
+            if index == 1 {
+                settled_capacity = reader.recv_body.capacity();
+                assert!(settled_capacity >= 16 * 1_024 + 12 + 16, "unexpected capacity {settled_capacity}");
+            } else if index > 1 {
+                assert_eq!(
+                    reader.recv_body.capacity(),
+                    settled_capacity,
+                    "alternating frame sizes must not grow the receive buffer after frame {index}"
+                );
+            }
+        }
+        assert!(
+            reader.recv_body.capacity() <= MAX_FRAME_BODY_SIZE,
+            "retained receive capacity must stay within one protocol maximum"
+        );
+    }
+
+    #[tokio::test]
+    async fn aead_conn_rejects_a_tampered_tag_and_resumes_at_the_next_frame() {
+        let first = b"authenticated frame".to_vec();
+        let second = b"frame after the failure".to_vec();
+        let mut wire = aead_wire(&[first.clone(), second.clone()]);
+        let body_len = u16::from_be_bytes([wire[0], wire[1]]) as usize;
+        wire[2 + body_len - 1] ^= 0xff;
+
+        let mut reader =
+            new_aead_conn(Box::new(ReplayConn::new(wire)), "shared-secret", "chacha20-poly1305").expect("reader");
+
+        let mut rejected = vec![0u8; first.len()];
+        reader.read_exact(&mut rejected).await.expect_err("tampered tag must fail");
+
+        let mut got = vec![0u8; second.len()];
+        reader.read_exact(&mut got).await.expect("next frame after a tag failure");
+        assert_eq!(got, second, "receive state must be reset to the next frame boundary");
     }
 
     fn hex(s: &str) -> Vec<u8> {
