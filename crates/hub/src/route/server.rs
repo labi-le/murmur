@@ -311,7 +311,12 @@ fn traffic(req: Req) -> Response<RespBody> {
         let mut tick = tokio::time::interval(std::time::Duration::from_secs(1));
         tick.tick().await;
         loop {
-            tick.tick().await;
+            // cancel-safe: `closed` only observes the sink's token, and a dropped `Interval::tick`
+            // leaves the next tick pending rather than losing it.
+            tokio::select! {
+                () = sink.closed() => break,
+                _ = tick.tick() => {}
+            }
             let (up, down) = DEFAULT_MANAGER.now();
             let (up_total, down_total) = DEFAULT_MANAGER.total();
             let buf = encode_json(&Traffic { up, down, up_total, down_total });
@@ -328,7 +333,11 @@ fn memory(req: Req) -> Response<RespBody> {
         tick.tick().await;
         let mut first = true;
         loop {
-            tick.tick().await;
+            // cancel-safe: see `traffic`.
+            tokio::select! {
+                () = sink.closed() => break,
+                _ = tick.tick() => {}
+            }
             let mut inuse = DEFAULT_MANAGER.memory().await;
             if first {
                 inuse = 0;
@@ -2065,10 +2074,13 @@ mod tests {
         assert!(RouterState::from_config(&Config::default()).secret.is_empty());
     }
 
-    /// Serves `get_logs` over one raw loopback connection. The returned receiver resolves when
-    /// hyper's connection task finishes, which for a streaming response only happens once the
+    /// Serves one streaming route over a raw loopback connection. The returned receiver resolves
+    /// when hyper's connection task finishes, which for a streaming response only happens once the
     /// handler stops holding the body sender.
-    async fn open_logs(request: &str) -> (TcpStream, tokio::sync::oneshot::Receiver<()>) {
+    async fn open_stream(
+        request: &str,
+        route: fn(Req) -> Response<RespBody>,
+    ) -> (TcpStream, tokio::sync::oneshot::Receiver<()>) {
         use tokio::io::AsyncWriteExt as _;
         use tokio::net::TcpListener;
 
@@ -2077,7 +2089,7 @@ mod tests {
         let (done_tx, done_rx) = tokio::sync::oneshot::channel();
         tokio::spawn(async move {
             let (conn, _) = listener.accept().await.expect("accept loopback connection");
-            let service = hyper::service::service_fn(|req: Req| async move { Ok::<_, Infallible>(get_logs(req)) });
+            let service = hyper::service::service_fn(move |req: Req| async move { Ok::<_, Infallible>(route(req)) });
             let _ = hyper::server::conn::http1::Builder::new()
                 .serve_connection(TokioIo::new(conn), service)
                 .with_upgrades()
@@ -2088,6 +2100,13 @@ mod tests {
         let mut stream = TcpStream::connect(addr).await.expect("connect to loopback listener");
         stream.write_all(request.as_bytes()).await.expect("write request");
         (stream, done_rx)
+    }
+
+    fn websocket_request(path: &str) -> String {
+        format!(
+            "GET {path} HTTP/1.1\r\nHost: test\r\nUpgrade: websocket\r\nConnection: Upgrade\r\n\
+             Sec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\nSec-WebSocket-Version: 13\r\n\r\n"
+        )
     }
 
     async fn read_response_head(stream: &mut TcpStream) -> String {
@@ -2140,6 +2159,45 @@ mod tests {
         stream.write_all(&frame).await.expect("write websocket frame");
     }
 
+    /// Reads frames until `opcode` arrives, returning its payload and the text frames that
+    /// preceded it. A missing frame is a server that never closed, not a test hang.
+    async fn read_until_frame(stream: &mut TcpStream, opcode: u8) -> (Vec<Vec<u8>>, Vec<u8>) {
+        let mut text = Vec::new();
+        loop {
+            let (got, payload) = tokio::time::timeout(std::time::Duration::from_secs(2), read_server_frame(stream))
+                .await
+                .expect("the server must answer the close frame");
+            if got == opcode {
+                return (text, payload);
+            }
+            assert_eq!(got, 0x1, "unexpected frame opcode {got} before the close");
+            text.push(payload);
+        }
+    }
+
+    /// Reads the upgraded socket to EOF within two seconds; a data frame or an open socket means
+    /// the handler ignored the close.
+    async fn assert_socket_closed(stream: &mut TcpStream) {
+        use tokio::io::AsyncReadExt as _;
+
+        let mut byte = [0u8; 1];
+        let read = tokio::time::timeout(std::time::Duration::from_secs(2), stream.read(&mut byte))
+            .await
+            .expect("the server must close the upgraded socket after the close frame")
+            .expect("read after the close frame");
+        assert_eq!(read, 0, "the server must not send a frame after the close frame");
+    }
+
+    async fn wait_for_log_subscription() {
+        tokio::time::timeout(std::time::Duration::from_secs(2), async {
+            while !murmur_log::enabled(murmur_log::LogLevel::DEBUG) {
+                tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("the /logs handler must hold a subscription");
+    }
+
     /// The streaming routes share process-wide subscription state, so the two `/logs` tests must
     /// not observe each other's subscriber.
     static LOG_STREAM_TESTS: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
@@ -2152,10 +2210,10 @@ mod tests {
         murmur_log::set_level(murmur_log::LogLevel::ERROR);
 
         let (mut stream, done) =
-            open_logs("GET /logs?level=error HTTP/1.1\r\nHost: test\r\nConnection: close\r\n\r\n").await;
+            open_stream("GET /logs?level=error HTTP/1.1\r\nHost: test\r\nConnection: close\r\n\r\n", get_logs).await;
         let head = read_response_head(&mut stream).await;
         assert!(head.starts_with("HTTP/1.1 200 OK"), "{head}");
-        assert!(murmur_log::enabled(murmur_log::LogLevel::DEBUG), "the live stream must hold a log subscription");
+        wait_for_log_subscription().await;
 
         drop(stream);
         tokio::time::timeout(std::time::Duration::from_secs(2), async {
@@ -2166,7 +2224,10 @@ mod tests {
         .await
         .expect("closing the client must release the /logs subscription");
 
-        done.await.expect("server task reported completion");
+        tokio::time::timeout(std::time::Duration::from_secs(2), done)
+            .await
+            .expect("the server task must finish after the stream closes")
+            .expect("server task reported completion");
     }
 
     /// The websocket sink used to be write-only, so a peer that closed while no record qualified
@@ -2177,14 +2238,10 @@ mod tests {
         let _guard = LOG_STREAM_TESTS.lock().await;
         murmur_log::set_level(murmur_log::LogLevel::ERROR);
 
-        let (mut stream, _done) = open_logs(
-            "GET /logs?level=error HTTP/1.1\r\nHost: test\r\nUpgrade: websocket\r\n\
-             Connection: Upgrade\r\nSec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\n\
-             Sec-WebSocket-Version: 13\r\n\r\n",
-        )
-        .await;
+        let (mut stream, _done) = open_stream(&websocket_request("/logs?level=error"), get_logs).await;
         let head = read_response_head(&mut stream).await;
         assert!(head.starts_with("HTTP/1.1 101 Switching Protocols"), "{head}");
+        wait_for_log_subscription().await;
 
         write_client_frame(&mut stream, murmur_ws::OP_PING.0, b"hi").await;
         let (opcode, payload) = tokio::time::timeout(std::time::Duration::from_secs(2), read_server_frame(&mut stream))
@@ -2194,17 +2251,75 @@ mod tests {
         assert_eq!(payload, b"hi");
 
         write_client_frame(&mut stream, murmur_ws::OP_CLOSE.0, &[0x03, 0xe8]).await;
-        let (opcode, payload) = read_server_frame(&mut stream).await;
+        let (opcode, payload) = tokio::time::timeout(std::time::Duration::from_secs(2), read_server_frame(&mut stream))
+            .await
+            .expect("the server must echo a valid close frame");
         assert_eq!(opcode, murmur_ws::OP_CLOSE.0);
         assert_eq!(payload, [0x03, 0xe8]);
 
-        use tokio::io::AsyncReadExt as _;
-        let mut byte = [0u8; 1];
-        let read = tokio::time::timeout(std::time::Duration::from_secs(2), stream.read(&mut byte))
+        assert_socket_closed(&mut stream).await;
+    }
+
+    /// A close payload that RFC 6455 rejects must not be echoed back verbatim: a one-byte payload,
+    /// a reserved 1005 code and a non-UTF-8 reason all get a protocol-error close.
+    #[tokio::test]
+    async fn an_invalid_close_payload_is_answered_with_a_protocol_error() {
+        let _guard = LOG_STREAM_TESTS.lock().await;
+        murmur_log::set_level(murmur_log::LogLevel::ERROR);
+
+        for payload in [vec![0x78], vec![0x03, 0xed], vec![0x03, 0xe8, 0xff]] {
+            let (mut stream, _done) = open_stream(&websocket_request("/logs?level=error"), get_logs).await;
+            let head = read_response_head(&mut stream).await;
+            assert!(head.starts_with("HTTP/1.1 101 Switching Protocols"), "{head}");
+            wait_for_log_subscription().await;
+
+            write_client_frame(&mut stream, murmur_ws::OP_CLOSE.0, &payload).await;
+            let (opcode, reply) =
+                tokio::time::timeout(std::time::Duration::from_secs(2), read_server_frame(&mut stream))
+                    .await
+                    .expect("the server must answer an invalid close");
+            assert_eq!(opcode, murmur_ws::OP_CLOSE.0);
+            assert_eq!(reply, [0x03, 0xea], "invalid payload {payload:?} must not be echoed");
+
+            assert_socket_closed(&mut stream).await;
+        }
+    }
+
+    /// An empty close payload carries no status and is valid; it must be echoed rather than
+    /// answered with a protocol error.
+    #[tokio::test]
+    async fn an_empty_close_payload_is_echoed() {
+        let _guard = LOG_STREAM_TESTS.lock().await;
+        murmur_log::set_level(murmur_log::LogLevel::ERROR);
+
+        let (mut stream, _done) = open_stream(&websocket_request("/logs?level=error"), get_logs).await;
+        let head = read_response_head(&mut stream).await;
+        assert!(head.starts_with("HTTP/1.1 101 Switching Protocols"), "{head}");
+        wait_for_log_subscription().await;
+
+        write_client_frame(&mut stream, murmur_ws::OP_CLOSE.0, b"").await;
+        let (opcode, payload) = tokio::time::timeout(std::time::Duration::from_secs(2), read_server_frame(&mut stream))
             .await
-            .expect("the server must close the upgraded socket after the close frame")
-            .expect("read after the close frame");
-        assert_eq!(read, 0, "the server must close the upgraded socket");
+            .expect("the server must echo an empty close");
+        assert_eq!(opcode, murmur_ws::OP_CLOSE.0);
+        assert!(payload.is_empty(), "an empty close must be echoed empty: {payload:?}");
+
+        assert_socket_closed(&mut stream).await;
+    }
+
+    /// `/traffic` used to write its next tick after the close was echoed. The shared sink must
+    /// stop the stream first, so nothing follows the close frame.
+    #[tokio::test]
+    async fn a_close_frame_stops_the_traffic_stream_before_its_next_frame() {
+        let (mut stream, _done) = open_stream(&websocket_request("/traffic"), traffic).await;
+        let head = read_response_head(&mut stream).await;
+        assert!(head.starts_with("HTTP/1.1 101 Switching Protocols"), "{head}");
+
+        write_client_frame(&mut stream, murmur_ws::OP_CLOSE.0, &[0x03, 0xe8]).await;
+        let (_before, payload) = read_until_frame(&mut stream, murmur_ws::OP_CLOSE.0).await;
+        assert_eq!(payload, [0x03, 0xe8]);
+
+        assert_socket_closed(&mut stream).await;
     }
 }
 

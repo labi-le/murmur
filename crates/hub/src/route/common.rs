@@ -861,9 +861,20 @@ pub(crate) struct StreamSink {
     watcher: Option<JoinHandle<()>>,
 }
 
+/// An upgraded websocket's writer and the flag that orders the last data frame before the close
+/// frame.
+///
+/// The watcher also writes control frames, so both sides take this mutex: a data write either
+/// completes before the server's close frame goes out or observes `closed` and never starts, and
+/// the flag stays set even if the close write is cancelled half-way.
+struct WsWriter {
+    writer: tokio::io::WriteHalf<TokioIo<hyper::upgrade::Upgraded>>,
+    closed: bool,
+}
+
 enum SinkDest {
     Http(mpsc::Sender<Bytes>),
-    Ws(Arc<tokio::sync::Mutex<tokio::io::WriteHalf<TokioIo<hyper::upgrade::Upgraded>>>>),
+    Ws(Arc<tokio::sync::Mutex<WsWriter>>),
 }
 
 impl StreamSink {
@@ -873,9 +884,12 @@ impl StreamSink {
     pub(crate) async fn write_text(&mut self, data: &[u8]) -> bool {
         match &mut self.dest {
             SinkDest::Http(tx) => tx.send(Bytes::copy_from_slice(data)).await.is_ok(),
-            SinkDest::Ws(writer) => {
-                let mut writer = writer.lock().await;
-                ws_write_server_text(&mut *writer, data).await.is_ok()
+            SinkDest::Ws(sink) => {
+                let mut sink = sink.lock().await;
+                if sink.closed {
+                    return false;
+                }
+                ws_write_server_text(&mut sink.writer, data).await.is_ok()
             }
         }
     }
@@ -912,12 +926,13 @@ impl Drop for StreamSink {
 /// Streaming routes only write, but a websocket peer that closes while the server is quiet is
 /// otherwise invisible until the next application write. Reading the control stream turns that
 /// close (or EOF, or an I/O error) into [`StreamSink::closed`]. Ping is answered with a pong
-/// carrying the same payload, a close frame is echoed, and data frames are discarded.
-async fn watch_websocket<R, W>(mut reader: R, writer: Arc<tokio::sync::Mutex<W>>, shutdown: CancellationToken)
-where
-    R: AsyncRead + Unpin,
-    W: AsyncWrite + Unpin,
-{
+/// carrying the same payload, a valid close frame is echoed, an invalid one is answered with a
+/// protocol-error close, and data frames are discarded.
+async fn watch_websocket<R: AsyncRead + Unpin>(
+    mut reader: R,
+    writer: Arc<tokio::sync::Mutex<WsWriter>>,
+    shutdown: CancellationToken,
+) {
     let mut fragmented = false;
     loop {
         let Ok(Some(header)) = murmur_ws::read_header(&mut reader).await else { break };
@@ -928,23 +943,27 @@ where
         };
         if murmur_ws::check_header(&header, state).is_err() {
             let body = murmur_ws::new_close_frame_body(murmur_ws::STATUS_PROTOCOL_ERROR, b"");
-            let mut writer = writer.lock().await;
-            let _ = ws_write_server_message(&mut *writer, murmur_ws::OP_CLOSE.0, &body).await;
-            drop(writer);
+            close_websocket(&writer, &body).await;
             break;
         }
 
         if header.op_code.is_control() {
             let Some(payload) = read_ws_payload(&mut reader, &header).await else { break };
             if header.op_code == murmur_ws::OP_PING {
-                let mut writer = writer.lock().await;
-                if ws_write_server_message(&mut *writer, murmur_ws::OP_PONG.0, &payload).await.is_err() {
+                let mut sink = writer.lock().await;
+                if sink.closed {
+                    break;
+                }
+                if ws_write_server_message(&mut sink.writer, murmur_ws::OP_PONG.0, &payload).await.is_err() {
                     break;
                 }
             } else if header.op_code == murmur_ws::OP_CLOSE {
-                let mut writer = writer.lock().await;
-                let _ = ws_write_server_message(&mut *writer, murmur_ws::OP_CLOSE.0, &payload).await;
-                drop(writer);
+                if close_payload_is_valid(&payload) {
+                    close_websocket(&writer, &payload).await;
+                } else {
+                    let body = murmur_ws::new_close_frame_body(murmur_ws::STATUS_PROTOCOL_ERROR, b"");
+                    close_websocket(&writer, &body).await;
+                }
                 break;
             }
             // A pong needs no response of its own.
@@ -957,6 +976,32 @@ where
         fragmented = !header.fin;
     }
     shutdown.cancel();
+}
+
+/// Sends the server's close frame and marks the socket closed under the writer lock.
+///
+/// Marking `closed` before the write means a cancelled close still keeps later data off the wire;
+/// the first close wins, so a handler racing the watcher cannot emit a second close frame.
+async fn close_websocket(writer: &tokio::sync::Mutex<WsWriter>, payload: &[u8]) {
+    let mut sink = writer.lock().await;
+    if sink.closed {
+        return;
+    }
+    sink.closed = true;
+    let _ = ws_write_server_message(&mut sink.writer, murmur_ws::OP_CLOSE.0, payload).await;
+}
+
+/// RFC 6455 §5.5.1: an empty close payload is valid, a single byte is malformed, and any other
+/// payload must carry a status code and UTF-8 reason the codec accepts.
+fn close_payload_is_valid(payload: &[u8]) -> bool {
+    if payload.is_empty() {
+        return true;
+    }
+    if payload.len() == 1 {
+        return false;
+    }
+    let (code, reason) = murmur_ws::parse_close_frame_data(payload);
+    murmur_ws::check_close_frame_data(code, &reason).is_ok()
 }
 
 /// Reads and unmasks one control frame's payload. `check_header` has already bounded its length
@@ -1004,7 +1049,7 @@ where
                 tokio::spawn(async move {
                     let Ok(upgraded) = hyper::upgrade::on(req).await else { return };
                     let (reader, writer) = tokio::io::split(TokioIo::new(upgraded));
-                    let writer = Arc::new(tokio::sync::Mutex::new(writer));
+                    let writer = Arc::new(tokio::sync::Mutex::new(WsWriter { writer, closed: false }));
                     let shutdown = CancellationToken::new();
                     let watcher = tokio::spawn(watch_websocket(reader, Arc::clone(&writer), shutdown.clone()));
                     run(StreamSink { dest: SinkDest::Ws(writer), shutdown, watcher: Some(watcher) }).await;
