@@ -2081,6 +2081,16 @@ mod tests {
         request: &str,
         route: fn(Req) -> Response<RespBody>,
     ) -> (TcpStream, tokio::sync::oneshot::Receiver<()>) {
+        open_stream_with_receive_buffer(request, route, None).await
+    }
+
+    /// [`open_stream`] with the client's SO_RCVBUF set before connecting, so a test can reach
+    /// write backpressure without moving megabytes through the kernel.
+    async fn open_stream_with_receive_buffer(
+        request: &str,
+        route: fn(Req) -> Response<RespBody>,
+        receive_buffer: Option<u32>,
+    ) -> (TcpStream, tokio::sync::oneshot::Receiver<()>) {
         use tokio::io::AsyncWriteExt as _;
         use tokio::net::TcpListener;
 
@@ -2097,7 +2107,14 @@ mod tests {
             let _ = done_tx.send(());
         });
 
-        let mut stream = TcpStream::connect(addr).await.expect("connect to loopback listener");
+        let mut stream = match receive_buffer {
+            Some(size) => {
+                let socket = tokio::net::TcpSocket::new_v4().expect("bind a client socket");
+                socket.set_recv_buffer_size(size).expect("set the client receive buffer");
+                socket.connect(addr).await.expect("connect with a bounded receive buffer")
+            }
+            None => TcpStream::connect(addr).await.expect("connect to loopback listener"),
+        };
         stream.write_all(request.as_bytes()).await.expect("write request");
         (stream, done_rx)
     }
@@ -2198,9 +2215,9 @@ mod tests {
         .expect("the /logs handler must hold a subscription");
     }
 
-    /// The streaming routes share process-wide subscription state, so the two `/logs` tests must
-    /// not observe each other's subscriber.
-    static LOG_STREAM_TESTS: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+    /// The streaming routes share process-wide subscription and log-level state, so these tests and
+    /// the `watch` tests that assert the level take the same crate-wide lock.
+    use crate::test_support::LOG_LEVEL_LOCK as LOG_STREAM_TESTS;
 
     /// The stream used to wait for a qualifying log record before testing the sink, so a client
     /// that closed while the daemon was quiet kept the handler task and its subscription alive.
@@ -2305,6 +2322,53 @@ mod tests {
         assert!(payload.is_empty(), "an empty close must be echoed empty: {payload:?}");
 
         assert_socket_closed(&mut stream).await;
+    }
+
+    /// A client that never reads leaves the handler blocked inside a frame write, holding the
+    /// writer mutex. The Close frame must still release the handler and its subscription instead of
+    /// waiting for that write; the abandoned connection is dropped rather than reused after a
+    /// partial frame.
+    #[tokio::test]
+    async fn a_close_frame_releases_a_log_subscription_blocked_on_backpressure() {
+        let _guard = LOG_STREAM_TESTS.lock().await;
+        murmur_log::set_level(murmur_log::LogLevel::ERROR);
+
+        let (mut stream, _done) =
+            open_stream_with_receive_buffer(&websocket_request("/logs?level=debug"), get_logs, Some(4096)).await;
+        let head = read_response_head(&mut stream).await;
+        assert!(head.starts_with("HTTP/1.1 101 Switching Protocols"), "{head}");
+        wait_for_log_subscription().await;
+
+        // Fill the socket, the forwarding channel and the subscriber buffer; the client reads
+        // nothing, so the handler ends up parked inside a frame write holding the writer mutex.
+        // Emitting in batches keeps the queues draining into the socket instead of filling the
+        // dropping channel once.
+        let payload = "x".repeat(1024);
+        for _ in 0..120 {
+            for _ in 0..256 {
+                murmur_log::log::log_line(murmur_log::LogLevel::DEBUG, payload.clone());
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(2)).await;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+
+        write_client_frame(&mut stream, murmur_ws::OP_CLOSE.0, &[0x03, 0xe8]).await;
+        tokio::time::timeout(std::time::Duration::from_secs(2), async {
+            while murmur_log::enabled(murmur_log::LogLevel::DEBUG) {
+                tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("a close must release a subscription whose write is blocked");
+
+        // The handler is gone; drain the buffered frames and require the connection to end.
+        use tokio::io::AsyncReadExt as _;
+        let mut buf = vec![0u8; 64 * 1024];
+        tokio::time::timeout(std::time::Duration::from_secs(4), async {
+            while stream.read(&mut buf).await.expect("read buffered frames") > 0 {}
+        })
+        .await
+        .expect("the connection abandoned under backpressure must be dropped");
     }
 
     /// `/traffic` used to write its next tick after the close was echoed. The shared sink must

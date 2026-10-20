@@ -442,6 +442,7 @@ mod tests {
 
         // The API paths hold this lock for their whole update; this stands in for one of them.
         let operation = hub::lock_config_operation().await;
+        let _level = crate::test_support::LOG_LEVEL_LOCK.lock().await;
         murmur_log::set_level(LogLevel::WARNING);
 
         let reload_target = watch.target().to_path_buf();
@@ -477,6 +478,7 @@ mod tests {
         let mut applied = Some(running.clone().into_bytes());
 
         // Stand in for a runtime change made over the API.
+        let _level = crate::test_support::LOG_LEVEL_LOCK.lock().await;
         murmur_log::set_level(LogLevel::WARNING);
 
         write_atomically(&target, &running);
