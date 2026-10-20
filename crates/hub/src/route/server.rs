@@ -2375,7 +2375,7 @@ mod tests {
     /// writer mutex. The Close frame must still release the handler and its subscription instead of
     /// waiting for that write; the abandoned connection is dropped rather than reused after a
     /// partial frame.
-    #[tokio::test]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn a_close_frame_releases_a_log_subscription_blocked_on_backpressure() {
         let _guard = LOG_STREAM_TESTS.lock().await;
         murmur_log::set_level(murmur_log::LogLevel::ERROR);
@@ -2389,7 +2389,7 @@ mod tests {
     /// A Ping that cannot be answered because a data write holds the mutex must not hide the Close
     /// after it: the lock and the pong are one bounded operation, so the timeout cancels the
     /// stream and releases the subscription even though the pong never completed.
-    #[tokio::test]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn a_ping_before_close_releases_a_log_subscription_blocked_on_backpressure() {
         let _guard = LOG_STREAM_TESTS.lock().await;
         murmur_log::set_level(murmur_log::LogLevel::ERROR);
