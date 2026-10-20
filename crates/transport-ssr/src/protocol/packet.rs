@@ -87,17 +87,29 @@ impl WaitReadFrom for PacketConn {
     ) -> (Vec<u8>, Option<Box<dyn FnOnce() + Send>>, Option<Box<dyn Addr>>, io::Result<()>) {
         let (data, put, addr, result) = self.enhance_packet_conn.wait_read_from().await;
         if result.is_err() {
-            return (data, put, addr, result);
+            if put.is_some() {
+                return (data, put, addr, result);
+            }
+            let _ = pool::put(data);
+            return (Vec::new(), None, addr, result);
         }
         let decoded = {
             let mut protocol = self.protocol.lock();
             protocol.decode_packet(&data)
         };
         match decoded {
-            Ok(decoded) => (decoded, put, addr, result),
+            Ok(decoded) => {
+                // `decode_packet` returns a fresh Vec; the transferred block can go back now.
+                if put.is_none() {
+                    let _ = pool::put(data);
+                }
+                (decoded, put, addr, result)
+            }
             Err(err) => {
                 if let Some(put) = put {
                     put();
+                } else {
+                    let _ = pool::put(data);
                 }
                 (Vec::new(), None, addr, Err(io::Error::other(err)))
             }

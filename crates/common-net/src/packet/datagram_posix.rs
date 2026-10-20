@@ -86,13 +86,13 @@ impl WaitReadFromDatagram for EnhanceUdpDatagram {
             read.await
         };
         match result {
-            Ok((read_n, read_from, read_buf)) => {
+            Ok((read_n, read_from, mut read_buf)) => {
                 if read_n > 0 {
-                    let data = read_buf.get(..read_n).unwrap_or_default().to_vec();
-                    let put: Option<Box<dyn FnOnce() + Send>> = Some(Box::new(move || {
-                        let _ = pool::put(read_buf);
-                    }));
-                    (data, put, read_from, Ok(()))
+                    // Hand the pooled block itself to the caller, truncated to the datagram; the
+                    // caller owns it and returns it with `pool::put(data)`. No payload copy and no
+                    // callback retaining a second reference to the same allocation.
+                    read_buf.truncate(read_n);
+                    (read_buf, None, read_from, Ok(()))
                 } else {
                     let _ = pool::put(read_buf);
                     (Vec::new(), None, read_from, Ok(()))
@@ -159,7 +159,7 @@ fn recvmsg(fd: RawFd, read_buf: &mut [u8]) -> io::Result<(usize, Option<SocketAd
 
 #[cfg(test)]
 mod tests {
-    use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+    use std::sync::atomic::{AtomicBool, Ordering};
     use std::sync::mpsc;
     use std::time::Duration;
 
@@ -212,17 +212,17 @@ mod tests {
         res.unwrap();
         assert_eq!(b"pooled", data.as_slice());
         assert_eq!(addr, Some(client_addr));
-        let put = put.expect("a nonzero read must hand back a release callback");
-        put();
+        assert!(put.is_none(), "the pooled block itself is returned as `data`; there is nothing left for `put`");
+        assert_eq!(data.capacity(), pool::UDP_BUFFER_SIZE, "the transferred block must remain poolable");
+        pool::put(data).expect("caller must be able to recycle the returned buffer");
     }
 
-    /// "Counting" release semantics: three completed reads each release their pooled buffer
-    /// exactly once through the returned callback; a wait dropped before any datagram arrives
-    /// never takes a buffer at all (it lives inside the `async_io` closure, which never runs);
-    /// a zero-length datagram releases its buffer internally, handing back `put: None` instead
-    /// of a second release path.
+    /// Ownership-transfer semantics: every completed read hands the pooled block itself back as
+    /// `data` with `put: None`, and the caller recycles it exactly once; a wait dropped before any
+    /// datagram arrives never takes a buffer at all (it lives inside the `async_io` closure, which
+    /// never runs); a zero-length datagram releases its buffer internally and hands back no block.
     #[tokio::test]
-    async fn wait_read_from_releases_the_pooled_buffer_exactly_once_per_read_and_not_at_all_when_dropped_mid_wait() {
+    async fn wait_read_from_transfers_the_pooled_block_once_per_read_and_takes_none_when_dropped_mid_wait() {
         let server = tokio::net::UdpSocket::bind((Ipv4Addr::LOCALHOST, 0)).await.unwrap();
         let server_addr = server.local_addr().unwrap();
         let client = tokio::net::UdpSocket::bind((Ipv4Addr::LOCALHOST, 0)).await.unwrap();
@@ -233,22 +233,21 @@ mod tests {
         let dropped_early = tokio::time::timeout(Duration::from_millis(20), conn.wait_read_from()).await;
         assert!(dropped_early.is_err(), "no datagram is pending, so the wait must still be running at the timeout");
 
-        let released = AtomicUsize::new(0);
         for i in 0..3u8 {
             client.send(&[i]).await.unwrap();
             let (data, put, _addr, res) = conn.wait_read_from().await;
             res.unwrap();
             assert_eq!(data, vec![i]);
-            let put = put.expect("a nonzero read must hand back a release callback");
-            put();
-            released.fetch_add(1, Ordering::SeqCst);
+            assert!(put.is_none(), "a transferred read has no release callback");
+            assert_eq!(data.capacity(), pool::UDP_BUFFER_SIZE, "the transferred block must remain poolable");
+            pool::put(data).expect("the caller recycles the transferred block");
         }
-        assert_eq!(released.load(Ordering::SeqCst), 3, "exactly one release per completed read");
 
         client.send(b"").await.unwrap();
         let (data, put, _addr, res) = conn.wait_read_from().await;
         res.unwrap();
         assert!(data.is_empty());
-        assert!(put.is_none(), "a zero-length datagram releases its buffer internally, not through a second path");
+        assert!(put.is_none(), "a zero-length datagram releases its buffer internally");
+        assert_eq!(data.capacity(), 0, "a zero-length datagram hands back no pooled block");
     }
 }

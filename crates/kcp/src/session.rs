@@ -238,14 +238,20 @@ impl Engine {
         }
     }
 
+    /// Serves the next KCP message. A message that fits in the caller's buffer is received into
+    /// that buffer's initialized, unfilled prefix, so the read allocates nothing and copies the
+    /// payload once. Only a message larger than the buffer needs [`Self::recvbuf`], and the prefix
+    /// already handed to the caller stays there until [`Self::try_read_leftover`] drains it.
     fn try_read_kcp(&mut self, buf: &mut ReadBuf<'_>) -> bool {
         let Ok(peek) = usize::try_from(self.kcp.peek_size()) else {
             return false;
         };
         if buf.remaining() >= peek {
-            let mut tmp = vec![0u8; peek];
-            self.kcp.recv(&mut tmp);
-            buf.put_slice(&tmp);
+            let dst = buf.initialize_unfilled_to(peek);
+            let Ok(n) = usize::try_from(self.kcp.recv(dst)) else {
+                return false;
+            };
+            buf.advance(n);
         } else {
             if self.recvbuf.len() < peek {
                 self.recvbuf.resize(peek, 0);
@@ -1144,6 +1150,74 @@ mod tests {
         let mut client = new_conn4(conv, addr, None, 0, 0, true, Box::new(sock)).expect("new_conn4");
         client.write_all(&[0x5au8; 64]).await.expect("client write_all");
         client
+    }
+
+    /// Builds an engine whose receive queue holds one whole message, by running a real peer
+    /// [`Kcp`] and feeding its wire output through [`Kcp::input`]. Nothing here goes through the
+    /// read path, so a test observes exactly what the next read sees.
+    fn engine_with_queued_message(conv: u32, payload: &[u8]) -> Engine {
+        let wire = Arc::new(StdMutex::new(Vec::new()));
+        let sink = Arc::clone(&wire);
+        let mut sender = Kcp::new(
+            conv,
+            Box::new(move |packet: &[u8]| {
+                if let Ok(mut packets) = sink.lock() {
+                    packets.push(packet.to_vec());
+                }
+            }),
+        );
+        // Congestion control would release one segment per flush; the receiver only assembles a
+        // fragmented message once every segment is queued, so emit the whole payload at once.
+        sender.no_delay(0, -1, -1, 1);
+        assert_eq!(sender.send(payload), 0, "the peer accepts the payload");
+        sender.update();
+        let packets = wire.lock().map(|packets| packets.clone()).unwrap_or_default();
+        assert!(!packets.is_empty(), "the peer must emit at least one segment");
+
+        let (tx, _rx) = mpsc::channel(4);
+        let mut engine = new_engine(conv, 0, 0, tx, 0);
+        for packet in &packets {
+            assert!(engine.kcp.input(packet, PacketType::Regular, false) >= 0, "the peer segment parses");
+        }
+        engine
+    }
+
+    fn patterned_payload(len: usize) -> Vec<u8> {
+        (0..len).map(|i| u8::try_from(i % 251).unwrap_or(0)).collect()
+    }
+
+    #[test]
+    fn a_full_fit_message_is_received_straight_into_the_caller_buffer() {
+        for len in [64usize, 1200, 8192] {
+            let payload = patterned_payload(len);
+            for extra in [0usize, 512] {
+                let mut engine = engine_with_queued_message(7, &payload);
+                let mut caller = vec![0u8; len + extra];
+                let mut buf = ReadBuf::new(&mut caller);
+                assert!(engine.try_read_kcp(&mut buf), "the queued message must be served: len={len} extra={extra}");
+                assert_eq!(buf.filled(), &payload[..], "len={len} extra={extra}");
+                assert_eq!((engine.recv_pos, engine.recv_len), (0, 0), "a full-fit read retains no scratch");
+                let mut empty: [u8; 0] = [];
+                assert!(!engine.try_read_kcp(&mut ReadBuf::new(&mut empty)), "the queue must be empty");
+            }
+        }
+    }
+
+    #[test]
+    fn a_short_caller_buffer_drains_the_retained_scratch_across_reads() {
+        let payload = patterned_payload(1200);
+        let mut engine = engine_with_queued_message(11, &payload);
+        let mut reassembled = Vec::new();
+        while reassembled.len() < payload.len() {
+            let mut caller = [0u8; 64];
+            let mut buf = ReadBuf::new(&mut caller);
+            let served = engine.try_read_leftover(&mut buf) || engine.try_read_kcp(&mut buf);
+            assert!(served, "a read must make progress at {} bytes", reassembled.len());
+            assert!(!buf.filled().is_empty(), "a read must return bytes");
+            reassembled.extend_from_slice(buf.filled());
+        }
+        assert_eq!(reassembled, payload, "the short-buffer path must preserve every byte");
+        assert_eq!((engine.recv_pos, engine.recv_len), (1200, 1200), "the scratch is fully drained");
     }
 
     #[tokio::test(flavor = "multi_thread")]
