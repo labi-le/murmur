@@ -40,4 +40,9 @@ pub(crate) mod test_support {
     use tokio::sync::Mutex;
 
     pub(crate) static TUNNEL_STATE_LOCK: Mutex<()> = Mutex::const_new(());
+
+    /// Serialises the tests that mutate or assert the process-global log level: `murmur_log` keeps
+    /// one level per process, so a `set_level` in one test would otherwise decide what a concurrent
+    /// test observes.
+    pub(crate) static LOG_LEVEL_LOCK: Mutex<()> = Mutex::const_new(());
 }
