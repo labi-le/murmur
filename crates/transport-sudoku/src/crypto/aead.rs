@@ -160,6 +160,7 @@ impl AEADConn {
     ///
     /// Bounded by the 65,535-byte protocol maximum; the `recv_alloc` bench reports it separately
     /// from the allocations made while constructing the connection.
+    #[must_use]
     pub fn recv_buffer_capacity(&self) -> usize {
         self.recv_body.capacity()
     }
@@ -406,12 +407,11 @@ impl AsyncRead for AEADConn {
                 let (nonce_bytes, payload) = this.recv_body.split_at_mut(12);
                 let mut nonce = [0u8; 12];
                 nonce.copy_from_slice(nonce_bytes);
-                match aead.open_in_place(&nonce, payload, &[]) {
-                    Ok(plaintext) => plaintext.len(),
-                    Err(_) => {
-                        this.reset_recv_frame();
-                        return Poll::Ready(Err(std::io::Error::other("decryption failed")));
-                    }
+                if let Ok(plaintext) = aead.open_in_place(&nonce, payload, &[]) {
+                    plaintext.len()
+                } else {
+                    this.reset_recv_frame();
+                    return Poll::Ready(Err(std::io::Error::other("decryption failed")));
                 }
             };
             this.recv_plain_end = this.nonce_size + plain_len;

@@ -124,6 +124,7 @@ impl RecordConn {
     ///
     /// Bounded by the 65,535-byte protocol maximum; the `recv_alloc` bench reports it separately
     /// from the allocations made while constructing the connection.
+    #[must_use]
     pub fn recv_buffer_capacity(&self) -> usize {
         self.recv_body.capacity()
     }
