@@ -13,6 +13,7 @@ doctest = false
 anyhow.workspace = true
 fancy-regex.workspace = true
 ipnet.workspace = true
+memchr.workspace = true
 tokio.workspace = true
 murmur-common = { path = "../common" }
 murmur-component = { path = "../component" }

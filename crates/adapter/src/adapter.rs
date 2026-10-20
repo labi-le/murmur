@@ -212,6 +212,8 @@ impl CProxy for Proxy {
         delay
     }
 
+    // NOT cancel-safe: the alive/delay history below is written after `url_test_inner` returns,
+    // so a caller that drops this future skips the publication.
     async fn url_test(&self, ctx: &CancellationToken, url: &str, expected_status: IntRanges<u16>) -> Result<u16> {
         let outcome = self.url_test_inner(ctx, url, &expected_status).await;
 
