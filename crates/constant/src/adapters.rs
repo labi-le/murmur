@@ -317,6 +317,9 @@ pub trait Proxy: ProxyAdapter {
 
     fn last_delay_for_test_url(&self, url: &str) -> u16;
 
+    // NOT cancel-safe: implementations publish alive/delay state only after their network
+    // operation returns, so a `select!` arm must retain the pinned future and await it again
+    // after cancelling instead of dropping it.
     async fn url_test(&self, ctx: &CancellationToken, url: &str, expected_status: IntRanges<u16>) -> Result<u16>;
 }
 
@@ -377,6 +380,15 @@ impl PacketAdapterImpl {
     /// Mutation handle for the metadata held alongside the packet.
     pub const fn metadata_mut(&mut self) -> &mut Metadata {
         &mut self.metadata
+    }
+
+    /// The NAT key as a borrowed string.
+    ///
+    /// [`PacketAdapter::key`] clones it; the established-entry fast path uses this form so a
+    /// per-datagram lookup on an existing key allocates no key buffer.
+    #[must_use]
+    pub fn key_ref(&self) -> &str {
+        &self.key
     }
 }
 
@@ -448,6 +460,15 @@ pub trait PacketSender: Send + Sync {
 /// `NatTable`. Local conns are `tokio::net::UdpSocket`s, and the condition variable is a
 /// `tokio::sync::Notify` (waiter: `notified()`, waker: `notify_waiters()`).
 pub trait NatTable: Send + Sync {
+    /// Returns the sender stored for `key`, or `None` when this lookup did not observe an entry.
+    ///
+    /// This borrows `key` and never constructs an entry, so it is the established-flow fast path.
+    /// Neither answer is a reservation. A `None` can be stale because a concurrent `get_or_create`
+    /// can store the key right after the lookup, and a `Some` sender can be removed and closed right
+    /// after it is returned. Callers must fall back to `get_or_create` on `None`; the sender a `Some`
+    /// returns has the same lifetime guarantee as the sender `get_or_create` returns.
+    fn get(&self, key: &str) -> Option<Arc<dyn PacketSender>>;
+
     fn get_or_create(
         &self,
         key: &str,
@@ -609,6 +630,8 @@ mod tests {
         assert_ne!(one.key(), two.key(), "two sessions behind one peer socket must not collapse onto the same NAT key");
         assert_eq!(one.key(), "session-one");
         assert_eq!(two.key(), "session-two");
+        assert_eq!(one.key_ref(), "session-one", "the borrowed key disagrees with the owned one");
+        assert_eq!(one.key_ref(), one.key(), "the established fast path would look up another key");
     }
 
     #[test]

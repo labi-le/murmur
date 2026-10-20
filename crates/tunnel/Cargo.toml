@@ -42,7 +42,16 @@ workspace = true
 
 [dev-dependencies]
 criterion.workspace = true
+dhat.workspace = true
 
 [[bench]]
 name = "udp_path"
+harness = false
+
+[[bench]]
+name = "udp_hit_path"
+harness = false
+
+[[bench]]
+name = "udp_dispatch"
 harness = false
