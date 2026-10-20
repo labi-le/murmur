@@ -34,6 +34,8 @@ murmur-tunnel = { path = "../tunnel" }
 
 
 [dev-dependencies]
+tokio = { workspace = true, features = ["test-util"] }
+murmur-adapter-outbound = { path = "../adapter-outbound" }
 murmur-transport-vless = { path = "../transport-vless" }
 
 

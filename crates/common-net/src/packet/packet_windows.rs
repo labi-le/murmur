@@ -58,13 +58,13 @@ impl WaitReadFrom for EnhanceUDPConn {
             })
             .await;
         match result {
-            Ok((read_n, read_from, read_buf)) => {
+            Ok((read_n, read_from, mut read_buf)) => {
                 if read_n > 0 {
-                    let data = read_buf.get(..read_n).unwrap_or_default().to_vec();
-                    let put: Option<Box<dyn FnOnce() + Send>> = Some(Box::new(move || {
-                        let _ = pool::put(read_buf);
-                    }));
-                    (data, put, read_from, Ok(()))
+                    // Hand the pooled block itself to the caller, truncated to the datagram; the
+                    // caller owns it and returns it with `pool::put(data)`. No payload copy and no
+                    // callback retaining a second reference to the same allocation.
+                    read_buf.truncate(read_n);
+                    (read_buf, None, read_from, Ok(()))
                 } else {
                     let _ = pool::put(read_buf);
                     (Vec::new(), None, read_from, Ok(()))
