@@ -1309,6 +1309,7 @@ mod tests {
         fn last_delay_for_test_url(&self, _url: &str) -> u16 {
             0
         }
+        // cancel-safe: the stub returns immediately and publishes no state.
         async fn url_test(
             &self,
             _ctx: &CancellationToken,

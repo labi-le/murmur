@@ -73,7 +73,8 @@ enum TlsReadStep {
 }
 
 /// Drives a framed read and the remaining-bytes branch across `poll_read` calls, holding
-/// per-call scratch buffers.
+/// per-call scratch buffers. A completing branch truncates `data` and moves the allocation to
+/// the caller; only an incomplete branch keeps it for the next poll.
 pub(super) struct TlsReadOp {
     step: TlsReadStep,
     discard_n: usize,
@@ -155,7 +156,10 @@ impl TlsReadOp {
                             let length = i64::try_from(self.length).unwrap_or(i64::MAX);
                             let read = i64::try_from(n).unwrap_or(i64::MAX);
                             self.remain_adjust = Some(RemainAdjust::Set(length - read));
-                            return Poll::Ready(Ok(self.data.get(..n).unwrap_or_default().to_vec()));
+                            // The op is cleared once this returns, so move the completed allocation
+                            // out instead of copying its `n`-byte prefix into a second one.
+                            self.data.truncate(n);
+                            return Poll::Ready(Ok(std::mem::take(&mut self.data)));
                         }
                         Poll::Ready(Err(err)) => return Poll::Ready(Err(err)),
                     }
@@ -174,7 +178,10 @@ impl TlsReadOp {
                     if self.from_remain {
                         self.remain_adjust = Some(RemainAdjust::Sub(i64::try_from(filled).unwrap_or(i64::MAX)));
                     }
-                    return Poll::Ready(Ok(self.data.get(..filled).unwrap_or_default().to_vec()));
+                    // Partial success (an error after `filled` bytes) takes this path too: the
+                    // bytes already read are handed back exactly as before, without copying them.
+                    self.data.truncate(filled);
+                    return Poll::Ready(Ok(std::mem::take(&mut self.data)));
                 }
             }
         }
@@ -580,6 +587,35 @@ mod tests {
             self.closes.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
             Ok(())
         }
+    }
+
+    /// An error after part of a record arrived still hands those bytes back; the move of the
+    /// completed buffer must not turn the partial success into an error or an empty read.
+    #[tokio::test]
+    async fn a_partial_record_before_eof_returns_the_bytes_already_read() {
+        let (client_side, server_side) = tokio::io::duplex(1 << 16);
+        let mut peer = client_side;
+        let closes = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let flag = FlagConn { inner: server_side, closes };
+        let mut obfs = new_tls_obfs(Box::new(flag), "example.com".to_owned());
+
+        peer.write_all(&[0u8; 105]).await.expect("write discard filler");
+        peer.write_all(&[0x00, 0x04]).await.expect("write record length");
+        peer.write_all(b"ab").await.expect("write partial payload");
+        peer.shutdown().await.expect("close the payload writer");
+
+        let mut buf = [0u8; 16];
+        let read = tokio::time::timeout(Duration::from_secs(5), obfs.read(&mut buf))
+            .await
+            .expect("partial read must not hang")
+            .expect("partial read returns the bytes already read");
+        assert_eq!(&buf[..read], b"ab");
+
+        let read = tokio::time::timeout(Duration::from_secs(5), obfs.read(&mut buf))
+            .await
+            .expect("the follow-up read must not hang")
+            .expect("clean end of stream after the partial record");
+        assert_eq!(read, 0);
     }
 
     /// Bug #112: the parked read op kept the first poll's buffer size, and the completion truncated

@@ -3776,6 +3776,7 @@ dependencies = [
  "fancy-regex",
  "hyper",
  "murmur-adapter",
+ "murmur-adapter-outbound",
  "murmur-common",
  "murmur-common-convert",
  "murmur-component",
