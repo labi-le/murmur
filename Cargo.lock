@@ -3776,6 +3776,7 @@ dependencies = [
  "fancy-regex",
  "hyper",
  "murmur-adapter",
+ "murmur-adapter-outbound",
  "murmur-common",
  "murmur-common-convert",
  "murmur-component",
@@ -4513,6 +4514,7 @@ dependencies = [
  "murmur-ntp",
  "murmur-std-compat",
  "murmur-tunnel",
+ "murmur-ws",
  "notify",
  "parking_lot",
  "pprof",
@@ -4880,6 +4882,7 @@ dependencies = [
  "fancy-regex",
  "futures-util",
  "ipnet",
+ "memchr",
  "murmur-common",
  "murmur-component",
  "murmur-component-geodata",
@@ -5723,6 +5726,7 @@ dependencies = [
  "async-trait",
  "chrono",
  "criterion",
+ "dhat",
  "murmur-common",
  "murmur-common-net",
  "murmur-common-pool",
@@ -6782,9 +6786,9 @@ dependencies = [
 
 [[package]]
 name = "russh"
-version = "0.63.3"
+version = "0.64.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "036204edbd199552a5b3832f63c60dcdf395dc44c7f06b4af1c0e8139cc11bce"
+checksum = "ba61e87b9ec9a39a59a6bbed4c0b8ff7fb07073405b24a767a1f2c8560ac8f58"
 dependencies = [
  "aes 0.9.3",
  "aws-lc-rs",
