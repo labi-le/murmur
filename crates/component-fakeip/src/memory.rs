@@ -36,7 +36,11 @@ impl MemoryStore {
     }
 
     pub(crate) fn by_ip(&self, ip: IpAddr) -> Option<String> {
-        let host = self.cache_host.with_value(&ip, |host| String::from(&**host))?;
+        let (host, exist) = self.cache_host.get(&ip);
+        if !exist {
+            return None;
+        }
+        let host = String::from(&*host);
         self.cache_ip.touch(host.as_str());
         Some(host)
     }

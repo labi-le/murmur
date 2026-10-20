@@ -95,11 +95,6 @@ impl<K, V> Entry<K, V> {
         self.value.lock().clone()
     }
 
-    fn with_value<R>(&self, f: impl FnOnce(&V) -> R) -> R {
-        let value = self.value.lock();
-        f(&value)
-    }
-
     fn set_value(&self, value: V) {
         *self.value.lock() = value;
     }
@@ -286,20 +281,6 @@ impl<K: Eq + Hash + Clone, V: Clone> LruCache<K, V> {
             None => (V::default(), false),
             Some(index) => (state.lru.entry(index).read_value(), true),
         }
-    }
-
-    /// Applies [`Self::get`]'s expiry and recency effects to the stored value through `f`, without
-    /// cloning the value itself. `f` runs while the cache lock is held, so it must not call back
-    /// into this cache.
-    pub fn with_value<Q, R>(&self, key: &Q, f: impl FnOnce(&V) -> R) -> Option<R>
-    where
-        K: Borrow<Q>,
-        Q: ?Sized + Hash + Eq,
-    {
-        let mut state = self.mu.lock();
-
-        let index = self.get_locked(&mut state, key)?;
-        Some(state.lru.entry(index).with_value(f))
     }
 
     /// Applies [`Self::get`]'s expiry and recency effects without reading the stored value.
