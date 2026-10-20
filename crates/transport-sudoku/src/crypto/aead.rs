@@ -360,11 +360,11 @@ impl AsyncRead for AEADConn {
                         this.reset_recv_frame();
                         return Poll::Ready(Err(std::io::Error::other("frame too short")));
                     }
-                    if this.recv_body.len() < frame_len {
-                        this.recv_body.resize(frame_len, 0);
-                    } else {
-                        this.recv_body.truncate(frame_len);
+                    if this.recv_body.capacity() < frame_len {
+                        this.recv_body.clear();
+                        this.recv_body.reserve_exact(frame_len);
                     }
+                    this.recv_body.resize(frame_len, 0);
                     this.recv_body_filled = 0;
                     this.recv_plain_off = this.nonce_size;
                     this.recv_plain_end = this.nonce_size;
@@ -608,6 +608,27 @@ mod tests {
             reader.recv_body.capacity() <= MAX_FRAME_BODY_SIZE,
             "retained receive capacity must stay within one protocol maximum"
         );
+    }
+
+    #[tokio::test]
+    async fn aead_conn_caps_retained_capacity_at_one_protocol_maximum() {
+        let max_plain = MAX_FRAME_BODY_SIZE - 12 - 16;
+        let payloads = vec![vec![0x51; 40 * 1_024], vec![0x52; 50 * 1_024], vec![0x53; max_plain]];
+        let mut reader =
+            new_aead_conn(Box::new(ReplayConn::new(aead_wire(&payloads))), "shared-secret", "chacha20-poly1305")
+                .expect("reader");
+
+        for payload in &payloads {
+            let mut got = vec![0u8; payload.len()];
+            reader.read_exact(&mut got).await.expect("read");
+            assert_eq!(&got, payload, "payload of {} bytes mismatch", payload.len());
+            assert!(
+                reader.recv_body.capacity() <= MAX_FRAME_BODY_SIZE,
+                "retained capacity {} exceeded the protocol maximum after a {} byte plaintext",
+                reader.recv_body.capacity(),
+                payload.len()
+            );
+        }
     }
 
     #[tokio::test]

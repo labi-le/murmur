@@ -400,11 +400,11 @@ impl AsyncRead for RecordConn {
                     if body_len > MAX_FRAME_BODY_SIZE {
                         return Poll::Ready(Err(io::Error::other("frame too large")));
                     }
-                    if this.recv_body.len() < body_len {
-                        this.recv_body.resize(body_len, 0);
-                    } else {
-                        this.recv_body.truncate(body_len);
+                    if this.recv_body.capacity() < body_len {
+                        this.recv_body.clear();
+                        this.recv_body.reserve_exact(body_len);
                     }
+                    this.recv_body.resize(body_len, 0);
                     this.recv_body_filled = 0;
                     this.recv_plain_off = RECORD_HEADER_SIZE;
                     this.recv_plain_end = RECORD_HEADER_SIZE;
@@ -782,6 +782,28 @@ mod tests {
             reader.recv_body.capacity() <= MAX_FRAME_BODY_SIZE,
             "retained receive capacity must stay within one protocol maximum"
         );
+    }
+
+    #[tokio::test]
+    async fn record_conn_caps_retained_capacity_at_one_protocol_maximum() {
+        let max_plain = MAX_FRAME_BODY_SIZE - RECORD_HEADER_SIZE - 16;
+        let payloads = vec![vec![0x51; 40 * 1_024], vec![0x52; 50 * 1_024], vec![0x53; max_plain]];
+        let (wire, psk_send) = record_receive_fixture(&payloads).await;
+        let psk_recv = Sha256::digest(b"record-recv");
+        let mut reader = new_record_conn(Box::new(ReplayConn::new(wire)), "chacha20-poly1305", &psk_recv, &psk_send)
+            .expect("new reader");
+
+        for payload in &payloads {
+            let mut got = vec![0u8; payload.len()];
+            reader.read_exact(&mut got).await.expect("read");
+            assert_eq!(&got, payload, "payload of {} bytes mismatch", payload.len());
+            assert!(
+                reader.recv_body.capacity() <= MAX_FRAME_BODY_SIZE,
+                "retained capacity {} exceeded the protocol maximum after a {} byte plaintext",
+                reader.recv_body.capacity(),
+                payload.len()
+            );
+        }
     }
 
     #[tokio::test]
