@@ -23,9 +23,9 @@ use super::fixture::{
     vision_new_conn, vless_header_len, MemoryStream, UUID_STR,
 };
 use super::metric_fixture::{
-    checksum_bytes, checksum_ip, domain_map_10k, dst_domain, dst_ipv4, dst_mux, fakeip_cold_hosts, fakeip_hit_hosts,
-    fakeip_pool, ip_cidr_trie_256, rule_chain_256, rule_helper_populated, rule_metadata_miss, DOMAIN_EXACT_KEY,
-    DOMAIN_VALUE, FAKEIP_MISS_POOL_SIZE,
+    checksum_bytes, checksum_ip, domain_map_10k, dst_domain, dst_ipv4, dst_mux, fakeip_cold_hosts,
+    fakeip_cold_hosts_mixed, fakeip_hit_hosts, fakeip_hit_hosts_mixed, fakeip_pool, ip_cidr_trie_256, rule_chain_256,
+    rule_helper_populated, rule_metadata_miss, DOMAIN_EXACT_KEY, DOMAIN_VALUE, FAKEIP_MISS_POOL_SIZE,
 };
 
 /// One operation; the argument is the iteration index. The return value is folded into the run
@@ -283,9 +283,8 @@ fn setup_ip_cidr_is_contain_v4_hit() -> Runner {
     run_step(move |_iteration| black_box(u64::from(trie.is_contain(&ip))))
 }
 
-fn setup_fakeip_lookup_hit_sized(size: i32) -> Runner {
+fn setup_fakeip_lookup_hit_sized(size: i32, hosts: Vec<String>) -> Runner {
     let pool = fakeip_pool(size);
-    let hosts = fakeip_hit_hosts();
     let ips: Vec<IpAddr> = hosts.iter().map(|host| pool.lookup(host)).collect();
     for (host, ip) in hosts.iter().zip(&ips) {
         assert_eq!(pool.lookup(host), *ip, "{host} is not a stable hit");
@@ -299,23 +298,31 @@ fn setup_fakeip_lookup_hit_sized(size: i32) -> Runner {
 }
 
 fn setup_fakeip_lookup_hit_256() -> Runner {
-    setup_fakeip_lookup_hit_sized(FAKEIP_MISS_POOL_SIZE)
+    setup_fakeip_lookup_hit_sized(FAKEIP_MISS_POOL_SIZE, fakeip_hit_hosts())
 }
 
 fn setup_fakeip_lookup_hit() -> Runner {
-    setup_fakeip_lookup_hit_sized(65_536)
+    setup_fakeip_lookup_hit_sized(65_536, fakeip_hit_hosts())
 }
 
 fn setup_fakeip_lookup_hit_1000() -> Runner {
-    setup_fakeip_lookup_hit_sized(1_000)
+    setup_fakeip_lookup_hit_sized(1_000, fakeip_hit_hosts())
 }
 
-fn setup_fakeip_look_back_hit_sized(size: i32) -> Runner {
+fn setup_fakeip_lookup_hit_mixed_256() -> Runner {
+    setup_fakeip_lookup_hit_sized(FAKEIP_MISS_POOL_SIZE, fakeip_hit_hosts_mixed())
+}
+
+fn setup_fakeip_lookup_hit_mixed_1000() -> Runner {
+    setup_fakeip_lookup_hit_sized(1_000, fakeip_hit_hosts_mixed())
+}
+
+fn setup_fakeip_look_back_hit_sized(size: i32, hosts: Vec<String>) -> Runner {
     let pool = fakeip_pool(size);
-    let hosts = fakeip_hit_hosts();
     let ips: Vec<IpAddr> = hosts.iter().map(|host| pool.lookup(host)).collect();
     for (host, ip) in hosts.iter().zip(&ips) {
-        assert_eq!(pool.look_back(*ip).as_deref(), Some(host.as_str()), "{ip} does not reverse to {host}");
+        let expected = host.to_lowercase();
+        assert_eq!(pool.look_back(*ip).as_deref(), Some(expected.as_str()), "{ip} does not reverse to {host}");
     }
     let mut index = 0usize;
     run_step(move |_iteration| {
@@ -326,16 +333,23 @@ fn setup_fakeip_look_back_hit_sized(size: i32) -> Runner {
 }
 
 fn setup_fakeip_look_back_hit_256() -> Runner {
-    setup_fakeip_look_back_hit_sized(FAKEIP_MISS_POOL_SIZE)
+    setup_fakeip_look_back_hit_sized(FAKEIP_MISS_POOL_SIZE, fakeip_hit_hosts())
 }
 
 fn setup_fakeip_look_back_hit_1000() -> Runner {
-    setup_fakeip_look_back_hit_sized(1_000)
+    setup_fakeip_look_back_hit_sized(1_000, fakeip_hit_hosts())
 }
 
-fn setup_fakeip_lookup_miss_sized(pool_size: i32) -> Runner {
+fn setup_fakeip_look_back_hit_mixed_256() -> Runner {
+    setup_fakeip_look_back_hit_sized(FAKEIP_MISS_POOL_SIZE, fakeip_hit_hosts_mixed())
+}
+
+fn setup_fakeip_look_back_hit_mixed_1000() -> Runner {
+    setup_fakeip_look_back_hit_sized(1_000, fakeip_hit_hosts_mixed())
+}
+
+fn setup_fakeip_lookup_miss_sized(pool_size: i32, hosts: Vec<String>) -> Runner {
     let pool = fakeip_pool(pool_size);
-    let hosts = fakeip_cold_hosts();
     let window = usize::try_from(pool_size).expect("positive pool size");
     let first = pool.lookup(&hosts[0]);
     for host in &hosts[1..=window] {
@@ -351,11 +365,19 @@ fn setup_fakeip_lookup_miss_sized(pool_size: i32) -> Runner {
 }
 
 fn setup_fakeip_lookup_miss() -> Runner {
-    setup_fakeip_lookup_miss_sized(FAKEIP_MISS_POOL_SIZE)
+    setup_fakeip_lookup_miss_sized(FAKEIP_MISS_POOL_SIZE, fakeip_cold_hosts())
 }
 
 fn setup_fakeip_lookup_miss_1000() -> Runner {
-    setup_fakeip_lookup_miss_sized(1_000)
+    setup_fakeip_lookup_miss_sized(1_000, fakeip_cold_hosts())
+}
+
+fn setup_fakeip_lookup_miss_mixed_256() -> Runner {
+    setup_fakeip_lookup_miss_sized(FAKEIP_MISS_POOL_SIZE, fakeip_cold_hosts_mixed())
+}
+
+fn setup_fakeip_lookup_miss_mixed_1000() -> Runner {
+    setup_fakeip_lookup_miss_sized(1_000, fakeip_cold_hosts_mixed())
 }
 
 fn scan(chain: &[Arc<dyn Rule>], metadata: &mut Metadata, helper: &RuleMatchHelper) -> (usize, Option<String>) {
@@ -511,6 +533,18 @@ pub static CASES: &[Case] = &[
         setup: setup_fakeip_lookup_hit_1000,
     },
     Case {
+        name: "fakeip_lookup_hit_mixed_256",
+        operation_scope: "fake-IP Pool (size 256, persistence off) with 64 warm mixed-case hosts; repeat forward hit lookup",
+        bytes_per_operation: 0,
+        setup: setup_fakeip_lookup_hit_mixed_256,
+    },
+    Case {
+        name: "fakeip_lookup_hit_mixed_1000",
+        operation_scope: "fake-IP Pool (size 1000, persistence off) with 64 warm mixed-case hosts; repeat forward hit lookup",
+        bytes_per_operation: 0,
+        setup: setup_fakeip_lookup_hit_mixed_1000,
+    },
+    Case {
         name: "fakeip_look_back_hit_256",
         operation_scope: "fake-IP Pool (size 256, persistence off) with 64 warm hosts; repeat reverse hit look_back",
         bytes_per_operation: 0,
@@ -523,6 +557,18 @@ pub static CASES: &[Case] = &[
         setup: setup_fakeip_look_back_hit_1000,
     },
     Case {
+        name: "fakeip_look_back_hit_mixed_256",
+        operation_scope: "fake-IP Pool (size 256, persistence off) with 64 warm mixed-case hosts; repeat reverse hit look_back",
+        bytes_per_operation: 0,
+        setup: setup_fakeip_look_back_hit_mixed_256,
+    },
+    Case {
+        name: "fakeip_look_back_hit_mixed_1000",
+        operation_scope: "fake-IP Pool (size 1000, persistence off) with 64 warm mixed-case hosts; repeat reverse hit look_back",
+        bytes_per_operation: 0,
+        setup: setup_fakeip_look_back_hit_mixed_1000,
+    },
+    Case {
         name: "fakeip_lookup_miss",
         operation_scope: "bounded fake-IP Pool (size 256) over 8192 rotating hosts; cold miss inserts and evicts",
         bytes_per_operation: 0,
@@ -533,6 +579,18 @@ pub static CASES: &[Case] = &[
         operation_scope: "bounded fake-IP Pool (size 1000) over 8192 rotating hosts; cold miss inserts and evicts",
         bytes_per_operation: 0,
         setup: setup_fakeip_lookup_miss_1000,
+    },
+    Case {
+        name: "fakeip_lookup_miss_mixed_256",
+        operation_scope: "bounded fake-IP Pool (size 256) over 8192 rotating mixed-case hosts; cold miss inserts and evicts",
+        bytes_per_operation: 0,
+        setup: setup_fakeip_lookup_miss_mixed_256,
+    },
+    Case {
+        name: "fakeip_lookup_miss_mixed_1000",
+        operation_scope: "bounded fake-IP Pool (size 1000) over 8192 rotating mixed-case hosts; cold miss inserts and evicts",
+        bytes_per_operation: 0,
+        setup: setup_fakeip_lookup_miss_mixed_1000,
     },
     Case {
         name: "rule_chain_256_miss",

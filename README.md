@@ -680,7 +680,7 @@ Criterion point estimates (not deployment guarantees):
 
 ### Additional measurement suite
 
-`tools/bench_metrics.py` runs 24 isolated workloads through two optimized, `harness = false`
+`tools/bench_metrics.py` runs 30 isolated workloads through two optimized, `harness = false`
 targets: `metrics_cpu` uses the normal allocator, while `metrics_heap` installs
 [dhat](https://docs.rs/dhat/latest/dhat/) only in that benchmark executable. These two targets
 are built by `make bench-metrics`, not by `make bench` or `make bench-smoke`; the Criterion
@@ -688,8 +688,8 @@ target list in `Makefile` deliberately omits them because this runner needs to h
 executable paths itself and to keep the `dhat` allocator confined to `metrics_heap`. Production
 binaries and Criterion targets do not use its allocator. The suite covers VLESS first/established
 writes, fresh Vision encode/decode, AEAD, domain/IP lookup, fake-IP forward hits, reverse hits and
-eviction at 256- and 1,000-entry capacities, rule scans and buffer reuse, plus a zero-work control
-and a separately named stateful pipe diagnostic.
+eviction at 256- and 1,000-entry capacities in lowercase and mixed-case forms, rule scans and
+buffer reuse, plus a zero-work control and a separately named stateful pipe diagnostic.
 `rule_chain_256_miss_populated` complements the original empty-helper miss without changing it.
 
 ```bash
