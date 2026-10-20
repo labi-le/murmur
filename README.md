@@ -1225,14 +1225,24 @@ by the unit test suite.
   connection, and the websocket sink never read, so an idle peer's close was invisible.
   `crates/hub/src/route/server.rs` now selects the sink's closure against the channel and releases
   through a guard that also covers an aborted or panicking task; `crates/hub/src/route/common.rs`
-  watches the HTTP body receiver and the upgraded websocket's control frames (ping answered, close
-  echoed, data discarded). Tests:
-  `a_closed_logs_stream_releases_its_subscription_without_a_qualifying_record` and
-  `a_websocket_logs_client_is_answered_and_released_on_close`, both failing on the write-only form
-  with `Elapsed(())`. A loopback `level=error` probe opened and closed 1,000 plain HTTP streams and
+  watches the HTTP body receiver and the upgraded websocket's control frames (ping answered, valid
+  close echoed, invalid close answered with a 1002 protocol error, data discarded). `/traffic`,
+  `/memory` and `/connections` select the same closure against their ticker, and every websocket
+  write shares the writer mutex with the close path: the close sets a flag before it writes, so no
+  data frame can follow the close frame even if the ticker fires in between. Tests:
+  `a_closed_logs_stream_releases_its_subscription_without_a_qualifying_record`,
+  `a_websocket_logs_client_is_answered_and_released_on_close`,
+  `an_invalid_close_payload_is_answered_with_a_protocol_error`,
+  `an_empty_close_payload_is_echoed`,
+  `a_close_frame_stops_the_traffic_stream_before_its_next_frame` and
+  `a_close_frame_stops_an_hour_interval_connection_stream`; all but the empty-close case fail on
+  the previous form. A loopback `level=error` probe opened and closed 1,000 plain HTTP streams and
   1,000 websocket streams with no qualifying record: the process held 11 descriptors and no
   `CLOSE_WAIT` sockets before, between and after the churn, against 112 descriptors and 101
-  `CLOSE_WAIT` sockets for 100 websocket disconnects with only the old receive loop restored
+  `CLOSE_WAIT` sockets for 100 websocket disconnects with only the old receive loop restored. A
+  second probe sent a close frame to `/traffic`, `/memory`, `/logs?level=error` and
+  `/connections?interval=3600000` and read only the echoed close followed by EOF; payloads
+  `78`, `03ed` and `03e8ff` drew `03ea`, and an empty close was echoed empty
   ([#192](https://github.com/labi-le/murmur/issues/192)).
 
 ## Licence
