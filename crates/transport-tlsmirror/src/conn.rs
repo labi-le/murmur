@@ -420,10 +420,6 @@ impl ConnInner {
             let Some(chunk) = data.get(written..end) else {
                 return Err(io_err(anyhow!("tlsmirror: invalid tls record overhead")));
             };
-            let mut plain = chunk.to_vec();
-            if self.config.transport_layer_padding.enabled {
-                plain = pack_padding(&plain, 0);
-            }
             let mut fragment = vec![0u8; overhead];
             // Sealing advances the encryptor's nonce counter; anything that fails from this
             // point on (including the `insert_*` call below, e.g. a deadline hitting a full
@@ -431,7 +427,16 @@ impl ConnInner {
             // *next* fragment is sealed, so `poll_write`'s caller must tear the conn even if the
             // failing insert never queued a single byte (`agent://ReviewBridge2` P2).
             self.write_progress.store(true, Ordering::SeqCst);
-            encryptor.lock().seal(&mut fragment, &plain).map_err(io_err)?;
+            // `chunk` borrows the `data: Bytes` owned by this future and is not used after the
+            // seal, so the unpadded path seals it in place. Padding is the only case that needs
+            // a new buffer, and it is built once and borrowed rather than copied into `plain`
+            // first.
+            if self.config.transport_layer_padding.enabled {
+                let padded = pack_padding(chunk, 0);
+                encryptor.lock().seal(&mut fragment, &padded).map_err(io_err)?;
+            } else {
+                encryptor.lock().seal(&mut fragment, chunk).map_err(io_err)?;
+            }
             let rec = Record { record_type: RECORD_TYPE_APPLICATION_DATA, version, fragment, inserted: true };
             let result = if self.is_server {
                 self.insert_s2c(&rec, &cancel_token).await

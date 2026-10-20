@@ -1336,15 +1336,18 @@ impl UtlsClient {
         header[..3].copy_from_slice(&[CONTENT_APPLICATION_DATA, LEGACY_RECORD_VERSION[0], LEGACY_RECORD_VERSION[1]]);
         header[3..].copy_from_slice(&wire_u16(body.len()));
         let nonce = record_nonce(&self.server_iv, self.server_sequence);
-        let inner = suite.open(&self.server_key, &nonce, &body, &header)?;
+        let mut inner = suite.open(&self.server_key, &nonce, &body, &header)?;
         self.server_sequence += 1;
         let Some(index) = inner.iter().rposition(|byte| *byte != 0) else {
             return Err(anyhow!("tls: TLSInnerPlaintext carries no content type"));
         };
-        let (plaintext, rest) = inner.split_at(index);
-        let (content_type, _) =
-            rest.split_first().ok_or_else(|| anyhow!("tls: TLSInnerPlaintext carries no content type"))?;
-        Ok((*content_type, plaintext.to_vec()))
+        let content_type =
+            inner.get(index).copied().ok_or_else(|| anyhow!("tls: TLSInnerPlaintext carries no content type"))?;
+        // Truncating in place keeps the allocation AEAD already made instead of copying the
+        // payload out and dropping it. Padding and tag capacity stays attached until the record
+        // is drained, and only one record is held per connection.
+        inner.truncate(index);
+        Ok((content_type, inner))
     }
 
     async fn read_handshake_message(&mut self, stream: &mut dyn Stream) -> Result<Vec<u8>> {
@@ -2036,10 +2039,15 @@ mod tests {
     ) -> (u8, Vec<u8>) {
         let mut inner = payload.to_vec();
         inner.push(inner_content_type);
+        seal_raw_record(suite, key, iv, sequence, &inner)
+    }
+
+    /// Seals an already-assembled inner plaintext, so a test can supply its own padding.
+    fn seal_raw_record(suite: Tls13Suite, key: &[u8], iv: &[u8; IV_LEN], sequence: u64, inner: &[u8]) -> (u8, Vec<u8>) {
         let mut header = [0u8; 5];
         header[..3].copy_from_slice(&[CONTENT_APPLICATION_DATA, LEGACY_RECORD_VERSION[0], LEGACY_RECORD_VERSION[1]]);
         header[3..].copy_from_slice(&wire_u16(inner.len() + TAG_LEN));
-        let ciphertext = suite.seal(key, &record_nonce(iv, sequence), &inner, &header).expect("seal the record");
+        let ciphertext = suite.seal(key, &record_nonce(iv, sequence), inner, &header).expect("seal the record");
         (CONTENT_APPLICATION_DATA, ciphertext)
     }
 
@@ -2051,10 +2059,11 @@ mod tests {
         header: &[u8; 5],
         ciphertext: &[u8],
     ) -> (u8, Vec<u8>) {
-        let inner = suite.open(key, &record_nonce(iv, sequence), ciphertext, header).expect("open the record");
+        let mut inner = suite.open(key, &record_nonce(iv, sequence), ciphertext, header).expect("open the record");
         let index = inner.iter().rposition(|byte| *byte != 0).expect("the inner plaintext carries a content type");
-        let (plaintext, rest) = inner.split_at(index);
-        (rest[0], plaintext.to_vec())
+        let content_type = inner[index];
+        inner.truncate(index);
+        (content_type, inner)
     }
 
     /// Splits a captured write into `(header, ciphertext)` record pairs.
@@ -2144,6 +2153,60 @@ mod tests {
         assert_ne!(client.server_key, keys.server_key, "the peer's next generation is installed");
         assert_eq!(client.client_key, keys.client_key, "an unrequested update must not switch the write keys");
         assert!(client.pending_control.is_empty(), "nothing may be queued in reply");
+    }
+
+    /// RFC 8446 §5.2: authenticated zero padding follows the content type, and truncating at the
+    /// last non-zero byte hands the caller only the payload.
+    #[test]
+    fn a_padded_record_yields_only_its_payload() {
+        let (mut client, keys) = client_with_application_keys();
+        let mut inner = b"hello".to_vec();
+        inner.push(CONTENT_APPLICATION_DATA);
+        inner.extend_from_slice(&[0u8; 48]);
+        let record = seal_raw_record(keys.suite, &keys.server_key, &keys.server_iv, 0, &inner);
+
+        let (content_type, payload) = client.open_record(record).expect("open the padded record");
+        assert_eq!(content_type, CONTENT_APPLICATION_DATA);
+        assert_eq!(payload, b"hello");
+    }
+
+    /// An inner plaintext of nothing but zeroes has no content type to strip padding at, so the
+    /// record fails closed instead of surfacing as an empty application-data record.
+    #[test]
+    fn an_all_zero_inner_plaintext_is_rejected() {
+        let (mut client, keys) = client_with_application_keys();
+        let record = seal_raw_record(keys.suite, &keys.server_key, &keys.server_iv, 0, &[0u8; 32]);
+
+        let error = client.open_record(record).expect_err("an all-zero inner plaintext is not a record");
+        assert_eq!(error.to_string(), "tls: TLSInnerPlaintext carries no content type");
+    }
+
+    /// The application-data read path hands up the payload of a padded record with the padding
+    /// already stripped, not the padded inner plaintext.
+    #[test]
+    fn poll_read_returns_the_payload_of_a_padded_record() {
+        let (mut client, keys) = client_with_application_keys();
+        let mut inner = b"hello".to_vec();
+        inner.push(CONTENT_APPLICATION_DATA);
+        inner.extend_from_slice(&[0u8; 48]);
+        let (_, ciphertext) = seal_raw_record(keys.suite, &keys.server_key, &keys.server_iv, 0, &inner);
+        let mut wire = Vec::new();
+        wire.extend_from_slice(&[CONTENT_APPLICATION_DATA, LEGACY_RECORD_VERSION[0], LEGACY_RECORD_VERSION[1]]);
+        wire.extend_from_slice(&wire_u16(ciphertext.len()));
+        wire.extend_from_slice(&ciphertext);
+
+        let mut stream = ScriptedStream {
+            to_client: Mutex::new(VecDeque::from(wire)),
+            written: Arc::new(Mutex::new(Vec::new())),
+            one_byte_per_read: false,
+            script: Mutex::new(None),
+        };
+        let mut out = [0u8; 16];
+        let mut buf = ReadBuf::new(&mut out);
+        let mut cx = Context::from_waker(Waker::noop());
+
+        assert!(matches!(client.poll_read(&mut stream, &mut cx, &mut buf), Poll::Ready(Ok(()))));
+        assert_eq!(buf.filled(), b"hello");
     }
 
     /// A peer that declares more than the message cap in its handshake header must be refused on

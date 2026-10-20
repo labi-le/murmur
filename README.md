@@ -384,7 +384,7 @@ trips over those four dialers (TLS 1.3 and TLS 1.2 each), including a camouflage
 the client's byte stream as TLS records and requires the ClientHello's SNI to match the configured
 name. The TLS 1.3 master-secret salt defect that made the engine's TLS 1.3 records undecryptable was
 fixed — RFC 8446 §7.1 derives the master secret from the *handshake* secret's `derived` value —
-leaving `murmur-restls` at 59 lib tests plus its interop tests green. The superseded
+leaving `murmur-restls` at 66 lib tests plus its interop tests green. The superseded
 `trojan::restls_stream_tests` module was deleted.
 
 Mieru is implemented: `crates/mieru` (the chacha20poly1305-authenticated multiplexed TCP/UDP engine)
@@ -611,12 +611,13 @@ These are cases where this build intentionally or knowingly differs from the ref
 
 ## Component benchmarks
 
-Eight crate-local [Criterion](https://criterion-rs.github.io/book/) targets exercise production
+Nine crate-local [Criterion](https://criterion-rs.github.io/book/) targets exercise production
 APIs without changing the proxy's public interfaces:
 
 | Target | Workloads |
 | --- | --- |
 | `vless` | IPv4/domain/IPv6/UDP/MUX first-write request framing; established memory-stream writes; Vision padding encode/decode/roundtrip at 64 B, 1 KiB and 16 KiB; VLESS AES-256-GCM and ChaCha20-Poly1305 seal/open/roundtrip |
+| `v4_read` | Snell v4 decode of pre-encoded maximum-length records through the production `AsyncRead` at 1 B, 64 B, 512 B and one-full-record consumer windows; the fixture, salt exchange and AEAD key derivation sit outside the timed region |
 | `domain_match` | DomainSet/DomainMap/DomainTrie lookup over 10,000 generated patterns plus boundary cases; builds at 100/10,000 patterns; IPv4/IPv6 CIDR hit/miss |
 | `fakeip` | In-memory lookup hit and bounded eviction/miss, reverse lookup and existence; the miss workload rotates 8,192 hosts through a 256-entry pool across measurement batches |
 | `rule_match` | Ordered mixed-rule scans with 16/256/1,024 rules, matching first/last or missing; no DNS or network resolution. Also the `DomainKeyword` needle-search A/B: `str::contains` against the rule's cached `memchr::memmem::Finder` over 14/64/253-byte hosts, empty/one-byte/ASCII/non-ASCII needles, early/late/miss/shared-prefix cases, and keyword chains of 0/1/16/51/256 rules |
@@ -624,11 +625,12 @@ APIs without changing the proxy's public interfaces:
 | `rule_wrapper` | A bare rule chain against the same chain inside the production `RuleWrapper`, at 16/256/1,024 rules, on a full-chain miss and on a steady all-hit streak. The miss case pays a clock reading per rule because the streak gate is cold; the hit case pays it once per 256 matches |
 | `udp_path` | The per-datagram metadata path the UDP entry point walks |
 
-Four further targets are not Criterion and are not part of `make bench`:
+Five further targets are not Criterion and are not part of `make bench`:
 
 | Target | Output |
 | --- | --- |
 | `alloc_census` (`make bench-alloc`) | Heap allocations per operation from `dhat` as the global allocator: `Metadata::clone`, `DomainSet::has` and `DomainMap::lookup` in ASCII and upper-case, and rule-chain scans at 16/256/1,024 rules on a first-rule hit and a full-chain miss. Prints the measured figure beside the hand count for `Metadata::clone` so a disagreement between arithmetic and measurement is visible |
+| `recv_alloc` (`cargo bench -p murmur-transport-sudoku --bench recv_alloc`) | The same `dhat` accounting for the sudoku receive paths, `RecordConn` and `AEADConn`: heap blocks and bytes per decrypted frame, plus the exact receive-buffer capacity reported by the connection after a warm-up frame, at 1 KiB and 16 KiB stable and alternating sizes and at the 65,507 B protocol maximum. Both readers keep one frame buffer per connection and decrypt in place, so after one warm-up frame the measured loop must report zero blocks and the buffer capacity must stay within one protocol maximum |
 | `udp_hit_path` (`make bench-alloc`) | Heap allocations per datagram on an established NAT key, before and after the borrowed-key fast path: the key clone, `Metadata` clone, metadata-cell `Arc`, maker box and `get_or_create` key copy against `key_ref` + `NatTable::get` + the packet `Arc`. This is the modeled subset; `metadata_clone` calibrates the clone against its hand count |
 | `udp_dispatch` (`make bench-alloc`) | The real `handle_udp_conn` called once per datum, with fixture construction outside the window: established hits against an installed key, misses through the real `get_or_create`/maker path, both with sniffing off and with a QUIC dispatcher installed. Reports `dhat` blocks and wall-clock nanoseconds per dispatch, so the miss-side cost of the added lookup is visible; the failed dial is drained outside the miss window |
 | `dialer_alloc_census` | The same shape for the dialer and resolver: option application, the address helpers each attempt runs, the hosts-table search each lookup starts with, and the literal-IP short circuit. Every connect path is reported as unmeasured, because each ends in a real connect; the upstream DNS leg is reported as unmeasured too, because a bench can only supply a trait stub whose own allocations would be inside every figure |

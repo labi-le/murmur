@@ -117,16 +117,22 @@ async fn read_record<R: AsyncRead + Unpin>(inner: &mut R, keys: &mut Option<Traf
         keys.as_mut().ok_or_else(|| anyhow!("REALITY record layer: encrypted record before read keys were set"))?;
     let nonce = record_nonce(&keys.iv, keys.seq);
     keys.seq += 1;
-    let plaintext = keys.suite.open(&keys.key, &nonce, &payload, &header)?;
+    let mut plaintext = keys.suite.open(&keys.key, &nonce, &payload, &header)?;
     // RFC 8446 §5.2: the content type is the last non-zero octet, not the last byte -- a REALITY
     // server pads every handshake record to the length its `dest` used for the same message.
     let content_type_pos = plaintext
         .iter()
         .rposition(|byte| *byte != 0)
         .ok_or_else(|| anyhow!("REALITY record layer: TLSInnerPlaintext without a content type"))?;
-    let (content, tail) = plaintext.split_at(content_type_pos);
-    let content_type = tail.first().copied().unwrap_or_default();
-    Ok((content_type, content.to_vec()))
+    let content_type = plaintext
+        .get(content_type_pos)
+        .copied()
+        .ok_or_else(|| anyhow!("REALITY record layer: TLSInnerPlaintext without a content type"))?;
+    // Truncating in place keeps the allocation AEAD already made instead of copying the payload
+    // into a second `Vec` and dropping the first. The padding and tag capacity stays attached
+    // until the consumer drops the record, and only one record is held per connection.
+    plaintext.truncate(content_type_pos);
+    Ok((content_type, plaintext))
 }
 
 /// A REALITY handshake's record layer over an arbitrary byte stream, before the application-data
