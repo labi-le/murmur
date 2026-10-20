@@ -364,7 +364,7 @@ impl AsyncRead for AEADConn {
                 Poll::Ready(Ok(true)) => {
                     let frame_len = u16::from_be_bytes(this.recv_header) as usize;
                     this.recv_header_filled = 0;
-                    if frame_len < this.nonce_size {
+                    if frame_len == 0 {
                         this.reset_recv_frame();
                         return Poll::Ready(Err(std::io::Error::other("frame too short")));
                     }
@@ -390,6 +390,11 @@ impl AsyncRead for AEADConn {
                 Poll::Ready(Ok(false)) => return Poll::Ready(Ok(())),
                 Poll::Ready(Err(err)) => return Poll::Ready(Err(err)),
                 Poll::Pending => return Poll::Pending,
+            }
+
+            if this.recv_body.len() < this.nonce_size {
+                this.reset_recv_frame();
+                return Poll::Ready(Err(std::io::Error::other("frame too short")));
             }
 
             if this.nonce_size != 12 {
@@ -637,6 +642,28 @@ mod tests {
                 payload.len()
             );
         }
+    }
+
+    #[tokio::test]
+    async fn aead_conn_drains_a_short_frame_before_reporting_it() {
+        let valid = b"frame after the short bodies".to_vec();
+        let digest = Sha256::digest(b"shared-secret");
+        let aead = ChaCha20Poly1305Aead::new(&digest).expect("chacha20-poly1305 key");
+        let mut wire = Vec::new();
+        wire.extend_from_slice(&0u16.to_be_bytes());
+        wire.extend_from_slice(&4u16.to_be_bytes());
+        wire.extend_from_slice(&[0xde, 0xad, 0xbe, 0xef]);
+        wire.extend_from_slice(&aead_frame(&aead, [0x77; 12], &valid));
+
+        let mut reader =
+            new_aead_conn(Box::new(ReplayConn::new(wire)), "shared-secret", "chacha20-poly1305").expect("reader");
+
+        let mut rejected = [0u8; 1];
+        reader.read_exact(&mut rejected).await.expect_err("zero-length frame must fail");
+        reader.read_exact(&mut rejected).await.expect_err("short frame must fail");
+        let mut got = vec![0u8; valid.len()];
+        reader.read_exact(&mut got).await.expect("next frame after the short bodies");
+        assert_eq!(got, valid, "the declared short body must not be parsed as a header");
     }
 
     #[tokio::test]
