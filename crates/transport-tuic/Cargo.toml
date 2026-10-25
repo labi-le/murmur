@@ -1,0 +1,48 @@
+[package]
+name = "murmur-transport-tuic"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[lib]
+doctest = false
+
+[dependencies]
+anyhow.workspace = true
+async-trait.workspace = true
+blake3.workspace = true
+bytes.workspace = true
+chrono.workspace = true
+futures.workspace = true
+ipnet.workspace = true
+log.workspace = true
+parking_lot.workspace = true
+rand.workspace = true
+quinn.workspace = true
+rustls.workspace = true
+subtle.workspace = true
+thiserror.workspace = true
+tokio.workspace = true
+tokio-util.workspace = true
+uuid.workspace = true
+murmur-adapter-inbound = { path = "../adapter-inbound" }
+murmur-common = { path = "../common" }
+murmur-common-net = { path = "../common-net" }
+murmur-common-pool = { path = "../common-pool" }
+murmur-component = { path = "../component" }
+murmur-constant = { path = "../constant" }
+murmur-quic = { path = "../quic" }
+murmur-std-compat = { path = "../std-compat" }
+murmur-log = { path = "../log" }
+murmur-transport = { path = "../transport" }
+
+
+[dev-dependencies]
+murmur-component-ca = { path = "../component-ca" }
+murmur-component-tls = { path = "../component-tls" }
+
+
+[lints]
+workspace = true

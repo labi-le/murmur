@@ -1,0 +1,51 @@
+--- a/src/msgs/deframer/buffers.rs
++++ b/src/msgs/deframer/buffers.rs
+@@ -242,7 +242,10 @@
+         // which usually means that the other side suspended sending data.
+         let need_capacity = Ord::min(allow_max, self.used + READ_SIZE);
+         if need_capacity > self.buf.len() {
+-            self.buf.resize(need_capacity, 0);
++            // Use already allocated spare space before growing the buffer.
++            if self.used == self.buf.len() {
++                self.buf.resize(need_capacity, 0);
++            }
+         } else if self.used == 0 || self.buf.len() > allow_max {
+             self.buf.resize(need_capacity, 0);
+             self.buf.shrink_to(need_capacity);
+@@ -294,3 +297,36 @@
+         &mut self.buf[self.discard..]
+     }
+ }
++
++#[cfg(all(test, feature = "std"))]
++mod tests {
++    use super::DeframerVecBuffer;
++
++    #[test]
++    fn fragmented_small_input_reuses_initialized_storage() {
++        let mut buffer = DeframerVecBuffer::default();
++        let fragment = [0x5a; 128];
++        for _ in 0..3 {
++            for _ in 0..8 {
++                assert_eq!(buffer.read(&mut fragment.as_slice(), false).unwrap(), 128);
++                assert_eq!(buffer.buf.len(), 4096);
++                assert_eq!(buffer.buf.capacity(), 4096);
++            }
++            assert_eq!(buffer.filled(), &[0x5a; 1024]);
++            buffer.discard(1024);
++        }
++    }
++
++    #[test]
++    fn full_storage_grows_and_empty_storage_shrinks() {
++        let mut buffer = DeframerVecBuffer::default();
++        assert_eq!(buffer.read(&mut [0x5a; 4096].as_slice(), false).unwrap(), 4096);
++        assert_eq!(buffer.read(&mut [0x6b; 128].as_slice(), false).unwrap(), 128);
++        assert_eq!(buffer.buf.len(), 8192);
++        assert_eq!(&buffer.filled()[4096..], &[0x6b; 128]);
++        buffer.discard(4224);
++        assert_eq!(buffer.read(&mut [].as_slice(), false).unwrap(), 0);
++        assert_eq!(buffer.buf.len(), 4096);
++        assert_eq!(buffer.buf.capacity(), 4096);
++    }
++}

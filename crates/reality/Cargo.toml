@@ -1,0 +1,34 @@
+[package]
+name = "murmur-reality"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[lib]
+doctest = false
+
+[dependencies]
+aes-gcm.workspace = true
+anyhow.workspace = true
+chacha20poly1305.workspace = true
+ed25519-dalek.workspace = true
+hkdf.workspace = true
+hmac.workspace = true
+rand.workspace = true
+socket2.workspace = true
+murmur-std-compat = { path = "../std-compat" }
+sha2.workspace = true
+tokio.workspace = true
+x25519-dalek.workspace = true
+murmur-common-net = { path = "../common-net" }
+murmur-log = { path = "../log" }
+murmur-ntp = { path = "../ntp" }
+
+[dev-dependencies]
+base64.workspace = true
+tokio = { workspace = true, features = ["macros", "rt-multi-thread", "net", "time", "test-util"] }
+
+[lints]
+workspace = true

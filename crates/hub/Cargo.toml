@@ -1,0 +1,86 @@
+[package]
+name = "murmur-hub"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[lib]
+doctest = false
+
+[dependencies]
+anyhow.workspace = true
+async-trait.workspace = true
+base64.workspace = true
+bytes.workspace = true
+chrono.workspace = true
+futures.workspace = true
+hickory-proto.workspace = true
+http-body-util.workspace = true
+hyper.workspace = true
+hyper-util.workspace = true
+ipnet.workspace = true
+notify.workspace = true
+parking_lot.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+tokio.workspace = true
+tokio-util.workspace = true
+murmur-adapter = { path = "../adapter", default-features = false }
+murmur-adapter-inbound = { path = "../adapter-inbound" }
+murmur-adapter-outboundgroup = { path = "../adapter-outboundgroup", default-features = false }
+murmur-common = { path = "../common" }
+murmur-common-convert = { path = "../common-convert" }
+murmur-common-net = { path = "../common-net" }
+murmur-component = { path = "../component" }
+murmur-component-ca = { path = "../component-ca" }
+murmur-component-ech = { path = "../component-ech" }
+murmur-component-geodata = { path = "../component-geodata" }
+murmur-component-http = { path = "../component-http" }
+murmur-component-process = { path = "../component-process" }
+murmur-component-profile = { path = "../component-profile" }
+murmur-component-resource = { path = "../component-resource" }
+murmur-component-sniffer = { path = "../component-sniffer" }
+murmur-component-tls = { path = "../component-tls" }
+murmur-component-trie = { path = "../component-trie" }
+murmur-component-updater = { path = "../component-updater", default-features = false }
+murmur-config = { path = "../config", default-features = false }
+murmur-constant = { path = "../constant" }
+murmur-dns = { path = "../dns" }
+murmur-std-compat = { path = "../std-compat" }
+murmur-listener = { path = "../listener", default-features = false }
+murmur-listener-config = { path = "../listener-config" }
+murmur-listener-inner = { path = "../listener-inner" }
+murmur-listener-tproxy = { path = "../listener-tproxy" }
+murmur-log = { path = "../log" }
+murmur-ntp = { path = "../ntp" }
+murmur-tunnel = { path = "../tunnel" }
+murmur-ws = { path = "../ws" }
+
+# `/debug/pprof` needs a CPU sampler and a symbolizer the Rust std does not ship. The crate is
+# SIGPROF-based but only builds where `nix`/`findshlibs` do, so the profiling endpoints are
+# Unix-only; `pprof.rs` refuses them honestly elsewhere.
+[target.'cfg(unix)'.dependencies]
+backtrace = { version = "0.3.76", optional = true }
+flate2 = { workspace = true, optional = true }
+pprof = { version = "0.15.0", optional = true }
+prost = { workspace = true, optional = true }
+
+[features]
+extra-protocols = ["murmur-adapter/extra-protocols", "murmur-adapter-outboundgroup/extra-protocols", "murmur-config/extra-protocols", "murmur-listener/extra-protocols", "murmur-component-updater/extra-protocols"]
+default = ["extra-protocols", "easytier", "tailscale", "zerotier", "diagnostic-profiling"]
+diagnostic-profiling = ["dep:backtrace", "dep:flate2", "dep:pprof", "dep:prost"]
+easytier = ["murmur-adapter/easytier", "murmur-adapter-outboundgroup/easytier", "murmur-config/easytier"]
+tailscale = ["murmur-adapter/tailscale", "murmur-adapter-outboundgroup/tailscale", "murmur-config/tailscale"]
+zerotier = ["murmur-adapter/zerotier", "murmur-adapter-outboundgroup/zerotier", "murmur-config/zerotier"]
+cmfa = ["murmur-constant/cmfa", "murmur-dns/cmfa"]
+no_easytier = ["murmur-adapter/no_easytier"]
+no_tailscale = ["murmur-adapter/no_tailscale"]
+no_zerotier = ["murmur-adapter/no_zerotier"]
+with_gvisor = ["murmur-adapter/with_gvisor"]
+[dev-dependencies]
+murmur-adapter-outbound = { path = "../adapter-outbound", default-features = false }
+
+[lints]
+workspace = true
