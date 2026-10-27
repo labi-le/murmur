@@ -1,0 +1,44 @@
+#!/usr/bin/env bash
+# Build a native x86_64 murmur on the shared cargo slot and run the protocol stability suite
+# there. The suite itself needs no root, VM or network: it starts its own reference listeners,
+# targets and murmur client on 127.0.0.1.
+#
+# Usage, from anywhere inside the repository:
+#   tools/e2e-pc [--cycles N] [--protocols a,b] [--direction outbound|inbound] [--skip-restart] [--keep]
+#
+# Environment:
+#   E2E_HOST       build/run host (default: pc)
+#   E2E_TARGET_DIR cargo target directory name on that host (default: e2e-stability-pc)
+#   E2E_PROFILE    cargo profile (default: compact)
+#   E2E_RUST_BIN   use an already-built murmur instead of building one
+#   E2E_REF_BIN    reference proxy binary on the host (default: /home/drive/tmp/go-mihomo)
+#   E2E_WORKDIR    empty directory for configs, logs and artifacts
+set -euo pipefail
+
+repo_root=$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)
+cd "$repo_root"
+
+host=${E2E_HOST:-pc}
+target_dir=${E2E_TARGET_DIR:-e2e-stability-pc}
+profile=${E2E_PROFILE:-compact}
+ref_bin=${E2E_REF_BIN:-/home/drive/tmp/go-mihomo}
+
+if [[ -z ${E2E_RUST_BIN:-} ]]; then
+    cargo_slot_dir=$(mktemp -d "${TMPDIR:-/tmp}/murmur-e2e-slot.XXXXXX")
+    trap 'rm -rf "$cargo_slot_dir"' EXIT
+    CARGO_TARGET_DIR="$target_dir" \
+        tools/cargo-slot cargo build --locked -p murmur --bin murmur --all-features --profile "$profile" \
+        | tee "$cargo_slot_dir/build.log"
+    rust_bin=$(ssh "$host" "find ~/.cache/cargo-pc/$target_dir -type f -path '*/$profile/murmur' -perm -u+x | head -n1")
+else
+    rust_bin=$E2E_RUST_BIN
+fi
+
+if [[ -z ${rust_bin:-} ]]; then
+    echo "error: could not find the built murmur binary under ~/.cache/cargo-pc/$target_dir" >&2
+    exit 1
+fi
+
+workdir=${E2E_WORKDIR:-/tmp/murmur-e2e-pc-$$}
+quoted_args=$(printf '%q ' "$@")
+ssh "$host" "cd $(printf '%q' "$repo_root") && python3 tools/e2e_stability.py --rust-bin $(printf '%q' "$rust_bin") --ref-bin $(printf '%q' "$ref_bin") --workdir $(printf '%q' "$workdir") $quoted_args"

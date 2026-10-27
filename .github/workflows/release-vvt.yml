@@ -1,0 +1,57 @@
+name: Release VVT
+
+# Attaches the VLESS/Trojan/VMess-only Linux ARM64 musl asset to an existing
+# release. It does not replace the full-build assets or version.txt: the updater
+# uses version-vvt.txt for this channel.
+on:
+  release:
+    types: [published]
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: Existing release tag to attach the VVT asset to
+        required: true
+
+permissions:
+  contents: write
+
+env:
+  NIX_CONFIG: experimental-features = nix-command flakes
+
+jobs:
+  attach-vvt:
+    runs-on: ubuntu-latest
+    timeout-minutes: 90
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          ref: ${{ github.event.release.tag_name || inputs.tag }}
+          fetch-depth: 0
+      - name: Install Nix
+        run: |
+          curl -L https://nixos.org/nix/install | sh -s -- --daemon --yes
+          . /nix/var/nix/profiles/default/etc/profile.d/nix-daemon.sh
+          nix --version
+      - name: Build and package
+        run: |
+          . /nix/var/nix/profiles/default/etc/profile.d/nix-daemon.sh
+          nix develop .#aarch64-musl --command bash -se <<'BUILD'
+            set -euo pipefail
+            cargo build --locked --profile compact -p murmur --bin murmur \
+              --no-default-features --features router-vvt \
+              --target aarch64-unknown-linux-musl
+            version=$(awk '/^pub static VERSION: &str = /{ sub(/^[^"]*"/, ""); sub(/".*/, ""); print; exit }' crates/constant/src/version.rs)
+            test -n "$version"
+            mkdir -p dist
+            cp target/aarch64-unknown-linux-musl/compact/murmur dist/murmur-linux-arm64-vvt
+            cd dist
+            gzip -9 murmur-linux-arm64-vvt
+            mv murmur-linux-arm64-vvt.gz "murmur-linux-arm64-vvt-${version}.gz"
+            printf "%s\n" "$version" > version-vvt.txt
+            test "$(gzip -lN "murmur-linux-arm64-vvt-${version}.gz" | awk "NR == 2 { print \$4 }")" = murmur-linux-arm64-vvt
+          BUILD
+      - name: Upload to release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          TAG: ${{ github.event.release.tag_name || inputs.tag }}
+        run: gh release upload "$TAG" dist/murmur-linux-arm64-vvt-*.gz dist/version-vvt.txt --clobber

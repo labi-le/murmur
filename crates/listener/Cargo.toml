@@ -1,0 +1,104 @@
+[package]
+name = "murmur-listener"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[lib]
+doctest = false
+
+[dependencies]
+murmur-compat = { path = "../compat" }
+murmur-quic = { path = "../quic", optional = true }
+murmur-reality = { path = "../reality" }
+murmur-mieru = { path = "../mieru", optional = true }
+anyhow.workspace = true
+arc-swap.workspace = true
+async-trait.workspace = true
+base64.workspace = true
+bytes.workspace = true
+dashmap.workspace = true
+futures.workspace = true
+http.workspace = true
+http-body-util.workspace = true
+hex.workspace = true
+httparse.workspace = true
+hyper.workspace = true
+hyper-util.workspace = true
+ipnet.workspace = true
+libc.workspace = true
+parking_lot.workspace = true
+portable-atomic.workspace = true
+prost.workspace = true
+quinn.workspace = true
+rand.workspace = true
+regex.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+yaml_serde.workspace = true
+sha2.workspace = true
+socket2.workspace = true
+tokio.workspace = true
+tokio-util.workspace = true
+url.workspace = true
+uuid.workspace = true
+murmur-adapter-inbound = { path = "../adapter-inbound" }
+murmur-common = { path = "../common" }
+murmur-common-httputils = { path = "../common-httputils" }
+murmur-common-net = { path = "../common-net" }
+murmur-common-pool = { path = "../common-pool" }
+murmur-component = { path = "../component" }
+murmur-component-ca = { path = "../component-ca" }
+murmur-component-ech = { path = "../component-ech" }
+murmur-component-wireguard = { path = "../component-wireguard" }
+murmur-component-tls = { path = "../component-tls" }
+murmur-constant = { path = "../constant" }
+murmur-jls-tls = { path = "../jls-tls" }
+murmur-sing = { path = "../sing" }
+murmur-std-compat = { path = "../std-compat" }
+murmur-listener-config = { path = "../listener-config" }
+murmur-listener-inner = { path = "../listener-inner" }
+murmur-listener-sing = { path = "../listener-sing" }
+murmur-listener-tproxy = { path = "../listener-tproxy" }
+murmur-log = { path = "../log" }
+murmur-ntp = { path = "../ntp" }
+murmur-transport = { path = "../transport" }
+murmur-transport-anytls = { path = "../transport-anytls", optional = true }
+murmur-transport-hysteria2 = { path = "../transport-hysteria2", optional = true }
+murmur-transport-jls = { path = "../transport-jls" }
+murmur-transport-kcptun = { path = "../transport-kcptun" }
+murmur-transport-mekya = { path = "../transport-mekya" }
+murmur-transport-mkcp = { path = "../transport-mkcp" }
+murmur-transport-shadowquic = { path = "../transport-shadowquic", optional = true }
+murmur-transport-shadowsocks = { path = "../transport-shadowsocks" }
+murmur-transport-shadowtls = { path = "../transport-shadowtls" }
+murmur-transport-simple-obfs = { path = "../transport-simple-obfs", optional = true }
+murmur-transport-snell = { path = "../transport-snell", optional = true }
+murmur-transport-sudoku = { path = "../transport-sudoku", optional = true }
+murmur-transport-tlsmirror = { path = "../transport-tlsmirror" }
+murmur-transport-trusttunnel = { path = "../transport-trusttunnel", optional = true }
+murmur-transport-tuic = { path = "../transport-tuic", optional = true }
+murmur-transport-vless = { path = "../transport-vless" }
+murmur-transport-vmess = { path = "../transport-vmess" }
+murmur-transport-xhttp = { path = "../transport-xhttp" }
+
+
+[dev-dependencies]
+murmur-testsupport-probe = { path = "../testsupport-probe" }
+murmur-adapter-outbound = { path = "../adapter-outbound", default-features = false }
+murmur-component-nat = { path = "../component-nat" }
+murmur-testsupport = { path = "../testsupport" }
+criterion.workspace = true
+
+[[bench]]
+name = "unsafe_rewrite_cost"
+harness = false
+
+[features]
+default = ["extra-protocols"]
+extra-protocols = ["dep:murmur-quic", "dep:murmur-mieru", "dep:murmur-transport-anytls", "dep:murmur-transport-hysteria2", "dep:murmur-transport-shadowquic", "dep:murmur-transport-simple-obfs", "dep:murmur-transport-snell", "dep:murmur-transport-sudoku", "dep:murmur-transport-trusttunnel", "dep:murmur-transport-tuic", "murmur-adapter-outbound/extra-protocols"]
+
+[lints]
+workspace = true

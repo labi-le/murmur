@@ -1,0 +1,51 @@
+name: Audit
+
+# Dependency and advisory hygiene, run by hand. cargo-deny reads deny.toml, whose
+# accepted exceptions carry their own justification.
+on:
+  workflow_dispatch:
+    inputs:
+      ref:
+        description: Commit SHA, tag or branch to audit
+        required: false
+        default: ""
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  deny:
+    name: cargo-deny
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          ref: ${{ inputs.ref }}
+      - uses: EmbarkStudios/cargo-deny-action@v2
+      - uses: dtolnay/rust-toolchain@stable
+      - name: Install pinned supplemental auditor
+        run: cargo install cargo-audit --version 0.22.2 --locked
+      - name: Audit vendored registry identities
+        run: python3 tools/audit_vendored.py
+
+  audit:
+    name: cargo-audit
+    runs-on: ubuntu-latest
+    # audit-check publishes its findings through the check-run and issue APIs,
+    # which the default token does not reach.
+    permissions:
+      contents: read
+      checks: write
+      issues: write
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          ref: ${{ inputs.ref }}
+      - uses: rustsec/audit-check@v2
+        with:
+          token: ${{ secrets.GITHUB_TOKEN }}
+      - uses: dtolnay/rust-toolchain@stable
+      - name: Install pinned supplemental auditor
+        run: cargo install cargo-audit --version 0.22.2 --locked
+      - name: Audit vendored registry identities
+        run: python3 tools/audit_vendored.py

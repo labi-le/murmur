@@ -1,0 +1,24 @@
+[package]
+name = "murmur-constant-features"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[lib]
+doctest = false
+
+[dependencies]
+
+[features]
+cmfa = []
+no_easytier = []
+no_fake_tcp = []
+no_tailscale = []
+no_zerotier = []
+with_gvisor = []
+with_low_memory = []
+
+[lints]
+workspace = true
