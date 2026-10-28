@@ -371,9 +371,15 @@ background process must be stopped by its verified PID/executable, not by name.
 
 Obtain a trusted subscription privately. Never send the credential-bearing URL
 to an LLM, put it on a command line, or publish cached nodes. Insert it locally in
-the protected config. Require the provider's supported payload format (for
-example Clash YAML with a top-level `proxies:` list); do not assume arbitrary HTML,
-a control-panel URL or another core's full config is a usable provider.
+the protected config. A `type: http` provider accepts a Clash-style document with
+a top-level `proxies:` list **and** a v2ray-style URI list, base64-encoded or
+plain: when the YAML parse fails, the provider falls back to the built-in
+converter, which decodes the payload and accepts `vless://`, `vmess://`,
+`trojan://`, `ss://`, `ssr://`, `hysteria://`, `tuic://`, `anytls://` and
+`socks`/`http` lines. Keep that URL in `type: http` so `interval` refreshes the
+nodes; converting a base64 subscription into a local `proxies:` file by hand makes
+the result static, and `interval` then has nothing to fetch. A control-panel HTML
+page or another core's full config is still not a usable provider payload.
 
 Merge these sections into the baseline, **replacing** its `rules` section:
 
