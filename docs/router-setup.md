@@ -63,7 +63,11 @@ cat /proc/1/comm
 cat /etc/os-release
 cat /etc/openwrt_release
 cat /opt/etc/entware-release
-command -v opkg apk ubus uci fw4 nft iptables ip ss netstat file readelf
+for t in opkg apk ubus uci fw4 nft iptables ip ss netstat file readelf \
+         sha256sum tar gzip curl wget scp sftp start-stop-daemon nohup setsid \
+         openssl hexdump od pidof crond; do
+    printf '%s: ' "$t"; command -v "$t" || echo MISSING
+done
 opkg print-architecture
 file -L /bin/sh /opt/bin/opkg
 readelf -h -l -A /bin/busybox
@@ -82,6 +86,14 @@ cat /proc/modules
 ls -l /dev/net/tun
 ```
 
+One name per `command -v`. POSIX and BusyBox accept a single name and ignore the
+rest, so `command -v opkg apk ubus ...` reports only the first result and makes
+every later tool look absent. `MISSING` means "not on this `PATH`", not "not
+installed": Entware places many tools under `/opt/bin` and `/opt/sbin`, so probe
+from the shell the service will run in, or with the absolute path you intend to
+use. `file`, `readelf`, `ldd` and the `-A`/`-t` forms of `od` are GNU or
+desktop-BusyBox tools; run those probes only when the loop found them.
+
 Use `ubus call system board` only on verified OpenWrt. On KeeneticOS, obtain the
 firmware/model from its management UI or documented read-only management command,
 and inspect `/opt/etc/init.d/rc.unslung`, `/opt/etc/init.d/rc.func` and the configured
@@ -93,7 +105,9 @@ backends, and identify who regenerates those rules. Inspect existing service
 files and resolver settings locally. These outputs can contain private addresses,
 VPN keys or subscription details: return a redacted inventory, not raw config.
 If ELF tools are absent, copy a known system ELF to a trusted workstation for
-inspection. `uname -m` alone does not establish userspace ABI, libc, MIPS
+inspection. An `od: invalid option -- 'A'` failure is missing information, not
+data: plain BusyBox `od` has no `-A` or `-t`, and §2 gives the byte-level
+fallback. `uname -m` alone does not establish userspace ABI, libc, MIPS
 endianness or floating-point ABI. Do not run `ldd` on an untrusted binary.
 
 ## 2. Artifact and feature gate
@@ -108,19 +122,29 @@ a shell history, a gist or an assistant transcript.
 
 | Profile | Intended capabilities | Important exclusions |
 | --- | --- | --- |
-| Full/default | Ordinary proxy protocols, DNS, rules/providers, controller, transparent-inbound infrastructure, optional overlay engines | Availability still depends on target and runtime support |
-| `router` | Ordinary proxy protocols including WireGuard; DNS/rules/controller; TUN/redir/TPROXY infrastructure; lower-memory build | EasyTier/Wasmtime/WASI, Tailscale, ZeroTier and diagnostic CPU profiling |
-| `router-vvt` (VVT) | VLESS, VMess and Trojan transport families; DNS/rules/providers/controller; mixed inbound; TUN/redir/TPROXY infrastructure | Other optional proxy protocols and the router exclusions above |
+| Full/default | Every implemented proxy protocol (`extra-protocols` on), DNS, rules/providers, controller, transparent-inbound infrastructure, optional overlay engines | Availability still depends on target and runtime support |
+| `router` | The same protocol set as full/default, because the profile enables `extra-protocols`; WireGuard, DNS/rules/controller, TUN/redir/TPROXY infrastructure; lower-memory build | EasyTier/Wasmtime/WASI, Tailscale, ZeroTier and diagnostic CPU profiling |
+| `router-vvt` (VVT) | VLESS, VMess and Trojan transport families; DNS/rules/providers/controller; mixed inbound; TUN/redir/TPROXY infrastructure | Every protocol behind `extra-protocols`, and the router exclusions above |
 
-Profiles describe build selection, not universal interoperability. Select a build
-that supports **every** protocol in the config and every provider entry; VVT does
-not silently discard unsupported entries. `router` and VVT must be built with
-`--no-default-features`; additive features can change the effective result.
-Check `murmur -v` and the running `/version` response rather than a filename alone.
-VVT's established update asset is `murmur-linux-arm64-vvt-<version>.gz` for
-non-Android Linux ARM64 musl. Do not assume a corresponding MIPS/ARM32 download
-exists; the reduced updater rejects unsupported targets. No automatic upgrade
-is needed for this installation.
+Profiles describe build selection, not universal interoperability, and no profile
+name is printed by the binary. Select a build that supports **every** protocol in
+the config and every provider entry; VVT does not silently discard unsupported
+entries. `router` and VVT must be built with `--no-default-features`; additive
+features can change the effective result. `murmur -v` prints the target OS and
+architecture, a `Protocol set:` line and the `Use tags:` list; the running
+`/version` response reports the same choice as `protocol-set`. The field has only
+two values: `full` for the default **and** for `router`, `vvt` for `router-vvt`.
+A bundle named `router` whose `-v` says `full` therefore matches this table;
+`-v` does not reveal ELF class, endianness or the floating-point ABI. VLESS, VMess
+and Trojan belong to the base protocol set, so a `router` build carries them and
+`extra-protocols` adds the remaining optional transports (TUIC, Hysteria2,
+SSR/Shadowsocks variants, AnyTLS and others). VVT's established update asset is
+`murmur-linux-arm64-vvt-<version>.gz` for non-Android Linux ARM64 musl. Do not
+assume a corresponding MIPS/ARM32 download exists — none is published; on MIPSEL
+use a full or `router` artifact for a VLESS/VMess/Trojan subscription, and if the
+supplied artifact is a VVT-only build for another architecture, stop as below
+rather than renaming it. The reduced updater rejects unsupported targets. No
+automatic upgrade is needed for this installation.
 
 The demonstrated router target is static Linux AArch64 musl on OpenWrt. This is
 not evidence that a KN-1810, MIPS/MIPSEL, ARM32 or any particular KeeneticOS kernel
@@ -146,6 +170,47 @@ build-host paths. Verify the uncompressed checksum again after transfer. Only
 then mark it executable and run `murmur.new -v` on the router. `Exec format error`,
 an absent required loader, `Illegal instruction` or unsupported protocol is a
 stop condition, not a reason to try random assets. Leave the old binary untouched.
+
+**Delivery.** Transfer over the SSH channel you already use, or download on the
+device from the same URL. `sftp` needs an `sftp-server` binary that a router's
+Dropbear server often lacks, so `sftp` and Paramiko fail during negotiation rather
+than at login; stock firmware usually has no `scp`, while Entware may install one
+under `/opt/bin`. `wget` and `curl` likewise sit under different prefixes. Pick a
+path only after the §1 probe, and verify both digests:
+
+```sh
+mkdir -p /tmp/murmur-stage && cd /tmp/murmur-stage || exit 1
+curl -fsSL --max-time 300 -o murmur.tar.gz "ASSET_URL_FROM_TRUSTED_CHANNEL"
+sha256sum murmur.tar.gz   # must equal the digest from the trusted channel
+tar xzf murmur.tar.gz
+sha256sum murmur          # must equal the SHA256SUMS entry inside the archive
+```
+
+Use `wget -O` where `curl` is absent. If `sha256sum` is absent, do not skip the
+check: Entware may ship it in a separate package as `/opt/bin/sha256sum`, and not
+every BusyBox build carries the applet, so verify on the workstation instead and
+transfer only over an authenticated channel. Never fetch over plain HTTP, from a
+third-party mirror, or with a token in the URL.
+
+**Header check without `file`/`readelf`.** When those tools are missing on the
+device, do the full inspection on the trusted workstation before transfer. On the
+device only a coarse check is possible, and `od -An`/`od -tx1` belong to GNU and
+desktop-BusyBox builds; a plain BusyBox `od` accepts just `-abcdeFfhiloxsv`, where
+the octal byte form keeps positions unambiguous:
+
+```sh
+head -c 20 murmur | od -b
+# 0000000 177 105 114 106 001 001 001 000 000 000 000 000 000 000 000 000
+# 0000020 000 000 010 000
+```
+
+Bytes 1-4 read `\x7fELF` (`177 105 114 106`); byte 5 is `001` for ELF32 and `002`
+for ELF64; byte 6 is `001` for little-endian and `002` for big-endian; bytes 19-20
+are `e_machine` in that endianness — `076 000` x86-64, `267 000` AArch64,
+`010 000` MIPS little-endian, `000 010` MIPS big-endian. The sample above is
+MIPSEL. If `od` is missing too, stop guessing: the remaining evidence is the
+digest plus a successful `-v`, which prints OS and architecture but not class,
+endianness or ABI.
 
 ## 3. Preserve recovery before installation
 
@@ -183,20 +248,39 @@ complete rollback. Never flush the ruleset, restore an unrelated full snapshot
 on top of concurrent changes, use `killall` on shared services, or replace the
 router's whole network/firewall configuration.
 
-Arm a detached timer immediately before each risky stage. This example assumes
-`B` is the absolute, unique backup directory, `nohup` is present, and the reviewed
-rollback script is already complete:
+Arm a detached timer immediately before each risky stage. `B` must be the
+absolute, unique backup directory and the reviewed rollback script must already be
+complete. `nohup` and `setsid` are not guaranteed on BusyBox or Entware, so choose
+the mechanism by probe and stop when neither exists:
 
 ```sh
 : "${B:?Set B to the private backup directory}"
 test -x "$B/rollback.sh" || exit 1
+rm -f "$B/timer.pid"
 touch "$B/armed"
-nohup sh -c 'sleep 300; if test -f "$1/armed"; then sh "$1/rollback.sh" >"$1/rollback.log" 2>&1; fi' sh "$B" </dev/null >"$B/timer.log" 2>&1 &
-printf '%s\n' "$!" > "$B/timer.pid"
+TIMER='sleep 300; if test -f "$1/armed"; then sh "$1/rollback.sh" >"$1/rollback.log" 2>&1; fi'
+if command -v nohup >/dev/null 2>&1; then
+    nohup sh -c "$TIMER" sh "$B" </dev/null >"$B/timer.log" 2>&1 &
+    printf '%s\n' "$!" > "$B/timer.pid"
+elif command -v start-stop-daemon >/dev/null 2>&1; then
+    start-stop-daemon -S -q -b -m -p "$B/timer.pid" -x /bin/sh \
+        -O "$B/timer.log" -- -c "$TIMER" sh "$B" || exit 1
+else
+    echo "no nohup or start-stop-daemon available" >&2
+    exit 1
+fi
 ```
 
+Do not drop `-p` from the `start-stop-daemon` branch: without a pidfile it matches
+every running `/bin/sh`, including `rc.unslung` during boot, and silently declines
+to start. With `-p` the match is the recorded PID, `-m` writes that pidfile and
+`-O` appends both output streams; `-O` requires `-b` and an absolute path and is
+missing from older `start-stop-daemon` builds, so verify that the branch really
+detached and read the timer PID from `$B/timer.pid`, not from `$!`.
+
 First test the same timer mechanism with a short delay and a harmless marker,
-disconnect that test SSH session and confirm the marker from another session.
+confirm the PID recorded in `$B/timer.pid` is alive, disconnect that test SSH
+session and confirm the marker from another session.
 Do not test the real rollback by accidentally restoring a live network. Do not
 proceed if detachment cannot be demonstrated. Cancel the real timer with
 `rm "$B/armed"` only after checks from a fresh SSH connection and the relevant
@@ -227,7 +311,19 @@ config, provider caches and secret-bearing files should be 0600.
 
 Save this minimal **direct-only** baseline as `config.yaml` in that directory.
 Replace the controller-secret placeholder with a locally generated unpredictable
-secret (for example `openssl rand -hex 32` if installed). Do not paste it into chat.
+secret. `openssl rand -hex 32` works where `openssl` exists; BusyBox and Entware
+often lack it and have no `base64` applet either, but BusyBox `hexdump` prints the
+same value:
+
+```sh
+head -c 32 /dev/urandom | hexdump -v -e '/1 "%02x"'; echo
+```
+
+Probe both tools from §1 and generate on a trusted machine when neither exists.
+Do not paste the secret into chat, and do not build a command line that contains
+it: `ps` shows arguments, so `sed -i "s/…/$secret/"` leaks it into the process
+list. Edit the protected file through the channel you trust.
+
 This config does not prove an upstream proxy works and does not proxy the LAN:
 
 ```yaml
@@ -455,7 +551,10 @@ than assuming START=99 guarantees it is mounted.
 ### KeeneticOS with an existing Entware installation
 
 Verify the configured OPKG init path actually invokes the installed
-`/opt/etc/init.d/rc.unslung` after `/opt` is mounted. Do not run `rc.unslung restart`
+`/opt/etc/init.d/rc.unslung` after `/opt` is mounted. `rc.unslung` sources every
+executable `S*` file and passes the action as `$1`, so inside a sourced service
+script `$0` is `rc.unslung`: never `exit` and never re-invoke `$0` there, or the
+whole service set is affected. Do not run `rc.unslung restart`
 for this task: it affects other Entware services, potentially including SSH.
 The following pattern relies on the installed `rc.func` implementing `ENABLED`,
 `PROCS`, `ARGS` and `start|stop|check` as in the primary source linked below.
@@ -481,14 +580,65 @@ Its `check` tests presence, not functional health, and it is not a procd-style
 supervisor. For removal, stop it first, then set `ENABLED=no` or remove only the
 newly installed script as recorded in the manifest.
 
-The cited helper discards daemon stdout/stderr; service start/stop messages are
-not runtime logs. Capture the foreground run's output in a protected, size-bounded
-temporary file for diagnosis, or observe the authenticated controller `/logs`
-stream through a compatible client. If persistent runtime logs or automatic crash
-restart are required, provision a verified Entware supervisor/log-rotation setup
-before claiming those requirements are met; do not invent murmur log-file flags.
+The cited helper discards daemon stdout/stderr and has no restart, so service
+start/stop messages are not runtime logs and a crash leaves the service down.
+Capture the foreground run's output in a protected, size-bounded temporary file
+for diagnosis, or observe the authenticated controller `/logs` stream through a
+compatible client. murmur has no log-file flag; do not invent one.
+
+If persistent runtime logs and crash restart are required, make this one service
+own its process with `start-stop-daemon` instead of `rc.func`. Verify the applet
+exists (§1) and that it supports `-O`, create `/opt/var/log` (`-O` creates the
+file, not its directory), then replace the script above with this source-safe one:
+
+```sh
+#!/bin/sh
+# /opt/etc/init.d/S99murmur, mode 0755, root-owned; sourced by rc.unslung.
+PATH=/opt/sbin:/opt/bin:/usr/sbin:/usr/bin:/sbin:/bin
+DIR=/opt/etc/murmur
+BIN=/opt/bin/murmur
+LOG=/opt/var/log/murmur.log
+start() {
+    "$BIN" -t -d "$DIR" -f "$DIR/config.yaml" || return 1
+    start-stop-daemon -S -q -b -x "$BIN" -O "$LOG" -- -d "$DIR" -f "$DIR/config.yaml"
+}
+stop() {
+    start-stop-daemon -K -q -x "$BIN"
+}
+case "$1" in
+    start) start ;;
+    stop) stop ;;
+    restart) stop; start ;;
+    *) echo "usage: S99murmur {start|stop|restart}" >&2 ;;
+esac
+```
+
+`-x` must name the real executable, not a symlink: start and stop matching
+compares `/proc/<pid>/exe`. `-O` opens the log with `O_CREAT|O_APPEND` and
+redirects both output streams before exec, so truncate a live log with
+`: > "$LOG"` instead of deleting it. Test start, stop, log content and a killed
+process on the device before claiming supervision.
+
+Entware's cron reads `/opt/etc/crontabs/root`; confirm `crond` is installed and
+running before relying on it. A one-minute watchdog only needs the idempotent
+start:
+
+```
+* * * * * /opt/etc/init.d/S99murmur start >/dev/null 2>&1
+```
+
+Cron receives a minimal `PATH`, so use absolute paths there. Detection latency is
+up to a minute, a `pidof murmur` guard is weaker than the service's own check and
+matches a second, manually started instance, and cron does not rotate logs: bound
+the file yourself. Older `start-stop-daemon` builds lack `-O`; without it, keep
+the `rc.func` script and capture output separately rather than claiming
+persistent logs.
+
 Reboot testing must confirm `/opt` mounts and this one service starts without
-manual SSH login. Entware presence alone does not prove boot integration.
+manual SSH login. `rc.func` reports success through `logger` as
+`Started $DESC from $CALLER.`, so the device log is evidence that boot reached the
+service; the custom script above should log the same message if that evidence is
+required. Entware presence alone does not prove boot integration.
 
 ## 6. LAN gateway: a separate, explicitly approved change
 
@@ -554,8 +704,9 @@ gateway setup is blocked, not complete.
 
 Report each item as **passed**, **failed** or **not tested**, with redacted evidence:
 
-- Artifact checksum/version/architecture/profile match; config-test passes and no
-  unsupported-protocol/provider errors remain.
+- Artifact checksum/version/architecture match and `-v` reports the expected
+  `Protocol set:` and tags; config-test passes and no unsupported-protocol or
+  provider errors remain.
 - Exactly the intended instance and listeners exist; controller is loopback-only,
   WAN cannot access proxy/DNS/controller, existing mihomo remains unaffected.
 - Real HTTP and SOCKS HTTPS requests work through the selected upstream; expected
