@@ -1,0 +1,18 @@
+# Kept in sync with `rust/deny.toml`'s `[advisories] ignore`: cargo-audit and
+# cargo-deny read different files, and an advisory suppressed in one still fails
+# the other (RUST_GUIDELINES.md section 10).
+[advisories]
+ignore = [
+    # Marvin attack (RSA decryption timing) in `rsa` 0.9.x; upstream has no fixed
+    # release. This tree uses `rsa` only for PKCS#1 v1.5 *signing* and PKCS#8
+    # encoding of locally generated CA certificates (`component-ca`) and for PSS
+    # *verification* of a server key (`restls`) -- it never decrypts
+    # attacker-supplied ciphertext, which is the operation the attack targets.
+    # Re-check when `rsa` 0.10 leaves pre-release.
+    "RUSTSEC-2023-0071",
+    # `rustls-pemfile` is unmaintained (upstream folded the API into
+    # `rustls-pki-types`). It reaches the tree only through `geiserx_tailscale`
+    # 0.57.2 -> `geiserx_ts_control`, the Tailscale engine crate; nothing in this
+    # workspace calls it, so the fix path is an upstream release.
+    "RUSTSEC-2025-0134",
+]

@@ -1,0 +1,27 @@
+[package]
+name = "murmur-listener-config"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[lib]
+doctest = false
+
+[dependencies]
+ipnet.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+murmur-common-net = { path = "../common-net" }
+murmur-component = { path = "../component" }
+murmur-constant = { path = "../constant" }
+murmur-listener-sing = { path = "../listener-sing" }
+murmur-transport-kcptun = { path = "../transport-kcptun" }
+murmur-transport-mekya = { path = "../transport-mekya" }
+murmur-transport-mkcp = { path = "../transport-mkcp" }
+murmur-transport-tlsmirror = { path = "../transport-tlsmirror" }
+
+
+[lints]
+workspace = true

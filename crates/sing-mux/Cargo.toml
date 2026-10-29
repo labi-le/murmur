@@ -1,0 +1,36 @@
+[package]
+name = "murmur-sing-mux"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[lib]
+doctest = false
+
+[dependencies]
+anyhow.workspace = true
+async-trait.workspace = true
+bytes.workspace = true
+futures.workspace = true
+h2.workspace = true
+http.workspace = true
+libc.workspace = true
+parking_lot.workspace = true
+portable-atomic.workspace = true
+rand.workspace = true
+socket2.workspace = true
+tokio.workspace = true
+tokio-util.workspace = true
+murmur-sing = { path = "../sing" }
+murmur-yamux = { path = "../yamux" }
+murmur-compat = { path = "../compat" }
+murmur-std-compat = { path = "../std-compat" }
+murmur-log = { path = "../log" }
+
+[dev-dependencies]
+tokio = { workspace = true, features = ["rt-multi-thread", "macros", "net", "time", "io-util"] }
+
+[lints]
+workspace = true

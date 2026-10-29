@@ -1,0 +1,64 @@
+[package]
+name = "murmur-component"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[lib]
+doctest = false
+
+[dependencies]
+anyhow.workspace = true
+async-trait.workspace = true
+base64.workspace = true
+bitflags.workspace = true
+chacha20poly1305.workspace = true
+chrono.workspace = true
+futures.workspace = true
+hex.workspace = true
+hickory-proto.workspace = true
+hkdf.workspace = true
+hmac.workspace = true
+if-addrs.workspace = true
+ipnet.workspace = true
+libc.workspace = true
+parking_lot.workspace = true
+portable-atomic.workspace = true
+rand.workspace = true
+sha2.workspace = true
+socket2.workspace = true
+subtle.workspace = true
+thiserror.workspace = true
+tokio.workspace = true
+tokio-util.workspace = true
+x25519-dalek.workspace = true
+murmur-common = { path = "../common" }
+murmur-common-net = { path = "../common-net" }
+murmur-common-pool = { path = "../common-pool" }
+murmur-component-trie = { path = "../component-trie" }
+murmur-constant-features = { path = "../constant-features" }
+murmur-std-compat = { path = "../std-compat" }
+murmur-log = { path = "../log" }
+
+
+[dev-dependencies]
+dhat.workspace = true
+murmur-common = { path = "../common" }
+murmur-component-trie = { path = "../component-trie" }
+murmur-testsupport-probe = { path = "../testsupport-probe" }
+
+[[bench]]
+name = "dialer_alloc_census"
+harness = false
+
+[[bench]]
+name = "unsafe_removal_parity"
+harness = false
+
+[lints]
+workspace = true
+
+[target.'cfg(windows)'.dependencies]
+windows-sys.workspace = true

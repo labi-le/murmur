@@ -1,0 +1,608 @@
+//! The platform spelling baked into release asset names has no exact Rust equivalent.
+//!
+//! `release_os`/`release_arch` translate `std::env::consts::OS`/`ARCH` into the spelling for the
+//! two values this file's platform switches actually distinguish (`darwin` vs `macos`, and the
+//! architecture strings in the release filenames).
+//!
+//! A `tokio::sync::Mutex` (not `parking_lot`) guards the whole update, because it is held across
+//! the async HTTP download. Zip unpacking uses the pinned `zip` crate.
+
+use std::collections::HashMap;
+use std::path::{Path, PathBuf};
+use std::time::Duration;
+
+use anyhow::{anyhow, Result};
+use futures_util::StreamExt;
+use http_body_util::BodyExt;
+
+use murmur_component_ca as ca;
+use murmur_component_http::http as murmur_http;
+use murmur_constant::version::VERSION;
+use murmur_constant_features::{AMD64_LEVEL, ARM_VERSION, MIPS_FLOAT};
+use murmur_log::{debugln, errorln, infoln, warnln};
+
+use crate::utils::{copy_unpacked_file, in_dest, open_write_mode, BoundedReader, MAX_UNPACKED_FILE_SIZE};
+
+const BASE_RELEASE_URL: &str = "https://github.com/labi-le/murmur/releases/latest/download/";
+const VERSION_RELEASE_URL: &str = "https://github.com/labi-le/murmur/releases/latest/download/version.txt";
+const VERSION_RELEASE_URL_VVT: &str = "https://github.com/labi-le/murmur/releases/latest/download/version-vvt.txt";
+
+const BASE_ALPHA_URL: &str = "https://github.com/labi-le/murmur/releases/download/Prerelease-Alpha/";
+const VERSION_ALPHA_URL: &str = "https://github.com/labi-le/murmur/releases/download/Prerelease-Alpha/version.txt";
+const VERSION_ALPHA_URL_VVT: &str =
+    "https://github.com/labi-le/murmur/releases/download/Prerelease-Alpha/version-vvt.txt";
+
+pub const MAX_PACKAGE_FILE_SIZE: usize = 32 * 1024 * 1024;
+
+pub const RELEASE_CHANNEL: &str = "release";
+pub const ALPHA_CHANNEL: &str = "alpha";
+
+#[derive(Debug)]
+pub struct CoreUpdater {
+    mu: tokio::sync::Mutex<()>,
+}
+
+pub static DEFAULT_CORE_UPDATER: CoreUpdater = CoreUpdater { mu: tokio::sync::Mutex::const_new(()) };
+
+struct CleanupGuard {
+    dir: PathBuf,
+}
+
+impl Drop for CleanupGuard {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_dir_all(&self.dir);
+    }
+}
+
+fn release_os() -> &'static str {
+    match std::env::consts::OS {
+        "macos" => "darwin",
+        other => other,
+    }
+}
+
+fn release_arch() -> &'static str {
+    match std::env::consts::ARCH {
+        "x86" => "386",
+        "x86_64" => "amd64",
+        "aarch64" => "arm64",
+        "mipsel" => "mipsle",
+        "mips64el" => "mips64le",
+        "powerpc64" => "ppc64",
+        "powerpc64le" => "ppc64le",
+        "loongarch64" => "loong64",
+        other => other,
+    }
+}
+
+#[cfg(unix)]
+fn file_permission_bits(metadata: &std::fs::Metadata) -> u32 {
+    use std::os::unix::fs::PermissionsExt;
+    metadata.permissions().mode() & 0o777
+}
+
+#[cfg(not(unix))]
+fn file_permission_bits(_metadata: &std::fs::Metadata) -> u32 {
+    0o644
+}
+
+fn mkdir_mode(path: &Path, mode: u32) -> std::io::Result<()> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::DirBuilderExt;
+        std::fs::DirBuilder::new().mode(mode).create(path)
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = mode;
+        std::fs::DirBuilder::new().create(path)
+    }
+}
+
+async fn mkdir_mode_async(path: &Path, mode: u32) -> std::io::Result<()> {
+    #[cfg(unix)]
+    {
+        tokio::fs::DirBuilder::new().mode(mode).create(path).await
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = mode;
+        tokio::fs::DirBuilder::new().create(path).await
+    }
+}
+
+async fn open_write_mode_async(path: &Path, mode: u32) -> std::io::Result<tokio::fs::File> {
+    #[cfg(unix)]
+    {
+        tokio::fs::OpenOptions::new().write(true).create(true).truncate(true).mode(mode).open(path).await
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = mode;
+        tokio::fs::OpenOptions::new().write(true).create(true).truncate(true).open(path).await
+    }
+}
+
+/// Spelled field by field so a field added to [`ca::config::Option`] later cannot silently take
+/// its default in an update request.
+fn zero_trust_ca_option() -> ca::config::Option {
+    let ca::config::Option { tls_config, fingerprint, name_cert_verify, certificate, private_key, .. } =
+        ca::config::Option::default();
+    ca::config::Option { tls_config, fingerprint, name_cert_verify, zero_trust: true, certificate, private_key }
+}
+
+impl CoreUpdater {
+    pub fn core_base_name(&self) -> String {
+        let os = release_os();
+        let arch = release_arch();
+        let base = match arch {
+            "arm" => format!("murmur-{os}-{arch}v{ARM_VERSION}"),
+            "arm64" => {
+                if os == "android" {
+                    format!("murmur-{os}-{arch}-v8")
+                } else {
+                    format!("murmur-{os}-{arch}")
+                }
+            }
+            "mips" | "mipsle" => format!("murmur-{os}-{arch}-{MIPS_FLOAT}"),
+            "amd64" => {
+                if os == "android" {
+                    format!("murmur-{os}-{arch}")
+                } else {
+                    format!("murmur-{os}-{arch}-{AMD64_LEVEL}")
+                }
+            }
+            _ => format!("murmur-{os}-{arch}"),
+        };
+        // The reduced release asset is published only for non-Android Linux ARM64 musl.
+        if cfg!(feature = "extra-protocols") {
+            base
+        } else {
+            format!("{base}-vvt")
+        }
+    }
+
+    // NOT cancel-safe: a cancelled update drops `CleanupGuard`, which removes the update directory
+    // while the replacement step may still be running on the blocking pool.
+    pub async fn update(&self, current_exe_path: &str, channel: &str, force: bool) -> Result<()> {
+        let _guard = self.mu.lock().await;
+        if !cfg!(feature = "extra-protocols")
+            && !cfg!(all(target_os = "linux", target_arch = "aarch64", target_env = "musl"))
+        {
+            return Err(anyhow!(
+                "automatic updates for VLESS/Trojan/VMess-only builds are published only for Linux ARM64 musl; install a matching build manually"
+            ));
+        }
+
+        let info = tokio::fs::metadata(current_exe_path)
+            .await
+            .map_err(|err| anyhow!("check currentExePath {current_exe_path:?}: {err}"))?;
+
+        let (mut base_url, mut version_url) = (BASE_ALPHA_URL, VERSION_ALPHA_URL);
+        match channel.to_lowercase().as_str() {
+            RELEASE_CHANNEL => {
+                base_url = BASE_RELEASE_URL;
+                version_url = VERSION_RELEASE_URL;
+            }
+            ALPHA_CHANNEL => {}
+            _ => {
+                if !VERSION.starts_with("alpha") {
+                    base_url = BASE_RELEASE_URL;
+                    version_url = VERSION_RELEASE_URL;
+                }
+            }
+        }
+        if !cfg!(feature = "extra-protocols") {
+            version_url =
+                if version_url == VERSION_ALPHA_URL { VERSION_ALPHA_URL_VVT } else { VERSION_RELEASE_URL_VVT };
+        }
+
+        let latest_version =
+            self.get_latest_version(version_url).await.map_err(|err| anyhow!("get latest version: {err}"))?;
+        infoln!("current version {VERSION}, latest version {latest_version}");
+
+        if latest_version == VERSION && !force {
+            return Err(anyhow!("update error: already using latest version {VERSION}"));
+        }
+
+        let result = self.update_locked(current_exe_path, &info, base_url, &latest_version).await;
+        match &result {
+            Err(err) => errorln!("updater: failed: {err}"),
+            Ok(()) => infoln!("updater: finished"),
+        }
+        result
+    }
+
+    // NOT cancel-safe: the guard removes the update directory even if the blocking replacement step
+    // is still reading from it.
+    async fn update_locked(
+        &self,
+        current_exe_path: &str,
+        info: &std::fs::Metadata,
+        base_url: &str,
+        latest_version: &str,
+    ) -> Result<()> {
+        let murmur_base_name = self.core_base_name();
+        let mut package_name = format!("{murmur_base_name}-{latest_version}");
+        package_name.push_str(if cfg!(target_os = "windows") { ".zip" } else { ".gz" });
+        let package_url = format!("{base_url}{package_name}");
+        infoln!("updater: updating using url: {package_url}");
+
+        let current_exe_path = Path::new(current_exe_path);
+        let work_dir = current_exe_path.parent().unwrap_or_else(|| Path::new(""));
+        let backup_dir = work_dir.join("meta-backup");
+        let update_dir = work_dir.join("meta-update");
+        let package_path = update_dir.join(&package_name);
+
+        let mut update_exe_name = murmur_base_name;
+        if cfg!(target_os = "windows") {
+            update_exe_name.push_str(".exe");
+        }
+        infoln!("updateExeName: {update_exe_name}");
+        let update_exe_path = update_dir.join(&update_exe_name);
+        let backup_exe_path = backup_dir.join(current_exe_path.file_name().unwrap_or_default());
+
+        let _cleanup = CleanupGuard { dir: update_dir.clone() };
+
+        self.download(&update_dir, &package_path, &package_url).await.map_err(|err| anyhow!("downloading: {err}"))?;
+
+        let file_mode = file_permission_bits(info);
+        let exe_path = current_exe_path.to_path_buf();
+        tokio::task::spawn_blocking(move || -> Result<()> {
+            unpack(&update_dir, &package_path, file_mode).map_err(|err| anyhow!("unpacking: {err}"))?;
+            backup(&exe_path, &backup_exe_path, &backup_dir).map_err(|err| anyhow!("backuping: {err}"))?;
+            copy_file(&update_exe_path, &exe_path).map_err(|err| anyhow!("replacing: {err}"))?;
+            Ok(())
+        })
+        .await??;
+
+        Ok(())
+    }
+
+    // cancel-safe: it reads one version string and keeps no state.
+    async fn get_latest_version(&self, version_url: &str) -> Result<String> {
+        let ctx = tokio_util::sync::CancellationToken::new();
+        let timeout_ctx = ctx.clone();
+        tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_secs(5)).await;
+            timeout_ctx.cancel();
+        });
+
+        let options = [murmur_http::with_ca_option(zero_trust_ca_option())];
+        let resp = murmur_http::http_request(&ctx, version_url, "GET", &HashMap::new(), None, &options).await?;
+        let body = resp.into_body().collect().await?.to_bytes();
+        Ok(String::from_utf8_lossy(&body).trim_end_matches('\n').to_owned())
+    }
+
+    // cancel-safe: a partial package file stays in the update directory, which the caller's guard
+    // removes on drop.
+    async fn download(&self, update_dir: &Path, package_path: &Path, package_url: &str) -> Result<()> {
+        let ctx = tokio_util::sync::CancellationToken::new();
+        let timeout_ctx = ctx.clone();
+        tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_secs(90)).await;
+            timeout_ctx.cancel();
+        });
+
+        let options = [murmur_http::with_ca_option(zero_trust_ca_option())];
+        let resp = murmur_http::http_request(&ctx, package_url, "GET", &HashMap::new(), None, &options)
+            .await
+            .map_err(|err| anyhow!("http request failed: {}", murmur_http::url_error_text("GET", package_url, &err)))?;
+
+        debugln!("updateDir {}", update_dir.display());
+        mkdir_mode_async(update_dir, 0o755).await.map_err(|err| anyhow!("mkdir error: {err}"))?;
+
+        debugln!("updater: saving package to file {}", package_path.display());
+        let mut wc = open_write_mode_async(package_path, 0o755)
+            .await
+            .map_err(|err| anyhow!("os.OpenFile({}): {err}", package_path.display()))?;
+
+        debugln!("updater: reading http body");
+        let mut stream = http_body_util::BodyDataStream::new(resp.into_body());
+        let mut n: usize = 0;
+        while let Some(chunk) = stream.next().await {
+            let chunk = chunk.map_err(|err| anyhow!("copy: {err}"))?;
+            let remaining = MAX_PACKAGE_FILE_SIZE - n;
+            if remaining == 0 {
+                break;
+            }
+            let slice = chunk.get(..remaining).unwrap_or(&chunk);
+            tokio::io::AsyncWriteExt::write_all(&mut wc, slice).await.map_err(|err| anyhow!("copy: {err}"))?;
+            n += slice.len();
+        }
+        drop(wc);
+        if n == MAX_PACKAGE_FILE_SIZE {
+            return Err(anyhow!("attempted to read more than {MAX_PACKAGE_FILE_SIZE} bytes"));
+        }
+        debugln!("updater: downloaded package to file {}", package_path.display());
+
+        Ok(())
+    }
+}
+
+fn unpack(update_dir: &Path, package_path: &Path, file_mode: u32) -> Result<()> {
+    infoln!("updater: unpacking package");
+    let package_str = package_path.to_string_lossy();
+    if package_str.ends_with(".zip") {
+        zip_file_unpack(package_path, update_dir, file_mode).map_err(|err| anyhow!(".zip unpack failed: {err}"))?;
+    } else if package_str.ends_with(".gz") {
+        gz_file_unpack(package_path, update_dir, file_mode).map_err(|err| anyhow!(".gz unpack failed: {err}"))?;
+    } else {
+        return Err(anyhow!("unknown package extension"));
+    }
+    Ok(())
+}
+
+fn backup(current_exe_path: &Path, backup_exe_path: &Path, backup_dir: &Path) -> Result<()> {
+    infoln!("updater: backing up current ExecFile:{} to {}", current_exe_path.display(), backup_exe_path.display());
+    let _ = mkdir_mode(backup_dir, 0o755);
+
+    if cfg!(target_os = "windows") {
+        std::fs::rename(current_exe_path, backup_exe_path)?;
+    } else {
+        copy_file(current_exe_path, backup_exe_path)?;
+    }
+    Ok(())
+}
+
+fn gz_file_unpack(gzfile: &Path, out_dir: &Path, file_mode: u32) -> Result<PathBuf> {
+    let f = std::fs::File::open(gzfile).map_err(|err| anyhow!("os.Open(): {err}"))?;
+    let mut gz_reader = flate2::read::GzDecoder::new(f);
+
+    let original_name = gz_reader
+        .header()
+        .and_then(|header| header.filename())
+        .map(|bytes| String::from_utf8_lossy(bytes).into_owned())
+        .filter(|name| !name.is_empty())
+        .unwrap_or_else(|| {
+            let base = gzfile.file_name().map(|s| s.to_string_lossy().into_owned()).unwrap_or_default();
+            base.strip_suffix(".gz").map(str::to_owned).unwrap_or(base)
+        });
+
+    let output_name = out_dir.join(&original_name);
+    if !in_dest(&output_name, out_dir) {
+        return Err(anyhow!("invalid file path: {}", output_name.display()));
+    }
+
+    let mut wc = open_write_mode(&output_name, file_mode)
+        .map_err(|err| anyhow!("os.OpenFile({}): {err}", output_name.display()))?;
+    let mut decoder = BoundedReader::new(&mut gz_reader, MAX_UNPACKED_FILE_SIZE);
+    std::io::copy(&mut decoder, &mut wc).map_err(|err| anyhow!("copy: {err}"))?;
+
+    Ok(output_name)
+}
+
+fn zip_file_unpack(zipfile: &Path, out_dir: &Path, file_mode: u32) -> Result<PathBuf> {
+    let file = std::fs::File::open(zipfile).map_err(|err| anyhow!("zip.OpenReader(): {err}"))?;
+    let mut archive = zip::ZipArchive::new(file).map_err(|err| anyhow!("zip.OpenReader(): {err}"))?;
+    if archive.is_empty() {
+        return Err(anyhow!("no files in the zip archive"));
+    }
+
+    let mut zf = archive.by_index(0).map_err(|err| anyhow!("zip file Open(): {err}"))?;
+    if zf.is_dir() {
+        return Err(anyhow!("the target file is a directory"));
+    }
+
+    let name = zf.name().map_err(|err| anyhow!("zip file name: {err}"))?.into_owned();
+    let base_name = Path::new(&name).file_name().map_or_else(|| name.clone(), |s| s.to_string_lossy().into_owned());
+    let output_name = out_dir.join(&base_name);
+    let file = open_write_mode(&output_name, file_mode).map_err(|err| anyhow!("os.OpenFile(): {err}"))?;
+    copy_unpacked_file(&mut zf, file, &output_name).map_err(|err| anyhow!("copy: {err}"))?;
+
+    Ok(output_name)
+}
+
+fn copy_file(src: &Path, dst: &Path) -> Result<()> {
+    let mut rc = std::fs::File::open(src).map_err(|err| anyhow!("os.Open({}): {err}", src.display()))?;
+    let metadata = rc.metadata().map_err(|err| anyhow!("rc.Stat(): {err}"))?;
+    let mode = file_permission_bits(&metadata);
+
+    let mut wc = if let Ok(f) = open_write_mode(dst, mode) {
+        f
+    } else {
+        std::fs::remove_file(dst).map_err(|err| anyhow!("os.Remove({}): {err}", dst.display()))?;
+        open_write_mode(dst, mode).map_err(|err| anyhow!("os.OpenFile({}): {err}", dst.display()))?
+    };
+
+    std::io::copy(&mut rc, &mut wc).map_err(|err| anyhow!("copy: {err}"))?;
+    drop(wc);
+
+    if cfg!(target_os = "macos") {
+        match std::process::Command::new("/usr/bin/codesign").arg("--sign").arg("-").arg(dst).status() {
+            Ok(status) if !status.success() => warnln!("codesign failed: exit status {status}"),
+            Err(err) => warnln!("codesign failed: {err}"),
+            Ok(_) => {}
+        }
+    }
+
+    infoln!("updater: copy: {} to {}", src.display(), dst.display());
+    Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use std::io::{Read as _, Write as _};
+    use std::net::TcpListener;
+    use std::path::PathBuf;
+
+    use super::{unpack, MAX_PACKAGE_FILE_SIZE, MAX_UNPACKED_FILE_SIZE};
+
+    fn test_dir(name: &str) -> PathBuf {
+        let dir = std::env::temp_dir().join(format!("murmur-{name}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).expect("create test dir");
+        dir
+    }
+
+    /// A gzip whose header names `name`, filled with `len` zero bytes: a few KiB of compressed
+    /// input that inflates to `len`.
+    fn gzip(name: &str, len: usize) -> Vec<u8> {
+        let mut encoder = flate2::GzBuilder::new().filename(name).write(Vec::new(), flate2::Compression::fast());
+        let chunk = vec![0u8; 64 * 1024];
+        let mut written = 0;
+        while written < len {
+            let n = (len - written).min(chunk.len());
+            encoder.write_all(&chunk[..n]).expect("gzip write");
+            written += n;
+        }
+        encoder.finish().expect("gzip finish")
+    }
+
+    fn zip_of(entry: &str, len: usize) -> Vec<u8> {
+        let mut buf = Vec::new();
+        {
+            let mut writer = zip::ZipWriter::new(std::io::Cursor::new(&mut buf));
+            writer.start_file(entry, zip::write::SimpleFileOptions::default()).expect("start_file");
+            let chunk = vec![0u8; 64 * 1024];
+            let mut written = 0;
+            while written < len {
+                let n = (len - written).min(chunk.len());
+                writer.write_all(&chunk[..n]).expect("zip write");
+                written += n;
+            }
+            writer.finish().expect("finish");
+        }
+        buf
+    }
+
+    #[test]
+    fn gz_unpack_rejects_a_name_that_leaves_the_update_directory() {
+        let root = test_dir("gz-unpack-traversal");
+        let out = root.join("meta-update");
+        std::fs::create_dir_all(&out).expect("create update dir");
+        let package = out.join("murmur-linux-amd64-1.0.gz");
+
+        std::fs::write(&package, gzip("../escaped.bin", 16)).expect("write package");
+        let err = unpack(&out, &package, 0o644).expect_err("a name that leaves the directory is rejected");
+        assert!(err.to_string().contains("invalid file path"), "{err}");
+        assert!(!root.join("escaped.bin").exists());
+
+        let absolute = root.join("absolute-escaped.bin");
+        std::fs::write(&package, gzip(&absolute.to_string_lossy(), 16)).expect("write package");
+        let err = unpack(&out, &package, 0o644).expect_err("an absolute name is rejected");
+        assert!(err.to_string().contains("invalid file path"), "{err}");
+        assert!(!absolute.exists());
+
+        std::fs::write(&package, gzip("murmur-linux-amd64", 16)).expect("write package");
+        unpack(&out, &package, 0o644).expect("a plain name still unpacks");
+        assert_eq!(16, std::fs::metadata(out.join("murmur-linux-amd64")).expect("unpacked file").len());
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn unpack_stops_a_gzip_that_inflates_past_the_unpack_cap() {
+        let root = test_dir("gz-unpack-bomb");
+        let out = root.join("meta-update");
+        std::fs::create_dir_all(&out).expect("create update dir");
+        let package = out.join("murmur-linux-amd64-1.0.gz");
+
+        let bomb = gzip("murmur-linux-amd64", MAX_UNPACKED_FILE_SIZE + 1024 * 1024);
+        assert!(bomb.len() < MAX_PACKAGE_FILE_SIZE, "the bomb is {} compressed bytes", bomb.len());
+        std::fs::write(&package, &bomb).expect("write package");
+
+        let err = unpack(&out, &package, 0o644).expect_err("a bomb must fail closed");
+        assert!(err.to_string().contains("MAX_UNPACKED_FILE_SIZE"), "{err}");
+        let written = std::fs::metadata(out.join("murmur-linux-amd64")).expect("the partial file").len();
+        assert!(written <= MAX_UNPACKED_FILE_SIZE as u64, "{written} bytes were written past the cap");
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn unpack_stops_a_zip_entry_that_inflates_past_the_unpack_cap() {
+        let root = test_dir("zip-unpack-bomb");
+        let out = root.join("meta-update");
+        std::fs::create_dir_all(&out).expect("create update dir");
+        let package = out.join("murmur-linux-amd64-1.0.zip");
+
+        let bomb = zip_of("murmur-linux-amd64", MAX_UNPACKED_FILE_SIZE + 1024 * 1024);
+        assert!(bomb.len() < MAX_PACKAGE_FILE_SIZE, "the bomb is {} compressed bytes", bomb.len());
+        std::fs::write(&package, &bomb).expect("write package");
+
+        let err = unpack(&out, &package, 0o644).expect_err("a bomb must fail closed");
+        assert!(err.to_string().contains("MAX_UNPACKED_FILE_SIZE"), "{err}");
+        assert!(!out.join("murmur-linux-amd64").exists(), "a rejected entry must not be written");
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn corrupt_zip_removes_the_partial_executable() {
+        let root = test_dir("zip-unpack-corrupt");
+        let package = root.join("release.zip");
+        let mut data = zip_of("murmur", 128 * 1024);
+        let central = data.windows(4).position(|bytes| bytes == b"PK\x01\x02").expect("central header");
+        data[central + 16] ^= 1;
+        data[14] ^= 1;
+        std::fs::write(&package, data).expect("write package");
+
+        unpack(&root, &package, 0o755).expect_err("corrupt member must fail closed");
+        assert!(!root.join("murmur").exists(), "a partial executable must be removed");
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+    fn core_base_name_matches_release_asset_format() {
+        let suffix = if cfg!(feature = "extra-protocols") { "" } else { "-vvt" };
+        let expected = format!("murmur-linux-amd64-{}{suffix}", murmur_constant_features::AMD64_LEVEL);
+        assert_eq!(expected, super::DEFAULT_CORE_UPDATER.core_base_name());
+    }
+
+    fn serve_once(body: Vec<u8>) -> String {
+        let listener = TcpListener::bind(("127.0.0.1", 0)).expect("local update server");
+        let address = listener.local_addr().expect("server address");
+        std::thread::spawn(move || {
+            let (mut socket, _) = listener.accept().expect("accept the updater");
+            let mut request = [0u8; 4096];
+            let _ = socket.read(&mut request);
+            let header = format!("HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n", body.len());
+            socket.write_all(header.as_bytes()).expect("response head");
+            socket.write_all(&body).expect("response body");
+        });
+        format!("http://{address}/")
+    }
+
+    #[tokio::test]
+    async fn update_locked_downloads_replaces_and_keeps_the_backup() {
+        let root = test_dir("update-locked-local");
+        let executable = root.join("murmur");
+        std::fs::write(&executable, b"previous executable").expect("write executable");
+        let name = super::DEFAULT_CORE_UPDATER.core_base_name();
+        let base = serve_once(gzip(&name, 64));
+        let metadata = std::fs::metadata(&executable).expect("executable metadata");
+        super::DEFAULT_CORE_UPDATER
+            .update_locked(executable.to_str().expect("test path"), &metadata, &base, "9.9.9")
+            .await
+            .expect("local update");
+        assert_eq!(std::fs::read(&executable).expect("replaced executable"), vec![0u8; 64]);
+        assert_eq!(std::fs::read(root.join("meta-backup").join("murmur")).expect("backup"), b"previous executable");
+        std::fs::remove_dir_all(root).expect("remove test directory");
+    }
+
+    #[tokio::test]
+    async fn get_latest_version_reads_the_version_channel_body() {
+        let base = serve_once(b"1.2.3\n".to_vec());
+        assert_eq!(super::DEFAULT_CORE_UPDATER.get_latest_version(&base).await.expect("version body"), "1.2.3");
+    }
+
+    #[tokio::test]
+    #[cfg(not(feature = "extra-protocols"))]
+    async fn subset_update_refuses_replacement_before_touching_the_executable() {
+        let root = test_dir("vvt-update-disabled");
+        let executable = root.join("murmur");
+        std::fs::write(&executable, b"installed subset executable").expect("write executable");
+        let error = super::DEFAULT_CORE_UPDATER
+            .update(executable.to_str().expect("test path"), super::RELEASE_CHANNEL, true)
+            .await
+            .expect_err("no matching release asset");
+        assert!(error.to_string().contains("install a matching build manually"), "{error}");
+        assert_eq!(std::fs::read(&executable).expect("unchanged executable"), b"installed subset executable");
+        assert!(!root.join("meta-update").exists());
+        assert!(!root.join("meta-backup").exists());
+        std::fs::remove_dir_all(root).expect("remove test directory");
+    }
+}

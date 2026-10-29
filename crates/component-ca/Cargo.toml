@@ -1,0 +1,40 @@
+[package]
+name = "murmur-component-ca"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[lib]
+doctest = false
+
+[dependencies]
+anyhow.workspace = true
+base64.workspace = true
+bytes.workspace = true
+chrono.workspace = true
+ed25519-dalek.workspace = true
+hex.workspace = true
+http-body-util.workspace = true
+hyper.workspace = true
+hyper-util.workspace = true
+notify.workspace = true
+p256.workspace = true
+parking_lot.workspace = true
+rand.workspace = true
+rsa.workspace = true
+rustls.workspace = true
+rustls-native-certs.workspace = true
+sha2.workspace = true
+thiserror.workspace = true
+tokio.workspace = true
+murmur-common = { path = "../common" }
+murmur-component-tls = { path = "../component-tls" }
+murmur-constant = { path = "../constant" }
+murmur-constant-features = { path = "../constant-features" }
+murmur-ntp = { path = "../ntp" }
+
+
+[lints]
+workspace = true
