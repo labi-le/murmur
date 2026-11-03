@@ -1,0 +1,36 @@
+[package]
+name = "murmur-listener-sing"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[lib]
+doctest = false
+
+[dependencies]
+murmur-compat = { path = "../compat" }
+anyhow.workspace = true
+async-trait.workspace = true
+parking_lot.workspace = true
+serde.workspace = true
+tokio.workspace = true
+tokio-util.workspace = true
+uuid.workspace = true
+murmur-adapter-inbound = { path = "../adapter-inbound" }
+murmur-common = { path = "../common" }
+murmur-common-net = { path = "../common-net" }
+murmur-component-proxydialer = { path = "../component-proxydialer" }
+murmur-constant = { path = "../constant" }
+murmur-sing = { path = "../sing" }
+murmur-sing-mux = { path = "../sing-mux" }
+murmur-std-compat = { path = "../std-compat" }
+murmur-listener-inner = { path = "../listener-inner" }
+murmur-log = { path = "../log" }
+murmur-transport = { path = "../transport" }
+
+
+
+[lints]
+workspace = true

@@ -1,0 +1,33 @@
+[package]
+name = "murmur-component-http"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[lib]
+doctest = false
+
+[dependencies]
+anyhow.workspace = true
+base64.workspace = true
+bytes.workspace = true
+http.workspace = true
+http-body-util.workspace = true
+hyper.workspace = true
+hyper-util.workspace = true
+parking_lot.workspace = true
+tokio.workspace = true
+tokio-util.workspace = true
+url.workspace = true
+murmur-common-net = { path = "../common-net" }
+murmur-component = { path = "../component" }
+murmur-component-ca = { path = "../component-ca" }
+murmur-component-tls = { path = "../component-tls" }
+murmur-constant = { path = "../constant" }
+murmur-listener-inner = { path = "../listener-inner" }
+
+
+[lints]
+workspace = true

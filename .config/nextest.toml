@@ -1,0 +1,16 @@
+[test-groups]
+interop = { max-threads = 4 }
+
+# A slow-timeout is what keeps a test that blocks on a peer read from parking the whole run: the
+# openvpn deadline tests use sub-second deadlines, so anything past a minute is a hang, not
+# slowness. A terminated run is bounded; an unbounded one cost this workspace a multi-hour wait.
+[profile.default]
+slow-timeout = { period = "60s", terminate-after = 2 }
+
+[[profile.default.overrides]]
+filter = 'test(/interop/)'
+test-group = 'interop'
+
+[[profile.ci.overrides]]
+filter = 'test(/interop/)'
+test-group = 'interop'
