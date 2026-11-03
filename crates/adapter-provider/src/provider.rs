@@ -17,7 +17,7 @@ use parking_lot::{Mutex, RwLock};
 use serde::{Deserialize, Serialize};
 use yaml_serde::{Mapping, Value};
 
-use murmur_adapter::parser::{parse_proxy, with_provider_name, with_tunnel_for_api};
+use murmur_adapter::parser::{parse_proxy, with_provider_name, with_tunnel_for_api, FeatureGated};
 use murmur_common::time::zero_time;
 use murmur_common::utils::ranges::IntRanges;
 use murmur_common::yaml::yaml::{marshal as yaml_marshal, unmarshal as yaml_unmarshal};
@@ -28,6 +28,7 @@ use murmur_component_resource::fetcher::{new_fetcher, Fetcher, Parser as Resourc
 use murmur_constant::adapters::Proxy;
 use murmur_constant::provider::interface::{Provider, ProviderType, ProxyProvider, Vehicle, VehicleType};
 use murmur_constant::tunnel::Tunnel;
+use murmur_log::warnln;
 use murmur_tunnel::statistic::manager::DEFAULT_MANAGER;
 
 use super::healthcheck::HealthCheck;
@@ -612,7 +613,7 @@ pub fn new_compatible_provider(
 
 #[allow(
     clippy::too_many_arguments,
-    reason = "the constructor takes the eight configuration inputs the parser needs; a params struct would only relocate them"
+    reason = "the constructor takes the nine configuration inputs the parser needs; a params struct would only relocate them"
 )]
 pub(crate) fn new_proxies_parser(
     pd_name: &str,
@@ -623,6 +624,7 @@ pub(crate) fn new_proxies_parser(
     dialer_proxy: &str,
     override_: OverrideSchema,
     age_secret_key: &str,
+    skip_unsupported_types: bool,
 ) -> Result<ResourceParser<Vec<Arc<dyn Proxy>>>> {
     let exclude_type_array: Vec<String> =
         if exclude_type.is_empty() { Vec::new() } else { exclude_type.split('|').map(str::to_owned).collect() };
@@ -676,6 +678,9 @@ pub(crate) fn new_proxies_parser(
 
         let mut proxies: Vec<Arc<dyn Proxy>> = Vec::new();
         let mut proxies_set: HashSet<String> = HashSet::new();
+        let mut skipped_types: Vec<String> = Vec::new();
+        let mut skipped_count: usize = 0;
+        let mut attempted: usize = 0;
 
         for filter_reg in &filter_regs {
             'loop1: for (idx, mapping) in proxy_mappings.iter_mut().enumerate() {
@@ -714,17 +719,47 @@ pub(crate) fn new_proxies_parser(
                     mapping.insert(Value::String("dialer-proxy".to_owned()), Value::String(dialer_proxy.clone()));
                 }
 
-                override_.apply(mapping).with_context(|| format!("proxy {idx} override error"))?;
+                let proxy_type =
+                    mapping.get("type").and_then(Value::as_str).map_or_else(|| "<missing>".to_owned(), str::to_owned);
 
-                let proxy = parse_proxy(
+                override_
+                    .apply(mapping)
+                    .with_context(|| format!("proxy {idx} ({name}, type {proxy_type}) override error"))?;
+
+                attempted += 1;
+                let proxy = match parse_proxy(
                     mapping,
                     &[with_tunnel_for_api(Arc::clone(&tunnel)), with_provider_name(pd_name.clone())],
-                )
-                .with_context(|| format!("proxy {idx} error"))?;
+                ) {
+                    Ok(proxy) => proxy,
+                    Err(err) => {
+                        if skip_unsupported_types && err.downcast_ref::<FeatureGated>().is_some() {
+                            skipped_count += 1;
+                            if !skipped_types.contains(&proxy_type) {
+                                skipped_types.push(proxy_type);
+                            }
+                            proxies_set.insert(name);
+                            continue;
+                        }
+                        return Err(err).with_context(|| format!("proxy {idx} ({name}, type {proxy_type}) error"));
+                    }
+                };
 
                 proxies_set.insert(name);
                 proxies.push(proxy);
             }
+        }
+
+        if skipped_count > 0 {
+            let types = skipped_types.join(", ");
+            if proxies.is_empty() {
+                return Err(anyhow!(
+                    "file doesn't have any proxy this build can construct: skipped {skipped_count} of {attempted} nodes of types {types}, which require feature extra-protocols"
+                ));
+            }
+            warnln!(
+                "[Provider] {pd_name}: skipped {skipped_count} of {attempted} nodes with unsupported types: {types}"
+            );
         }
 
         if proxies.is_empty() {
@@ -745,10 +780,11 @@ mod tests {
     use super::*;
 
     #[cfg(not(feature = "extra-protocols"))]
-    #[test]
-    fn a_removed_protocol_rejects_the_whole_provider_payload() {
+    #[tokio::test]
+    async fn a_file_provider_skips_a_gated_node_between_two_supported_ones() {
+        let path = std::env::temp_dir().join(format!("murmur-skip-provider-{}", std::process::id()));
         let parser = new_proxies_parser(
-            "mixed",
+            "mixed-skip",
             Arc::new(murmur_tunnel::tunnel::Tunnel),
             "",
             "",
@@ -756,14 +792,45 @@ mod tests {
             "",
             OverrideSchema::default(),
             "",
+            true,
         )
         .expect("parser");
-        let error = parser(b"proxies:\n  - {name: retained, type: direct}\n  - {name: removed, type: ss}\n")
-            .err()
-            .expect("a provider cannot silently drop an unavailable protocol");
-        let message = format!("{error:#}");
-        assert!(message.contains("proxy 1"), "{message}");
-        assert!(message.contains("extra-protocols"), "{message}");
+        let hc = crate::healthcheck::new_health_check(Vec::new(), "", 0, 0, false, IntRanges::default());
+        let provider = ProxySetProvider::new(
+            "mixed-skip",
+            Duration::ZERO,
+            Vec::new(),
+            parser,
+            Arc::new(murmur_component_resource::vehicle::FileVehicle::new(path.to_str().expect("temporary path"))),
+            hc,
+        )
+        .expect("provider");
+        std::fs::write(
+            &path,
+            b"proxies:\n  - {name: first, type: direct}\n  - {name: gated, type: anytls}\n  - {name: obfs, type: ss, server: 192.0.2.1, port: 8388, cipher: chacha20-ietf-poly1305, password: example, plugin: obfs, plugin-opts: {mode: tls, host: example.com}}\n  - {name: last, type: direct}\n",
+        )
+        .expect("write mixed provider fixture");
+
+        let logs = murmur_log::subscribe().await.expect("a log subscription");
+        provider.update().await.expect("the supported nodes load");
+        let names: Vec<String> = provider.proxies().iter().map(|proxy| proxy.name()).collect();
+        assert_eq!(names, ["first", "last"]);
+
+        let warning = tokio::time::timeout(Duration::from_secs(5), async {
+            loop {
+                let event = logs.recv().await.expect("a log event");
+                if event.payload.starts_with("[Provider] mixed-skip:") {
+                    break event.payload;
+                }
+            }
+        })
+        .await
+        .expect("the skip warning is emitted");
+        assert_eq!(warning, "[Provider] mixed-skip: skipped 2 of 4 nodes with unsupported types: anytls, ss");
+
+        murmur_log::un_subscribe(logs).await;
+        provider.close().expect("close provider");
+        std::fs::remove_file(&path).expect("remove provider fixture");
     }
 
     #[cfg(not(feature = "extra-protocols"))]
@@ -779,6 +846,7 @@ mod tests {
             "",
             OverrideSchema::default(),
             "",
+            true,
         )
         .expect("parser");
         let hc = crate::healthcheck::new_health_check(Vec::new(), "", 0, 0, false, IntRanges::default());
@@ -796,9 +864,11 @@ mod tests {
         let original = provider.proxies();
         let version = provider.version();
         assert_eq!(original.len(), 1);
-        std::fs::write(&path, b"proxies:\n  - {name: removed, type: ss}\n").expect("write unsupported provider");
-        let error = provider.update().await.expect_err("unavailable protocol update fails");
-        assert!(format!("{error:#}").contains("extra-protocols"));
+        std::fs::write(&path, b"proxies:\n  - {name: removed, type: anytls}\n").expect("write unsupported provider");
+        let error = provider.update().await.expect_err("an all-unsupported update fails");
+        let message = format!("{error:#}");
+        assert!(message.contains("extra-protocols"), "{message}");
+        assert!(message.contains("anytls"), "the error must name the skipped type: {message}");
         let current = provider.proxies();
         assert_eq!(current.len(), 1);
         assert!(Arc::ptr_eq(&current[0], &original[0]));
@@ -940,6 +1010,7 @@ proxies:
             "",
             OverrideSchema::default(),
             "",
+            false,
         )
         .expect("parser");
 
