@@ -18,6 +18,8 @@ use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
 use tokio_util::sync::CancellationToken;
 
 use crate::ech::ECHOptions;
+#[cfg(not(feature = "extra-protocols"))]
+use crate::feature_gated::FeatureGated;
 use murmur_common::shared_conn::SharedConn;
 use murmur_common::structure::structure as structure_mod;
 use murmur_common_net::{
@@ -35,11 +37,14 @@ use murmur_std_compat::net::{Addr, Conn as NetConn, PacketConn};
 use murmur_transport::gost::websocket as gost;
 use murmur_transport::v2ray_plugin::websocket as v2ray_obfs;
 use murmur_transport_jls::client as jls;
+#[cfg(feature = "extra-protocols")]
 use murmur_transport_kcptun::client as kcptun;
+#[cfg(feature = "extra-protocols")]
 use murmur_transport_kcptun::common as kcptun_common;
 use murmur_transport_shadowsocks::core::cipher::{pick_cipher, Cipher};
 use murmur_transport_shadowsocks::shadowaead_2022::client as ss2022_client;
 use murmur_transport_shadowtls::client as shadowtls;
+#[cfg(feature = "extra-protocols")]
 use murmur_transport_simple_obfs::{http as simple_obfs_http, tls as simple_obfs_tls};
 
 use super::base::{new_conn, new_packet_conn, Base, BaseOption, BasicOption, ProxyAdapter};
@@ -55,12 +60,14 @@ pub struct ShadowSocks {
 
     option: ShadowSocksOption,
     obfs_mode: String,
+    #[cfg(feature = "extra-protocols")]
     obfs_option: Option<SimpleObfsOption>,
     v2ray_option: Option<v2ray_obfs::Option>,
     gost_option: Option<gost::Option>,
     shadow_tls_option: Option<shadowtls::ShadowTLSOption>,
     restls_config: Option<Arc<murmur_restls::Config>>,
     jls_option: Option<jls::ClientConfig>,
+    #[cfg(feature = "extra-protocols")]
     kcptun_client: Option<kcptun::Client>,
 
     self_weak: Weak<Self>,
@@ -129,6 +136,7 @@ const fn default_shadowtls_version() -> i32 {
     2
 }
 
+#[cfg(feature = "extra-protocols")]
 #[derive(Clone, Debug, Default, Deserialize)]
 pub(crate) struct SimpleObfsOption {
     #[serde(rename = "mode", default)]
@@ -260,6 +268,7 @@ pub(crate) struct JlsOption {
     pub(crate) alpn: Option<Vec<String>>,
 }
 
+#[cfg(feature = "extra-protocols")]
 #[derive(Clone, Debug, Default, Deserialize)]
 struct KcpTunOption {
     #[serde(rename = "key", default)]
@@ -697,10 +706,12 @@ impl ShadowSocks {
 
         let mut v2ray_option = None;
         let mut gost_option = None;
+        #[cfg(feature = "extra-protocols")]
         let mut obfs_option = None;
         let mut shadow_tls_option = None;
         let mut restls_config: Option<Arc<murmur_restls::Config>> = None;
         let mut jls_option: Option<jls::ClientConfig> = None;
+        #[cfg(feature = "extra-protocols")]
         let mut kcptun_client = None;
         let mut obfs_mode = String::new();
 
@@ -711,6 +722,11 @@ impl ShadowSocks {
         });
 
         match option.plugin.as_str() {
+            #[cfg(not(feature = "extra-protocols"))]
+            "obfs" | "kcptun" => {
+                return Err(anyhow::Error::new(FeatureGated::plugin(&option.plugin)));
+            }
+            #[cfg(feature = "extra-protocols")]
             "obfs" => {
                 let opts: SimpleObfsOption = decoder
                     .decode(&option.plugin_opts)
@@ -847,6 +863,7 @@ impl ShadowSocks {
                         .map_err(|err| anyhow!("ss {addr} initialize jls-plugin error: {err}"))?,
                 );
             }
+            #[cfg(feature = "extra-protocols")]
             mode if mode == kcptun::MODE => {
                 kcptun::MODE.clone_into(&mut obfs_mode);
                 let opt: KcpTunOption = decoder
@@ -917,10 +934,12 @@ impl ShadowSocks {
             obfs_mode,
             v2ray_option,
             gost_option,
+            #[cfg(feature = "extra-protocols")]
             obfs_option,
             shadow_tls_option,
             restls_config,
             jls_option,
+            #[cfg(feature = "extra-protocols")]
             kcptun_client,
             self_weak: Weak::clone(self_weak),
             option,
@@ -939,11 +958,13 @@ impl ShadowSocks {
         // NOT cancel-safe: the restls handshake consumes the connection, so a drop loses it.
         let mut use_early = false;
         match self.obfs_mode.as_str() {
+            #[cfg(feature = "extra-protocols")]
             "tls" => {
                 let opts = self.obfs_option.as_ref().ok_or_else(|| anyhow!("obfs_option set for tls mode"))?;
                 let host = opts.host.clone();
                 c = simple_obfs_tls::new_tls_obfs(c, host);
             }
+            #[cfg(feature = "extra-protocols")]
             "http" => {
                 let (_, port, _) = murmur_common_net::split_host_port(&self.base.addr).unwrap_or_default();
                 let opts = self.obfs_option.as_ref().ok_or_else(|| anyhow!("obfs_option set for http mode"))?;
@@ -1032,6 +1053,7 @@ impl ShadowSocks {
     }
 
     async fn raw_dial_context(&self, ctx: &CancellationToken) -> Result<Box<dyn NetConn>> {
+        #[cfg(feature = "extra-protocols")]
         if let Some(client) = &self.kcptun_client {
             let self_arc = self.self_arc()?;
             let dial: kcptun::DialFn = Box::new(move |ctx: CancellationToken| {
@@ -1158,6 +1180,7 @@ impl CProxyAdapter for ShadowSocks {
     }
 
     fn close(&self) -> Result<()> {
+        #[cfg(feature = "extra-protocols")]
         if let Some(client) = &self.kcptun_client {
             return client.close();
         }

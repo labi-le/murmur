@@ -128,24 +128,41 @@ a shell history, a gist or an assistant transcript.
 | --- | --- | --- |
 | Full/default | Every implemented proxy protocol (`extra-protocols` on), DNS, rules/providers, controller, transparent-inbound infrastructure, optional overlay engines | Availability still depends on target and runtime support |
 | `router` | The same protocol set as full/default, because the profile enables `extra-protocols`; WireGuard, DNS/rules/controller, TUN/redir/TPROXY infrastructure; lower-memory build | EasyTier/Wasmtime/WASI, Tailscale, ZeroTier and diagnostic CPU profiling |
-| `router-vvt` (VVT) | VLESS, VMess and Trojan transport families; DNS/rules/providers/controller; mixed inbound; TUN/redir/TPROXY infrastructure | Every protocol behind `extra-protocols`, and the router exclusions above |
+| `router-vvt` (VVT) | VLESS, VMess, Trojan and plain Shadowsocks outbound families; DNS/rules/providers/controller; mixed inbound; TUN/redir/TPROXY infrastructure | Every other protocol behind `extra-protocols`, the `obfs`/`kcptun` Shadowsocks plugins, and the router exclusions above |
 
 Profiles describe build selection, not universal interoperability, and no profile
-name is printed by the binary. Select a build that supports **every** protocol in
-the config and every provider entry; VVT does not silently discard unsupported
-entries. `router` and VVT must be built with `--no-default-features`; additive
-features can change the effective result. `murmur -v` prints the target OS and
-architecture, a `Protocol set:` line and the `Use tags:` list; the running
-`/version` response reports the same choice as `protocol-set`. The field has only
-two values: `full` for the default **and** for `router`, `vvt` for `router-vvt`.
-A bundle named `router` whose `-v` says `full` therefore matches this table;
-`-v` does not reveal ELF class, endianness or the floating-point ABI. VLESS, VMess
-and Trojan belong to the base protocol set, so a `router` build carries them and
-`extra-protocols` adds the remaining optional transports (TUIC, Hysteria2,
-SSR/Shadowsocks variants, AnyTLS and others). VVT's established update asset is
+name is printed by the binary. A plain Shadowsocks outbound (`ss` with no plugin, or
+with `v2ray-plugin`) belongs to the base protocol set, so VVT carries it; the
+`obfs` and `kcptun` Shadowsocks plugins still require `extra-protocols` and fail
+with `shadowsocks plugin <plugin> requires feature extra-protocols`.
+
+A `file` or `http` `proxy-providers` payload may mix types the build does not
+carry: the unsupported nodes are skipped and one warning per pull reports the count
+and the skipped types,
+
+```text
+level=warning msg="[Provider] <name>: skipped 4 of 142 nodes with unsupported types: hysteria2, anytls"
+```
+
+A payload where every node is unsupported still fails closed, naming those types,
+so an empty provider keeps its signal. `type: inline` payloads and the top-level
+`proxies:` list are fail-closed with no skipping: they are authored in the
+operator's own config, so a type this build cannot construct is a configuration
+error rather than a subscription detail. `router` and VVT must be built with
+`--no-default-features`; additive features can change the effective result.
+`murmur -v` prints the target OS and architecture, a `Protocol set:` line and the
+`Use tags:` list; the running `/version` response reports the same choice as
+`protocol-set`. The field has only two values: `full` for the default **and** for
+`router`, `vvt` for `router-vvt`. A bundle named `router` whose `-v` says `full`
+therefore matches this table; `-v` does not reveal ELF class, endianness or the
+floating-point ABI. VLESS, VMess, Trojan and plain Shadowsocks belong to the base
+protocol set, so a `router` build carries them and `extra-protocols` adds the
+remaining optional transports (TUIC, Hysteria2, SSR variants, AnyTLS and others).
+VVT's established update asset is
 `murmur-linux-arm64-vvt-<version>.gz` for non-Android Linux ARM64 musl. Do not
 assume a corresponding MIPS/ARM32 download exists — none is published; on MIPSEL
-use a full or `router` artifact for a VLESS/VMess/Trojan subscription, and if the
+use a full or `router` artifact for a VLESS/VMess/Trojan/Shadowsocks
+subscription, and if the
 supplied artifact is a VVT-only build for another architecture, stop as below
 rather than renaming it. The reduced updater rejects unsupported targets. No
 automatic upgrade is needed for this installation.

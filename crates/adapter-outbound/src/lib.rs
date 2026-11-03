@@ -28,6 +28,7 @@ pub mod dns;
 #[cfg(feature = "easytier")]
 pub mod easytier;
 pub mod ech;
+pub mod feature_gated;
 #[cfg(feature = "extra-protocols")]
 pub mod gost_relay;
 #[cfg(feature = "extra-protocols")]
@@ -49,7 +50,6 @@ pub mod reject;
 pub mod rematch;
 #[cfg(feature = "extra-protocols")]
 pub mod shadowquic;
-#[cfg(feature = "extra-protocols")]
 pub mod shadowsocks;
 #[cfg(feature = "extra-protocols")]
 pub mod shadowsocksr;
