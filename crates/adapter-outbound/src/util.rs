@@ -1,10 +1,7 @@
-#[cfg(feature = "extra-protocols")]
 use anyhow::anyhow;
 use tokio_util::sync::CancellationToken;
 
-#[cfg(feature = "extra-protocols")]
 use murmur_common_net::io::{close_stream, Stream};
-#[cfg(feature = "extra-protocols")]
 use murmur_component::resolver::ip4p::lookup_ip4p;
 use murmur_component::resolver::resolver::{
     resolve_ip_prefer6_with_resolver, resolve_ip_with_resolver as resolve_ip_with_resolver_default,
@@ -12,7 +9,6 @@ use murmur_component::resolver::resolver::{
 };
 use murmur_constant::dns::DNSPrefer;
 use murmur_constant::metadata::{AddrType, Metadata};
-#[cfg(feature = "extra-protocols")]
 use murmur_std_compat::net::UdpAddr;
 use murmur_transport::socks5::socks5::{ATYP_DOMAIN_NAME, ATYP_IPV4, ATYP_IPV6};
 
@@ -67,7 +63,6 @@ pub(crate) async fn resolve_ip_with_resolver(
     }
 }
 
-#[cfg(feature = "extra-protocols")]
 pub(crate) async fn resolve_udp_addr(
     ctx: &CancellationToken,
     _network: &str,
@@ -94,7 +89,6 @@ pub(crate) async fn resolve_udp_addr(
     Ok(UdpAddr::new(ip, uint16_port))
 }
 
-#[cfg(feature = "extra-protocols")]
 pub(crate) fn safe_conn_close(c: Option<&dyn Stream>, err: bool) {
     if err {
         if let Some(conn) = c {

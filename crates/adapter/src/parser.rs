@@ -13,6 +13,7 @@ use serde::Deserialize;
 use yaml_serde::{Mapping, Value};
 
 use murmur_adapter_outbound::base::{self, BasicOption, ProxyAdapter as OutboundProxyAdapter};
+pub use murmur_adapter_outbound::feature_gated::FeatureGated;
 use murmur_common::structure::structure::{
     drop_null_fields, new_decoder, Decoder, Option as StructureOption, DEFAULT_KEY_REPLACER,
 };
@@ -70,10 +71,19 @@ pub fn parse_proxy(mapping: &Mapping, options: &[ProxyOption]) -> Result<Arc<dyn
 
     let proxy: Arc<dyn OutboundProxyAdapter> = match proxy_type {
         #[cfg(not(feature = "extra-protocols"))]
-        "ss" | "ssr" | "socks5" | "http" | "snell" | "mieru" | "hysteria" | "hysteria2" | "tuic" | "shadowquic"
+        "ssr" | "socks5" | "http" | "snell" | "mieru" | "hysteria" | "hysteria2" | "tuic" | "shadowquic"
         | "gost-relay" | "wireguard" | "ssh" | "anytls" | "sudoku" | "masque" | "trusttunnel" | "openvpn" => {
-            return Err(anyhow!("outbound protocol {proxy_type} requires feature extra-protocols"));
+            return Err(anyhow::Error::new(FeatureGated::protocol(proxy_type)));
         }
+        #[cfg(not(feature = "extra-protocols"))]
+        "ss" => flattened!(
+            mapping,
+            decoder,
+            basic_option,
+            outbound::shadowsocks::ShadowSocksOption,
+            basic_option,
+            outbound::shadowsocks::ShadowSocks::new
+        )?,
         #[cfg(feature = "extra-protocols")]
         "ss" => flattened!(
             mapping,
@@ -668,7 +678,6 @@ mod tests {
     #[test]
     fn removed_outbounds_fail_before_decoding_protocol_options() {
         for protocol in [
-            "ss",
             "ssr",
             "socks5",
             "http",
@@ -703,6 +712,32 @@ mod tests {
             )).unwrap();
             let proxy = parse_proxy(&mapping, &[]).expect("retained outbound parses");
             assert_eq!(proxy.name(), "retained");
+        }
+    }
+
+    #[test]
+    fn plain_shadowsocks_parses_with_or_without_extra_protocols() {
+        let mapping = yaml_serde::from_str::<Mapping>(
+            "name: retained\ntype: ss\nserver: 192.0.2.1\nport: 8388\ncipher: chacha20-ietf-poly1305\npassword: example\n",
+        )
+        .unwrap();
+        let proxy = parse_proxy(&mapping, &[]).expect("plain shadowsocks belongs to the base protocol set");
+        assert_eq!(proxy.name(), "retained");
+    }
+
+    #[cfg(not(feature = "extra-protocols"))]
+    #[tokio::test]
+    async fn a_shadowsocks_plugin_outside_the_base_set_names_the_missing_feature() {
+        for plugin in ["obfs", "kcptun"] {
+            let mapping = yaml_serde::from_str::<Mapping>(&format!(
+                "name: retained\ntype: ss\nserver: 192.0.2.1\nport: 8388\ncipher: chacha20-ietf-poly1305\npassword: example\nplugin: {plugin}\nplugin-opts:\n  mode: tls\n  host: example.com\n"
+            ))
+            .unwrap();
+            let error = parse_proxy(&mapping, &[]).err().expect("a plugin outside the base set must fail");
+            let message = error.to_string();
+            assert!(message.contains(&format!("shadowsocks plugin {plugin}")), "{message}");
+            assert!(message.contains("extra-protocols"), "{message}");
+            assert!(error.downcast_ref::<FeatureGated>().is_some(), "the rejection must stay identifiable");
         }
     }
 

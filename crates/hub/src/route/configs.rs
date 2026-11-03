@@ -931,7 +931,7 @@ mod tests {
             let original = murmur_tunnel::tunnel::proxies();
             let original_mode = murmur_tunnel::tunnel::mode();
             for payload in [
-                "mode: direct\nproxies:\n  - {name: removed, type: ss}\n",
+                "mode: direct\nproxies:\n  - {name: removed, type: anytls}\n",
                 "mode: direct\nlisteners:\n  - {name: removed, type: tuic, port: 1080}\n",
                 "mode: direct\nss-config: ss://example\n",
                 "mode: direct\ntuic-server:\n  enable: true\n",

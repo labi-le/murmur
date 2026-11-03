@@ -116,6 +116,7 @@ pub fn parse_proxy_provider(name: &str, mapping: &Mapping, tunnel: Arc<dyn Tunne
         expected_status,
     );
 
+    let skip_unsupported_types = matches!(schema.type_.as_str(), "file" | "http");
     let parser = new_proxies_parser(
         name,
         tunnel,
@@ -125,6 +126,7 @@ pub fn parse_proxy_provider(name: &str, mapping: &Mapping, tunnel: Arc<dyn Tunne
         &schema.dialer_proxy,
         schema.override_.clone(),
         &schema.age_secret_key,
+        skip_unsupported_types,
     )?;
 
     let vehicle: Arc<dyn Vehicle> = match schema.type_.as_str() {

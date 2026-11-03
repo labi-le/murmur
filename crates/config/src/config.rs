@@ -2593,7 +2593,7 @@ proxy-providers:
     type: inline
     payload:
       - {name: retained, type: direct}
-      - {name: removed, type: ss}
+      - {name: removed, type: anytls}
 "#,
         )
         .expect("raw config");
@@ -2601,7 +2601,7 @@ proxy-providers:
         let message = error.to_string();
         assert!(message.contains("fixture"), "{message}");
         assert!(message.contains("proxy 1"), "{message}");
-        assert!(message.contains("outbound protocol ss"), "{message}");
+        assert!(message.contains("outbound protocol anytls"), "{message}");
         assert!(message.contains("extra-protocols"), "{message}");
     }
 
