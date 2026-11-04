@@ -1,0 +1,32 @@
+[package]
+name = "murmur-component-geodata"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[lib]
+doctest = false
+
+[dependencies]
+anyhow.workspace = true
+http-body-util.workspace = true
+ipnet.workspace = true
+parking_lot.workspace = true
+prost.workspace = true
+regex.workspace = true
+thiserror.workspace = true
+tokio.workspace = true
+tokio-util.workspace = true
+murmur-common = { path = "../common" }
+murmur-component = { path = "../component" }
+murmur-component-http = { path = "../component-http" }
+murmur-component-mmdb = { path = "../component-mmdb" }
+murmur-component-trie = { path = "../component-trie" }
+murmur-constant = { path = "../constant" }
+murmur-log = { path = "../log" }
+
+
+[lints]
+workspace = true

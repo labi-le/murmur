@@ -1,0 +1,36 @@
+[package]
+name = "murmur-kcp"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[lib]
+doctest = false
+
+[dependencies]
+aes.workspace = true
+aes-gcm.workspace = true
+anyhow.workspace = true
+async-trait.workspace = true
+cfb-mode.workspace = true
+crc32fast.workspace = true
+hmac.workspace = true
+parking_lot.workspace = true
+pbkdf2.workspace = true
+rand.workspace = true
+reed-solomon-turbo = "0.1.1"
+sha1.workspace = true
+socket2.workspace = true
+tokio.workspace = true
+tokio-util.workspace = true
+murmur-common-net = { path = "../common-net" }
+
+[dev-dependencies]
+futures.workspace = true
+portable-atomic.workspace = true
+tokio = { workspace = true, features = ["test-util"] }
+
+[lints]
+workspace = true

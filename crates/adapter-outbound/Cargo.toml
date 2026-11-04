@@ -1,0 +1,113 @@
+[package]
+name = "murmur-adapter-outbound"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[lib]
+doctest = false
+
+[dependencies]
+anyhow.workspace = true
+async-trait.workspace = true
+base64.workspace = true
+chrono.workspace = true
+futures.workspace = true
+geiserx_tailscale = { workspace = true, optional = true }
+hickory-proto.workspace = true
+hex.workspace = true
+http.workspace = true
+http-body-util.workspace = true
+ipnet.workspace = true
+p256 = { workspace = true, optional = true }
+parking_lot.workspace = true
+portable-atomic.workspace = true
+quinn.workspace = true
+rand.workspace = true
+russh = { workspace = true, optional = true }
+rustls.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+yaml_serde.workspace = true
+sha2.workspace = true
+socket2.workspace = true
+thiserror.workspace = true
+tokio.workspace = true
+tokio-rustls.workspace = true
+tokio-util.workspace = true
+uuid.workspace = true
+murmur-common = { path = "../common" }
+murmur-common-convert = { path = "../common-convert" }
+murmur-common-net = { path = "../common-net" }
+murmur-common-pool = { path = "../common-pool" }
+murmur-component = { path = "../component" }
+murmur-component-ca = { path = "../component-ca" }
+murmur-component-easytier = { path = "../component-easytier", optional = true }
+murmur-component-ech = { path = "../component-ech" }
+murmur-component-http = { path = "../component-http" }
+murmur-component-loopback = { path = "../component-loopback" }
+murmur-component-proxydialer = { path = "../component-proxydialer" }
+murmur-component-tls = { path = "../component-tls" }
+murmur-component-wireguard = { path = "../component-wireguard" }
+murmur-constant = { path = "../constant" }
+murmur-constant-features = { path = "../constant-features" }
+murmur-dns = { path = "../dns" }
+murmur-compat = { path = "../compat" }
+murmur-easytier = { path = "../easytier", optional = true }
+murmur-jls-tls = { path = "../jls-tls" }
+murmur-mieru = { path = "../mieru", optional = true }
+murmur-quic = { path = "../quic", optional = true }
+murmur-reality = { path = "../reality" }
+murmur-restls = { path = "../restls" }
+murmur-sing = { path = "../sing" }
+murmur-sing-mux = { path = "../sing-mux" }
+murmur-zerotier = { path = "../zerotier", optional = true }
+murmur-std-compat = { path = "../std-compat" }
+murmur-log = { path = "../log" }
+murmur-ntp = { path = "../ntp" }
+murmur-transport = { path = "../transport" }
+murmur-transport-anytls = { path = "../transport-anytls", optional = true }
+murmur-transport-hysteria = { path = "../transport-hysteria", optional = true }
+murmur-transport-hysteria2 = { path = "../transport-hysteria2", optional = true }
+murmur-transport-jls = { path = "../transport-jls" }
+murmur-transport-kcptun = { path = "../transport-kcptun", optional = true }
+murmur-transport-masque = { path = "../transport-masque", optional = true }
+murmur-transport-mekya = { path = "../transport-mekya" }
+murmur-transport-mkcp = { path = "../transport-mkcp" }
+murmur-transport-openvpn = { path = "../transport-openvpn", optional = true }
+murmur-transport-shadowquic = { path = "../transport-shadowquic", optional = true }
+murmur-transport-shadowsocks = { path = "../transport-shadowsocks" }
+murmur-transport-shadowtls = { path = "../transport-shadowtls" }
+murmur-transport-simple-obfs = { path = "../transport-simple-obfs", optional = true }
+murmur-transport-snell = { path = "../transport-snell", optional = true }
+murmur-transport-ssr = { path = "../transport-ssr", optional = true }
+murmur-transport-sudoku = { path = "../transport-sudoku", optional = true }
+murmur-transport-tlsmirror = { path = "../transport-tlsmirror" }
+murmur-transport-trusttunnel = { path = "../transport-trusttunnel", optional = true }
+murmur-transport-tuic = { path = "../transport-tuic", optional = true }
+murmur-transport-vless = { path = "../transport-vless" }
+murmur-transport-vmess = { path = "../transport-vmess" }
+murmur-transport-xhttp = { path = "../transport-xhttp" }
+
+
+[features]
+extra-protocols = ["dep:russh", "dep:p256", "dep:murmur-mieru", "dep:murmur-quic", "dep:murmur-transport-anytls", "dep:murmur-transport-hysteria", "dep:murmur-transport-hysteria2", "dep:murmur-transport-kcptun", "dep:murmur-transport-masque", "dep:murmur-transport-openvpn", "dep:murmur-transport-shadowquic", "dep:murmur-transport-simple-obfs", "dep:murmur-transport-snell", "dep:murmur-transport-ssr", "dep:murmur-transport-sudoku", "dep:murmur-transport-trusttunnel", "dep:murmur-transport-tuic"]
+default = ["extra-protocols", "easytier", "tailscale", "zerotier"]
+easytier = ["dep:murmur-easytier", "dep:murmur-component-easytier"]
+tailscale = ["dep:geiserx_tailscale"]
+zerotier = ["dep:murmur-zerotier"]
+
+[package.metadata.cargo-machete]
+ignored = ["geiserx_tailscale"]
+
+[dev-dependencies]
+murmur-testsupport-probe = { path = "../testsupport-probe" }
+murmur-testsupport = { path = "../testsupport" }
+smoltcp.workspace = true
+tokio = { workspace = true, features = ["full", "test-util"] }
+x25519-dalek.workspace = true
+
+[lints]
+workspace = true

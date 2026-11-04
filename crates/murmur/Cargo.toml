@@ -1,0 +1,55 @@
+[package]
+name = "murmur"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[[bin]]
+name = "murmur"
+path = "src/main.rs"
+
+[dependencies]
+anyhow.workspace = true
+base64.workspace = true
+tokio.workspace = true
+murmur-adapter-outbound = { path = "../adapter-outbound", default-features = false }
+murmur-common = { path = "../common" }
+murmur-component = { path = "../component" }
+murmur-component-generator = { path = "../component-generator", default-features = false }
+murmur-component-geodata = { path = "../component-geodata" }
+murmur-component-updater = { path = "../component-updater", default-features = false }
+murmur-config = { path = "../config", default-features = false }
+murmur-constant = { path = "../constant" }
+murmur-constant-features = { path = "../constant-features" }
+murmur-dns = { path = "../dns" }
+murmur-hub = { path = "../hub", default-features = false }
+murmur-log = { path = "../log" }
+murmur-rules = { path = "../rules" }
+murmur-compat = { path = "../compat" }
+murmur-transport-hysteria = { path = "../transport-hysteria", optional = true }
+murmur-tunnel = { path = "../tunnel" }
+
+[features]
+extra-protocols = ["murmur-adapter-outbound/extra-protocols", "murmur-config/extra-protocols", "murmur-hub/extra-protocols", "murmur-component-generator/extra-protocols", "murmur-component-updater/extra-protocols", "dep:murmur-transport-hysteria"]
+default = ["extra-protocols", "with_gvisor", "easytier", "tailscale", "zerotier", "diagnostic-profiling"]
+diagnostic-profiling = ["murmur-hub/diagnostic-profiling"]
+easytier = ["murmur-adapter-outbound/easytier", "murmur-config/easytier", "murmur-hub/easytier"]
+tailscale = ["murmur-adapter-outbound/tailscale", "murmur-config/tailscale", "murmur-hub/tailscale"]
+zerotier = ["murmur-adapter-outbound/zerotier", "murmur-config/zerotier", "murmur-hub/zerotier"]
+# Negative flags deny configuration; only omitting positive features removes dependencies.
+router = ["extra-protocols", "with_low_memory", "with_gvisor", "no_easytier", "no_tailscale", "no_zerotier"]
+router-vvt = ["with_low_memory", "with_gvisor", "no_easytier", "no_tailscale", "no_zerotier"]
+cmfa = ["murmur-dns/cmfa", "murmur-constant/cmfa", "murmur-hub/cmfa", "murmur-constant-features/cmfa"]
+no_easytier = ["murmur-constant-features/no_easytier", "murmur-hub/no_easytier"]
+no_fake_tcp = ["murmur-transport-hysteria?/no_fake_tcp", "murmur-constant-features/no_fake_tcp"]
+no_tailscale = ["murmur-constant-features/no_tailscale", "murmur-hub/no_tailscale"]
+no_zerotier = ["murmur-constant-features/no_zerotier", "murmur-hub/no_zerotier"]
+with_gvisor = ["murmur-constant-features/with_gvisor", "murmur-hub/with_gvisor"]
+with_low_memory = ["murmur-compat/with_low_memory", "murmur-constant-features/with_low_memory"]
+[package.metadata.cargo-machete]
+ignored = ["murmur-compat", "murmur-transport-hysteria"]
+
+[lints]
+workspace = true
