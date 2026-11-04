@@ -1,0 +1,22 @@
+[package]
+name = "murmur-compat"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[lib]
+doctest = false
+
+[dependencies]
+anyhow.workspace = true
+rand.workspace = true
+tokio.workspace = true
+murmur-common-pool = { path = "../common-pool" }
+murmur-std-compat = { path = "../std-compat" }
+
+[features]
+with_low_memory = ["murmur-common-pool/with_low_memory"]
+[lints]
+workspace = true

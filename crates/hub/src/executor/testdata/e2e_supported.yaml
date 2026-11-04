@@ -1,0 +1,144 @@
+mixed-port: 7890
+allow-lan: false
+mode: rule
+log-level: info
+ipv6: true
+find-process-mode: strict
+
+external-controller: 127.0.0.1:9090
+
+profile:
+  store-selected: true
+
+sniffer:
+  enable: true
+  sniff:
+    HTTP:
+      ports: [80, 8080-8880]
+    TLS:
+      ports: [443]
+
+tun:
+  enable: true
+  stack: gvisor
+
+dns:
+  enable: true
+  ipv6: false
+  enhanced-mode: fake-ip
+  fake-ip-range: 198.18.0.1/16
+  nameserver:
+    - 198.51.100.1
+    - 198.51.100.2
+  fallback:
+    - 192.0.2.1
+    - tls://192.0.2.2:853
+  fallback-filter:
+    geoip: false
+
+hosts:
+  "internal.example": 192.0.2.10
+
+proxies:
+  - name: socks-in
+    type: socks5
+    server: 203.0.113.10
+    port: 1080
+  - name: http-in
+    type: http
+    server: 203.0.113.11
+    port: 8080
+  - name: ss-in
+    type: ss
+    server: 203.0.113.12
+    port: 8443
+    cipher: chacha20-ietf-poly1305
+    password: "placeholder-password"
+  - name: vmess-in
+    type: vmess
+    server: 203.0.113.13
+    port: 443
+    uuid: 00000000-0000-0000-0000-000000000000
+    alterId: 0
+    cipher: auto
+  - name: vless-in
+    type: vless
+    server: 203.0.113.14
+    port: 443
+    uuid: 00000000-0000-0000-0000-000000000001
+    network: tcp
+    servername: internal.example
+  - name: trojan-in
+    type: trojan
+    server: 203.0.113.15
+    port: 443
+    password: "placeholder-password"
+    sni: internal.example
+  - name: hysteria-in
+    type: hysteria
+    server: 203.0.113.16
+    port: 443
+    auth-str: "placeholder-auth"
+    protocol: udp
+    up: "30 Mbps"
+    down: "200 Mbps"
+  - name: tuic-in
+    type: tuic
+    server: 203.0.113.17
+    port: 10443
+    uuid: 00000000-0000-0000-0000-000000000002
+    password: "placeholder-password"
+    disable-sni: true
+  - name: ssh-in
+    type: ssh
+    server: 203.0.113.18
+    port: 22
+    username: placeholder-user
+    password: "placeholder-password"
+  - name: snell-in
+    type: snell
+    server: 203.0.113.19
+    port: 44046
+    psk: "placeholder-psk"
+  - name: anytls-in
+    type: anytls
+    server: 203.0.113.20
+    port: 443
+    password: "placeholder-password"
+  - name: gost-relay-in
+    type: gost-relay
+    server: relay.example
+    port: 443
+    udp: true
+    tls: true
+  - name: mieru-in
+    type: mieru
+    server: 203.0.113.21
+    port: 2999
+    transport: TCP
+    username: placeholder-user
+    password: "placeholder-password"
+    udp: true
+
+proxy-groups:
+  - name: PROXY
+    type: select
+    proxies:
+      - socks-in
+      - http-in
+      - ss-in
+      - vmess-in
+      - vless-in
+      - trojan-in
+      - hysteria-in
+      - tuic-in
+      - ssh-in
+      - snell-in
+      - anytls-in
+      - gost-relay-in
+      - mieru-in
+      - DIRECT
+
+rules:
+  - DOMAIN-SUFFIX,internal.example,PROXY
+  - MATCH,DIRECT

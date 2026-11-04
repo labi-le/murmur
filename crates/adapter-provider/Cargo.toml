@@ -1,0 +1,50 @@
+[package]
+name = "murmur-adapter-provider"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[lib]
+doctest = false
+
+[dependencies]
+anyhow.workspace = true
+async-trait.workspace = true
+chrono.workspace = true
+fancy-regex.workspace = true
+hyper.workspace = true
+parking_lot.workspace = true
+regex.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+yaml_serde.workspace = true
+tokio.workspace = true
+tokio-util.workspace = true
+murmur-adapter = { path = "../adapter", default-features = false }
+murmur-common = { path = "../common" }
+murmur-common-convert = { path = "../common-convert" }
+murmur-component = { path = "../component" }
+murmur-component-profile = { path = "../component-profile" }
+murmur-component-resource = { path = "../component-resource" }
+murmur-constant = { path = "../constant" }
+murmur-log = { path = "../log" }
+murmur-tunnel = { path = "../tunnel" }
+
+
+[features]
+extra-protocols = ["murmur-adapter/extra-protocols"]
+default = ["extra-protocols", "easytier", "tailscale", "zerotier"]
+easytier = ["murmur-adapter/easytier"]
+tailscale = ["murmur-adapter/tailscale"]
+zerotier = ["murmur-adapter/zerotier"]
+
+[dev-dependencies]
+tokio = { workspace = true, features = ["test-util"] }
+murmur-adapter-outbound = { path = "../adapter-outbound", default-features = false }
+murmur-transport-vless = { path = "../transport-vless" }
+
+
+[lints]
+workspace = true

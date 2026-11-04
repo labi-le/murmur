@@ -1,0 +1,52 @@
+[package]
+name = "murmur-easytier"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[lib]
+doctest = false
+
+[dependencies]
+aes-gcm.workspace = true
+anyhow.workspace = true
+async-trait.workspace = true
+base64.workspace = true
+hex.workspace = true
+ipnet.workspace = true
+parking_lot.workspace = true
+portable-atomic.workspace = true
+prost.workspace = true
+rand.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+sha2.workspace = true
+thiserror.workspace = true
+tokio.workspace = true
+tokio-util.workspace = true
+uuid.workspace = true
+x25519-dalek.workspace = true
+# The default feature set includes `cache`, which pulls `wasmtime-cache` -> zstd 0.13.
+# Easytier never configures wasmtime's on-disk cache, so the feature is disabled to keep the
+# advisory-affected zstd 0.13 out of the build. Every other default feature stays enabled.
+wasmtime = { version = "49.0.4", default-features = false, features = [
+    "anyhow", "async", "backtrace", "gc", "gc-copying", "gc-drc", "gc-null", "wat",
+    "profiling", "parallel-compilation", "cranelift", "pooling-allocator", "demangle",
+    "addr2line", "coredump", "debug-builtins", "runtime", "component-model",
+    "component-model-async", "threads", "stack-switching", "std", "debug",
+    "compile-time-builtins", "wit-parser",
+] }
+wasmtime-wasi = "49.0.4"
+murmur-common-net = { path = "../common-net" }
+murmur-component-easytier = { path = "../component-easytier" }
+murmur-std-compat = { path = "../std-compat" }
+
+[dev-dependencies]
+hickory-proto.workspace = true
+murmur-component = { path = "../component" }
+murmur-constant = { path = "../constant" }
+
+[lints]
+workspace = true
