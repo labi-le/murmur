@@ -1,0 +1,200 @@
+name: Nightly
+
+# Builds pre-1.0 router binaries nightly (and on manual dispatch) and publishes
+# them to the `Prerelease-Alpha` pre-release channel so testers and the core
+# updater (`channel=alpha`) always have current builds before 1.0 is tagged.
+on:
+  schedule:
+    - cron: "0 2 * * *"
+  workflow_dispatch:
+    inputs:
+      ref:
+        description: Commit SHA, tag or branch to build (defaults to current ref)
+        required: false
+        default: ""
+
+permissions:
+  contents: write
+
+env:
+  CARGO_TERM_COLOR: always
+  NIX_CONFIG: experimental-features = nix-command flakes
+
+jobs:
+  build:
+    name: build (${{ matrix.artifact }})
+    runs-on: ubuntu-latest
+    timeout-minutes: 90
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - shell: x86_64-musl
+            target: x86_64-unknown-linux-musl
+            features: router
+            artifact: murmur-linux-amd64
+            archive: gz
+            smoke: true
+          - shell: aarch64-musl
+            target: aarch64-unknown-linux-musl
+            features: router
+            artifact: murmur-linux-arm64
+            archive: gz
+            smoke: false
+          - shell: aarch64-musl
+            target: aarch64-unknown-linux-musl
+            features: router-vvt
+            artifact: murmur-linux-arm64-vvt
+            archive: gz
+            smoke: false
+          - shell: mipsel-musl
+            target: mipsel-unknown-linux-musl
+            features: router
+            artifact: murmur-linux-mipsle-softfloat
+            archive: gz
+            smoke: false
+          - shell: windows
+            target: x86_64-pc-windows-gnu
+            features: router
+            artifact: murmur-windows-amd64
+            archive: zip
+            smoke: false
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          ref: ${{ inputs.ref }}
+          fetch-depth: 0
+
+      - name: Install Nix
+        run: |
+          curl -L https://nixos.org/nix/install | sh -s -- --daemon --yes
+          . /nix/var/nix/profiles/default/etc/profile.d/nix-daemon.sh
+          nix --version
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: nightly-${{ matrix.artifact }}
+
+      - name: Build and package
+        env:
+          SHELL_NAME: ${{ matrix.shell }}
+          TARGET_TRIPLE: ${{ matrix.target }}
+          FEATURE_SET: ${{ matrix.features }}
+          ARTIFACT_BASE: ${{ matrix.artifact }}
+          ARCHIVE_KIND: ${{ matrix.archive }}
+          RUN_SMOKE: ${{ matrix.smoke }}
+        run: |
+          . /nix/var/nix/profiles/default/etc/profile.d/nix-daemon.sh
+          nix develop ".#${SHELL_NAME}" --command bash -se <<'BUILD'
+            set -euo pipefail
+            unset RUSTC_WRAPPER SCCACHE_DIR SCCACHE_SERVER_UDS SCCACHE_CACHE_SIZE
+            if [ "$TARGET_TRIPLE" = "mipsel-unknown-linux-musl" ]; then
+              export MURMUR_MIPS_FLOAT=softfloat
+            fi
+            cargo build --locked --profile compact -p murmur --bin murmur \
+              --no-default-features --features "$FEATURE_SET" \
+              --target "$TARGET_TRIPLE"
+
+            version=$(awk '/^pub static VERSION: &str = /{ sub(/^[^"]*"/, ""); sub(/".*/, ""); print; exit }' crates/constant/src/version.rs)
+            test -n "$version"
+
+            bin="target/${TARGET_TRIPLE}/compact/murmur"
+            if [ "$ARCHIVE_KIND" = "zip" ]; then
+              bin="${bin}.exe"
+            fi
+            test -f "$bin"
+
+            if [ "$RUN_SMOKE" = "true" ]; then
+              smoke_home=$(mktemp -d)
+              "$bin" -v
+              "$bin" -t -f crates/hub/src/executor/testdata/e2e_supported.yaml -d "$smoke_home"
+              rm -rf "$smoke_home"
+            fi
+
+            mkdir -p dist
+            if [ "$ARCHIVE_KIND" = "zip" ]; then
+              cp "$bin" "dist/${ARTIFACT_BASE}.exe"
+              python3 - "$ARTIFACT_BASE" "$version" <<'PY'
+          import sys, zipfile
+          base, version = sys.argv[1], sys.argv[2]
+          exe_name = f"{base}.exe"
+          zip_path = f"dist/{base}-{version}.zip"
+          with zipfile.ZipFile(zip_path, "w", compression=zipfile.ZIP_DEFLATED, compresslevel=9) as zf:
+              zf.write(f"dist/{exe_name}", arcname=exe_name)
+          PY
+              rm -f "dist/${ARTIFACT_BASE}.exe"
+            else
+              cp "$bin" "dist/${ARTIFACT_BASE}"
+              (
+                cd dist
+                gzip -9 "${ARTIFACT_BASE}"
+                mv "${ARTIFACT_BASE}.gz" "${ARTIFACT_BASE}-${version}.gz"
+                test "$(gzip -lN "${ARTIFACT_BASE}-${version}.gz" | awk 'NR == 2 { print $4 }')" = "${ARTIFACT_BASE}"
+              )
+            fi
+          BUILD
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.artifact }}
+          path: dist/*
+          if-no-files-found: error
+
+  publish:
+    name: publish nightly prerelease
+    needs: build
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    env:
+      GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+      TAG: Prerelease-Alpha
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          ref: ${{ inputs.ref }}
+
+      - uses: actions/download-artifact@v4
+        with:
+          path: dist
+          merge-multiple: true
+
+      - name: Prepare version metadata and checksums
+        run: |
+          set -euo pipefail
+          version=$(awk '/^pub static VERSION: &str = /{ sub(/^[^"]*"/, ""); sub(/".*/, ""); print; exit }' crates/constant/src/version.rs)
+          test -n "$version"
+          printf "%s\n" "$version" > dist/version.txt
+          printf "%s\n" "$version" > dist/version-vvt.txt
+          (
+            cd dist
+            sha256sum murmur-* version.txt version-vvt.txt > SHA256SUMS
+          )
+          ls -lh dist/
+
+      - name: Update Prerelease-Alpha release
+        run: |
+          set -euo pipefail
+          version=$(cat dist/version.txt)
+          commit=$(git rev-parse --short=12 HEAD)
+          built_at=$(date -u +"%Y-%m-%d %H:%M UTC")
+          notes=$(printf "Automated pre-1.0 nightly router builds from commit \`%s\` (%s).\n\nVersion: \`%s\`\nProfile: \`compact\` (\`router\` and \`router-vvt\`)\n" "$commit" "$built_at" "$version")
+
+          if gh release view "$TAG" >/dev/null 2>&1; then
+            gh release edit "$TAG" \
+              --prerelease \
+              --title "Murmur ${version} nightly (${commit})" \
+              --notes "$notes"
+          else
+            gh release create "$TAG" \
+              --prerelease \
+              --target "$(git rev-parse HEAD)" \
+              --title "Murmur ${version} nightly (${commit})" \
+              --notes "$notes"
+          fi
+
+          gh release upload "$TAG" \
+            dist/murmur-* \
+            dist/version.txt \
+            dist/version-vvt.txt \
+            dist/SHA256SUMS \
+            --clobber

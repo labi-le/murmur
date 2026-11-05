@@ -1,0 +1,40 @@
+name: pr-review
+
+on:
+  pull_request:
+    types: [opened, synchronize, reopened, ready_for_review]
+  workflow_dispatch:
+    inputs:
+      pr:
+        description: Pull-request number to review
+        required: true
+        type: string
+
+permissions:
+  contents: read
+
+concurrency:
+  group: pr-review-${{ github.event.pull_request.number || inputs.pr }}
+  cancel-in-progress: true
+
+jobs:
+  review:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - name: Check out the reviewer revision
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event.repository.default_branch }}
+          persist-credentials: false
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Review the pull request
+        env:
+          GH_TOKEN: ${{ secrets.REVIEWER_TOKEN }}
+          LLM_API_KEY: ${{ secrets.REVIEWER_LLM_API_KEY }}
+          LLM_MODEL: ${{ vars.PR_REVIEW_MODEL || 'gemini-4-argon' }}
+          GITHUB_REPOSITORY: ${{ github.repository }}
+          PR_NUMBER: ${{ github.event.pull_request.number || inputs.pr }}
+        run: python3 tools/pr_review.py

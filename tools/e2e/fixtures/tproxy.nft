@@ -1,0 +1,7 @@
+table inet murmur_e2e_tproxy {
+  chain prerouting {
+    type filter hook prerouting priority mangle; policy accept;
+    iifname "br-lan" ip daddr 149.154.160.10 meta l4proto tcp meta mark set 0x1 counter tproxy ip to :12342 accept
+    iifname "br-lan" ip daddr 149.154.160.10 meta l4proto udp meta mark set 0x1 counter tproxy ip to :12342 accept
+  }
+}
