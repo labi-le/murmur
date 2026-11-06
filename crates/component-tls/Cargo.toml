@@ -1,0 +1,41 @@
+[package]
+name = "murmur-component-tls"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[lib]
+doctest = false
+
+[dependencies]
+aes-gcm.workspace = true
+anyhow.workspace = true
+async-trait.workspace = true
+chacha20poly1305.workspace = true
+chrono.workspace = true
+hex.workspace = true
+hkdf.workspace = true
+hmac.workspace = true
+ml-kem.workspace = true
+parking_lot.workspace = true
+rand.workspace = true
+rustls.workspace = true
+rustls-native-certs.workspace = true
+sha2.workspace = true
+socket2.workspace = true
+tokio.workspace = true
+tokio-rustls.workspace = true
+tokio-util.workspace = true
+x25519-dalek.workspace = true
+murmur-common = { path = "../common" }
+murmur-common-net = { path = "../common-net" }
+murmur-std-compat = { path = "../std-compat" }
+murmur-log = { path = "../log" }
+
+
+[dev-dependencies]
+
+[lints]
+workspace = true

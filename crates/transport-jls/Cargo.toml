@@ -1,0 +1,32 @@
+[package]
+name = "murmur-transport-jls"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[lib]
+doctest = false
+
+[dependencies]
+murmur-common = { path = "../common" }
+murmur-common-net = { path = "../common-net" }
+murmur-component-ca = { path = "../component-ca" }
+murmur-jls-tls = { path = "../jls-tls" }
+murmur-std-compat = { path = "../std-compat" }
+murmur-log = { path = "../log" }
+murmur-ntp = { path = "../ntp" }
+anyhow.workspace = true
+base64.workspace = true
+parking_lot.workspace = true
+p256 = { workspace = true, features = ["pkcs8"] }
+thiserror.workspace = true
+tokio.workspace = true
+tokio-util.workspace = true
+
+[dev-dependencies]
+tokio = { workspace = true, features = ["full", "test-util"] }
+
+[lints]
+workspace = true

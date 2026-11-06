@@ -1,0 +1,82 @@
+# RUST_GUIDELINES.md section 10: license compliance, banned crates, source
+# restrictions and the advisory policy are stated explicitly here rather than left
+# to cargo-deny's defaults, so every policy in force is reviewable in one file.
+#
+# `cargo deny check` runs in `make lint` and in CI's `deny` job. cargo-deny 0.20
+# dropped the `unlicensed` / `copyleft` / `vulnerability` / `notice` level keys:
+# licenses are now an allow-list (anything outside `[licenses] allow` is rejected,
+# copyleft and unlicensed included), and the advisory checks keep their own
+# defaults (vulnerability and yanked deny, unmaintained/unsound/notice warn).
+[graph]
+targets = [{ triple = "x86_64-unknown-linux-gnu" }]
+
+[advisories]
+version = 2
+db-urls = ["https://github.com/rustsec/advisory-db"]
+# Section 10: an ignore entry with no rationale is indistinguishable from an
+# unreviewed vulnerability six months later. Every entry added here must name the
+# advisory, say why it does not apply to this crate, and note whether an upstream
+# fix exists -- the `{ id = "...", reason = "..." }` form, never a bare string.
+# `rust/.cargo/audit.toml` mirrors this list, because cargo-audit and cargo-deny
+# read different files and an advisory suppressed in one still fails the other.
+ignore = [
+    { id = "RUSTSEC-2023-0071", reason = "Marvin attack (RSA decryption timing) in `rsa` 0.9.x; upstream has no fixed release. this tree uses `rsa` only for PKCS#1 v1.5 *signing* and PKCS#8 encoding of locally generated CA certificates (`component-ca`) and for PSS *verification* of a server's key (`restls`) -- it never decrypts attacker-supplied ciphertext, which is the operation the attack targets. Re-check when `rsa` 0.10 leaves pre-release." },
+    { id = "RUSTSEC-2025-0134", reason = "`rustls-pemfile` is unmaintained (upstream folded the API into `rustls-pki-types`). It reaches the tree only through `geiserx_tailscale` 0.57.2 -> `geiserx_ts_control`, the Tailscale engine crate; nothing in this workspace calls it, so the fix path is an upstream release rather than a change here." },
+]
+
+[licenses]
+version = 2
+allow = [
+    "MIT",
+    "Apache-2.0",
+    "Apache-2.0 WITH LLVM-exception",
+    "BSD-2-Clause",
+    "BSD-3-Clause",
+    "ISC",
+    "Unicode-3.0",
+    "Zlib",
+    "CC0-1.0",
+    "0BSD",
+    "Unlicense",
+    "CDLA-Permissive-2.0",
+    # Permissive BSD-style license of libbz2, reached through sevenz-rust2.
+    "bzip2-1.0.6",
+    # The workspace's own license; the members themselves are exempted by
+    # `private.ignore` below, so these two entries only matter if a GPL crate is
+    # ever pulled from the registry.
+    "GPL-3.0-only",
+    "GPL-3.0-or-later",
+]
+confidence-threshold = 0.8
+
+[licenses.private]
+# Every workspace member is `publish = false`, and this project ships under
+# GPL-3.0-only itself. `ignore = true` keeps the allow-list model from rejecting
+# the members' own GPL-3.0-only declaration, while a copyleft *dependency* still
+# fails the check (it is not in `allow` and is not private).
+ignore = true
+
+[bans]
+# Section 10 asks for duplicates to be surfaced, not hidden: a warning keeps the
+# report visible without failing a build whose graph legitimately carries several
+# major versions of a crate (ring/rustls/tonic families).
+multiple-versions = "warn"
+# No `*` version requirement is acceptable from a registry. `allow-wildcard-paths`
+# keeps the workspace's own path dependencies (which carry no version requirement
+# at all, because every member is `publish = false`) out of that rule.
+wildcards = "deny"
+allow-wildcard-paths = true
+highlight = "all"
+# Deny-by-default bans list, kept empty: nothing is banned today, and an empty
+# list is the statement that no crate is excluded for policy reasons.
+deny = []
+allow = []
+
+[sources]
+unknown-registry = "deny"
+unknown-git = "deny"
+allow-registry = ["https://github.com/rust-lang/crates.io-index"]
+# No git dependency is used anywhere in the tree (checked against Cargo.lock),
+# so any git source appearing later is a deliberate change that must also update
+# this list.
+allow-git = []

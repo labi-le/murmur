@@ -1,0 +1,51 @@
+[package]
+name = "murmur-config"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[lib]
+doctest = false
+
+[dependencies]
+anyhow.workspace = true
+if-addrs.workspace = true
+ipnet.workspace = true
+serde.workspace = true
+yaml_serde.workspace = true
+url.workspace = true
+murmur-adapter = { path = "../adapter", default-features = false }
+murmur-adapter-outbound = { path = "../adapter-outbound", default-features = false }
+murmur-adapter-outboundgroup = { path = "../adapter-outboundgroup", default-features = false }
+murmur-adapter-provider = { path = "../adapter-provider", default-features = false }
+murmur-common = { path = "../common" }
+murmur-component = { path = "../component" }
+murmur-component-fakeip = { path = "../component-fakeip" }
+murmur-component-geodata = { path = "../component-geodata" }
+murmur-component-process = { path = "../component-process" }
+murmur-component-sniffer = { path = "../component-sniffer" }
+murmur-component-trie = { path = "../component-trie" }
+murmur-constant = { path = "../constant" }
+murmur-dns = { path = "../dns" }
+murmur-listener = { path = "../listener", default-features = false }
+murmur-listener-config = { path = "../listener-config" }
+murmur-log = { path = "../log" }
+murmur-rules = { path = "../rules" }
+murmur-rules-common = { path = "../rules-common" }
+murmur-tunnel = { path = "../tunnel" }
+
+
+[features]
+extra-protocols = ["murmur-adapter/extra-protocols", "murmur-adapter-outbound/extra-protocols", "murmur-adapter-outboundgroup/extra-protocols", "murmur-adapter-provider/extra-protocols", "murmur-listener/extra-protocols"]
+default = ["extra-protocols", "easytier", "tailscale", "zerotier"]
+easytier = ["murmur-adapter/easytier", "murmur-adapter-outbound/easytier", "murmur-adapter-outboundgroup/easytier", "murmur-adapter-provider/easytier"]
+tailscale = ["murmur-adapter/tailscale", "murmur-adapter-outbound/tailscale", "murmur-adapter-outboundgroup/tailscale", "murmur-adapter-provider/tailscale"]
+zerotier = ["murmur-adapter/zerotier", "murmur-adapter-outbound/zerotier", "murmur-adapter-outboundgroup/zerotier", "murmur-adapter-provider/zerotier"]
+
+[dev-dependencies]
+tokio.workspace = true
+
+[lints]
+workspace = true
