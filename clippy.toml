@@ -1,0 +1,33 @@
+# Lint *levels* live in Cargo.toml `[workspace.lints.clippy]`; lint *configuration*
+# lives here. RUST_GUIDELINES.md section 9 requires the thresholds to be pinned
+# rather than left at their near-useless defaults.
+#
+# `msrv` gates the suggestions that postdate the floor: the workspace's
+# `rust-version` is 1.97, so 1.95/1.97 APIs (bit_width, isolate_*_one,
+# Atomic::update, Vec::push_mut, cold_path, dead_code_pub_in_binary) are
+# suggested, while the 1.98 family (bool::ok_or, NumBuffer, substr_range,
+# strip_circumfix, String::from_utf16le, Atomic::from_mut) stays silent until the
+# toolchain moves.
+msrv = "1.97"
+
+# section 9: complexity thresholds.
+cognitive-complexity-threshold = 25
+too-many-lines-threshold = 100
+max-fn-params-bools = 3
+enum-variant-size-threshold = 200
+
+# Thresholds this workspace pins beyond the guideline's list, because the
+# defaults fire on idiomatic wire-format code:
+# - `too_many_arguments`: protocol dialers legitimately thread host/port/tls/
+#   route/interface/... through one constructor instead of a 7-field struct.
+too-many-arguments-threshold = 12
+# - `type_complexity`: the trie/rule/route types are genuinely nested generics;
+#   the default threshold flags every one of them.
+type-complexity-threshold = 500
+# - `array-size-threshold` drives `large_stack_arrays`, which matters here for
+#   the same reason it matters in the guideline: buffers must not sit on the
+#   stack of an async task.
+array-size-threshold = 16384
+# - `literal-representation-threshold` keeps wire-format constants (0xFFFF,
+#   0x7FFF_FFFF) spelled in the form the protocol documents use.
+literal-representation-threshold = 65536

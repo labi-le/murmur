@@ -1,0 +1,74 @@
+name: Warm Nix cache
+
+# Builds the flake's development shells and pushes them to the project Cachix cache, so the
+# nightly and release jobs substitute the pinned toolchains instead of compiling them from
+# source: only the soft-float MIPS cross set is missing from cache.nixos.org, and on its own
+# it costs ~38 minutes of every MIPS job.
+#
+# Run it after a flake.lock or flake.nix change. Requires the `CACHIX_AUTH_TOKEN` secret and a
+# Cachix cache named by `CACHIX_CACHE` below (about 0.5 GiB for the MIPS set; the other shells
+# have essentially nothing that upstream does not already serve).
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+env:
+  NIX_CONFIG: experimental-features = nix-command flakes
+  CACHIX_CACHE: murmur-lab
+
+jobs:
+  warm:
+    name: warm (${{ matrix.shell }})
+    runs-on: ubuntu-latest
+    timeout-minutes: 150
+    env:
+      CACHIX_AUTH_TOKEN: ${{ secrets.CACHIX_AUTH_TOKEN }}
+    strategy:
+      fail-fast: false
+      matrix:
+        shell: [default, x86_64-musl, aarch64-musl, mipsel-musl, windows]
+    steps:
+      - uses: actions/checkout@v6
+
+      - name: Require the Cachix token
+        run: |
+          set -euo pipefail
+          if [ -z "${CACHIX_AUTH_TOKEN:-}" ]; then
+            echo "CACHIX_AUTH_TOKEN is not set: create the '${CACHIX_CACHE}' cache and add the secret" >&2
+            exit 1
+          fi
+
+      - name: Install Nix
+        run: |
+          curl -L https://nixos.org/nix/install | sh -s -- --daemon --yes
+          . /nix/var/nix/profiles/default/etc/profile.d/nix-daemon.sh
+          nix --version
+          # Later steps are not login shells, so the installer's profile is not sourced for
+          # them; cachix-action is one of those steps and needs `nix` on PATH.
+          echo "$(dirname "$(command -v nix)")" >> "$GITHUB_PATH"
+          # The daemon install leaves this user untrusted, so `cachix use` is refused and the
+          # daemon ignores a substituter the step passes; trust it and reload the daemon.
+          echo "trusted-users = root runner" | sudo tee -a /etc/nix/nix.conf >/dev/null
+          sudo systemctl restart nix-daemon.service 2>/dev/null || sudo pkill nix-daemon || true
+
+      # The action installs Cachix with `nix-env -iA`, which needs channels; install it from the
+      # flake's pinned nixpkgs instead and let the action find the binary on PATH.
+      - name: Install Cachix
+        if: env.CACHIX_AUTH_TOKEN != ''
+        run: |
+          . /nix/var/nix/profiles/default/etc/profile.d/nix-daemon.sh
+          nix profile install --no-write-lock-file --inputs-from . nixpkgs#cachix
+          echo "$HOME/.nix-profile/bin" >> "$GITHUB_PATH"
+
+      - uses: cachix/cachix-action@v17
+        with:
+          name: ${{ env.CACHIX_CACHE }}
+          authToken: ${{ env.CACHIX_AUTH_TOKEN }}
+          useDaemon: false
+
+      - name: Build the development shell
+        run: |
+          . /nix/var/nix/profiles/default/etc/profile.d/nix-daemon.sh
+          nix develop ".#${{ matrix.shell }}" --command true

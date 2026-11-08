@@ -1,0 +1,26 @@
+[package]
+name = "murmur-component-profile"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[lib]
+doctest = false
+
+[dependencies]
+anyhow.workspace = true
+chrono.workspace = true
+parking_lot.workspace = true
+thiserror.workspace = true
+murmur-common = { path = "../common" }
+murmur-constant = { path = "../constant" }
+murmur-log = { path = "../log" }
+
+
+[lints]
+workspace = true
+
+[target.'cfg(windows)'.dependencies]
+windows-sys.workspace = true

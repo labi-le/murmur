@@ -1,0 +1,28 @@
+[package]
+name = "murmur-component-generator"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[lib]
+doctest = false
+
+[dependencies]
+anyhow.workspace = true
+base64.workspace = true
+rand.workspace = true
+uuid.workspace = true
+x25519-dalek.workspace = true
+murmur-component-ech = { path = "../component-ech" }
+murmur-transport-sudoku = { path = "../transport-sudoku", optional = true }
+murmur-transport-vless = { path = "../transport-vless" }
+
+
+[features]
+default = ["extra-protocols"]
+extra-protocols = ["dep:murmur-transport-sudoku"]
+
+[lints]
+workspace = true

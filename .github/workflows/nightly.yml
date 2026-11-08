@@ -1,0 +1,365 @@
+name: Nightly
+
+# Builds pre-1.0 router binaries nightly (and on manual dispatch) and publishes
+# them to the `Prerelease-Alpha` pre-release channel so testers and the core
+# updater (`channel=alpha`) always have current builds before 1.0 is tagged.
+#
+# Each run also creates a dated `nightly-YYYYMMDD` pre-release with the same
+# assets, so a specific night's build stays reachable after the rolling channel
+# has moved on; the newest NIGHTLY_RETENTION dated releases are kept.
+#
+# A run stops at the `gate` job when the rolling release title already names its
+# commit, so an unchanged tree costs one job instead of six cross builds.
+# `workflow_dispatch` with `force: true` rebuilds the same commit anyway.
+on:
+  schedule:
+    - cron: "0 2 * * *"
+  workflow_dispatch:
+    inputs:
+      ref:
+        description: Commit SHA, tag or branch to build (defaults to current ref)
+        required: false
+        default: ""
+      force:
+        description: Build even when the latest nightly already published this commit
+        type: boolean
+        default: false
+
+permissions:
+  contents: write
+
+env:
+  CARGO_TERM_COLOR: always
+  NIX_CONFIG: experimental-features = nix-command flakes
+  CACHIX_CACHE: murmur-lab
+  # Cachix cache that holds the flake's development shells; `workflow_dispatch` on
+  # warm-nix-cache.yml populates it, and the build jobs substitute from it. Without the
+  # CACHIX_AUTH_TOKEN secret the steps below are skipped and every job compiles its own
+  # toolchain, which is what the soft-float MIPS cross set costs 38 minutes of.
+
+jobs:
+  gate:
+    name: gate
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    outputs:
+      build: ${{ steps.check.outputs.build }}
+    env:
+      GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+      TAG: Prerelease-Alpha
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          ref: ${{ inputs.ref }}
+
+      # The nightly exists to publish changes. A scheduled run whose commit is already in the
+      # rolling release would compile six binaries to upload byte-identical assets, so it stops
+      # here. The commit lives in the rolling release name (`… nightly (<commit>)`, set through
+      # `gh release create --title`); a hand-edited name only makes this rebuild, never skip a
+      # real change.
+      - name: Skip when this commit already has a nightly
+        id: check
+        env:
+          FORCE: ${{ inputs.force }}
+        run: |
+          set -euo pipefail
+          commit=$(git rev-parse --short=12 HEAD)
+          if [ "$FORCE" = "true" ]; then
+            echo "forced rebuild of ${commit}"
+            echo "build=true" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          name=$(gh release view "$TAG" --json name --jq .name 2>/dev/null || true)
+          case "$name" in
+            *"(${commit})"*)
+              echo "commit ${commit} is already published: ${name}"
+              echo "build=false" >> "$GITHUB_OUTPUT"
+              ;;
+            *)
+              echo "latest nightly is '${name:-none}'; building ${commit}"
+              echo "build=true" >> "$GITHUB_OUTPUT"
+              ;;
+          esac
+
+  build:
+    name: build (${{ matrix.artifact }})
+    needs: gate
+    if: needs.gate.outputs.build == 'true'
+    runs-on: ubuntu-latest
+    timeout-minutes: 90
+    env:
+      CACHIX_AUTH_TOKEN: ${{ secrets.CACHIX_AUTH_TOKEN }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - shell: x86_64-musl
+            target: x86_64-unknown-linux-musl
+            features: router
+            artifact: murmur-linux-amd64
+            archive: gz
+            smoke: true
+            ipk_arch: x86_64
+            ipk_pkg: murmur
+          - shell: aarch64-musl
+            target: aarch64-unknown-linux-musl
+            features: router
+            artifact: murmur-linux-arm64
+            archive: gz
+            smoke: false
+            ipk_arch: aarch64_generic
+            ipk_pkg: murmur
+          - shell: aarch64-musl
+            target: aarch64-unknown-linux-musl
+            features: router-vvt
+            artifact: murmur-linux-arm64-vvt
+            archive: gz
+            smoke: false
+            ipk_arch: aarch64_generic
+            ipk_pkg: murmur-vvt
+          - shell: mipsel-musl
+            target: mipsel-unknown-linux-musl
+            features: router
+            artifact: murmur-linux-mipsle-softfloat
+            archive: gz
+            smoke: false
+            ipk_arch: mipsel_24kc
+            ipk_pkg: murmur
+          - shell: mipsel-musl
+            target: mipsel-unknown-linux-musl
+            features: router-vvt
+            artifact: murmur-linux-mipsle-softfloat-vvt
+            archive: gz
+            smoke: false
+            ipk_arch: mipsel_24kc
+            ipk_pkg: murmur-vvt
+          - shell: windows
+            target: x86_64-pc-windows-gnu
+            features: router
+            artifact: murmur-windows-amd64
+            archive: zip
+            smoke: false
+            ipk_arch: ""
+            ipk_pkg: ""
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          ref: ${{ inputs.ref }}
+          fetch-depth: 0
+
+      - name: Install Nix
+        run: |
+          curl -L https://nixos.org/nix/install | sh -s -- --daemon --yes
+          . /nix/var/nix/profiles/default/etc/profile.d/nix-daemon.sh
+          nix --version
+          # Later steps are not login shells, so the installer's profile is not sourced for
+          # them; cachix-action is one of those steps and needs `nix` on PATH.
+          echo "$(dirname "$(command -v nix)")" >> "$GITHUB_PATH"
+          # The daemon install leaves this user untrusted, so `cachix use` is refused and the
+          # daemon ignores a substituter the step passes; trust it and reload the daemon.
+          echo "trusted-users = root runner" | sudo tee -a /etc/nix/nix.conf >/dev/null
+          sudo systemctl restart nix-daemon.service 2>/dev/null || sudo pkill nix-daemon || true
+
+      # The action installs Cachix with `nix-env -iA`, which needs channels; install it from the
+      # flake's pinned nixpkgs instead and let the action find the binary on PATH.
+      - name: Install Cachix
+        if: env.CACHIX_AUTH_TOKEN != ''
+        run: |
+          . /nix/var/nix/profiles/default/etc/profile.d/nix-daemon.sh
+          nix profile install --no-write-lock-file --inputs-from . nixpkgs#cachix
+          echo "$HOME/.nix-profile/bin" >> "$GITHUB_PATH"
+
+      # Substitutes the pinned toolchain from the project cache and pushes whatever this job
+      # had to build into it, so the next run of the same shell starts warm.
+      - uses: cachix/cachix-action@v17
+        if: env.CACHIX_AUTH_TOKEN != ''
+        with:
+          name: ${{ env.CACHIX_CACHE }}
+          authToken: ${{ env.CACHIX_AUTH_TOKEN }}
+          # Pushing through the daemon's post-build hook needs a root-owned nix.conf; the
+          # post-step push reads the same store through the daemon and needs no extra privilege.
+          useDaemon: false
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: nightly-${{ matrix.artifact }}
+
+      - name: Build and package
+        env:
+          SHELL_NAME: ${{ matrix.shell }}
+          TARGET_TRIPLE: ${{ matrix.target }}
+          FEATURE_SET: ${{ matrix.features }}
+          ARTIFACT_BASE: ${{ matrix.artifact }}
+          ARCHIVE_KIND: ${{ matrix.archive }}
+          RUN_SMOKE: ${{ matrix.smoke }}
+          IPK_ARCH: ${{ matrix.ipk_arch }}
+          IPK_PKG: ${{ matrix.ipk_pkg }}
+        run: |
+          . /nix/var/nix/profiles/default/etc/profile.d/nix-daemon.sh
+          nix develop ".#${SHELL_NAME}" --command bash -se <<'BUILD'
+            set -euo pipefail
+            unset RUSTC_WRAPPER SCCACHE_DIR SCCACHE_SERVER_UDS SCCACHE_CACHE_SIZE
+            if [ "$TARGET_TRIPLE" = "mipsel-unknown-linux-musl" ]; then
+              export MURMUR_MIPS_FLOAT=softfloat
+            fi
+            cargo build --locked --profile compact -p murmur --bin murmur \
+              --no-default-features --features "$FEATURE_SET" \
+              --target "$TARGET_TRIPLE"
+
+            version=$(awk '/^pub static VERSION: &str = /{ sub(/^[^"]*"/, ""); sub(/".*/, ""); print; exit }' crates/constant/src/version.rs)
+            test -n "$version"
+
+            bin="target/${TARGET_TRIPLE}/compact/murmur"
+            if [ "$ARCHIVE_KIND" = "zip" ]; then
+              bin="${bin}.exe"
+            fi
+            test -f "$bin"
+
+            if [ "$RUN_SMOKE" = "true" ]; then
+              smoke_home=$(mktemp -d)
+              "$bin" -v
+              "$bin" -t -f crates/hub/src/executor/testdata/e2e_supported.yaml -d "$smoke_home"
+              rm -rf "$smoke_home"
+            fi
+
+            mkdir -p dist
+            if [ "$ARCHIVE_KIND" = "zip" ]; then
+              cp "$bin" "dist/${ARTIFACT_BASE}.exe"
+              python3 - "$ARTIFACT_BASE" "$version" <<'PY'
+          import sys, zipfile
+          base, version = sys.argv[1], sys.argv[2]
+          exe_name = f"{base}.exe"
+          zip_path = f"dist/{base}-{version}.zip"
+          with zipfile.ZipFile(zip_path, "w", compression=zipfile.ZIP_DEFLATED, compresslevel=9) as zf:
+              zf.write(f"dist/{exe_name}", arcname=exe_name)
+          PY
+              rm -f "dist/${ARTIFACT_BASE}.exe"
+            else
+              cp "$bin" "dist/${ARTIFACT_BASE}"
+              (
+                cd dist
+                gzip -9 "${ARTIFACT_BASE}"
+                mv "${ARTIFACT_BASE}.gz" "${ARTIFACT_BASE}-${version}.gz"
+                test "$(gzip -lN "${ARTIFACT_BASE}-${version}.gz" | awk 'NR == 2 { print $4 }')" = "${ARTIFACT_BASE}"
+              )
+            fi
+            if [ -n "${IPK_ARCH:-}" ]; then
+              bash packaging/openwrt/build-ipk.sh "$bin" "$version" "$IPK_ARCH" "dist/${IPK_PKG}_${version}_${IPK_ARCH}.ipk" "$IPK_PKG"
+            fi
+          BUILD
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.artifact }}
+          path: dist/*
+          if-no-files-found: error
+
+  publish:
+    name: publish nightly prerelease
+    needs: build
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    env:
+      GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+      TAG: Prerelease-Alpha
+      NIGHTLY_RETENTION: "14"
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          ref: ${{ inputs.ref }}
+
+      - uses: actions/download-artifact@v4
+        with:
+          path: dist
+          merge-multiple: true
+
+      - name: Prepare version metadata and checksums
+        run: |
+          set -euo pipefail
+          version=$(awk '/^pub static VERSION: &str = /{ sub(/^[^"]*"/, ""); sub(/".*/, ""); print; exit }' crates/constant/src/version.rs)
+          test -n "$version"
+          printf "%s\n" "$version" > dist/version.txt
+          printf "%s\n" "$version" > dist/version-vvt.txt
+          cp packaging/openwrt/install.sh dist/install-openwrt.sh
+          chmod 0755 dist/install-openwrt.sh
+          (
+            cd dist
+            sha256sum murmur-* *.ipk install-openwrt.sh version.txt version-vvt.txt | awk '!seen[$2]++' > SHA256SUMS
+          )
+          ls -lh dist/
+
+      - name: Update Prerelease-Alpha release
+        run: |
+          set -euo pipefail
+          version=$(cat dist/version.txt)
+          commit=$(git rev-parse --short=12 HEAD)
+          built_at=$(date -u +"%Y-%m-%d %H:%M UTC")
+          notes=$(printf "Automated pre-1.0 nightly router builds from commit \`%s\` (%s).\n\nVersion: \`%s\`\nProfile: \`compact\` (\`router\` and \`router-vvt\`)\n" "$commit" "$built_at" "$version")
+
+          if gh release view "$TAG" >/dev/null 2>&1; then
+            gh release edit "$TAG" \
+              --prerelease \
+              --title "Murmur ${version} nightly (${commit})" \
+              --notes "$notes"
+          else
+            gh release create "$TAG" \
+              --prerelease \
+              --target "$(git rev-parse HEAD)" \
+              --title "Murmur ${version} nightly (${commit})" \
+              --notes "$notes"
+          fi
+
+          gh release upload "$TAG" \
+            dist/murmur-*.gz \
+            dist/*.ipk \
+            dist/install-openwrt.sh \
+            dist/version.txt \
+            dist/version-vvt.txt \
+            dist/SHA256SUMS \
+            --clobber
+
+      - name: Publish dated nightly release
+        run: |
+          set -euo pipefail
+          version=$(cat dist/version.txt)
+          commit=$(git rev-parse --short=12 HEAD)
+          day=$(date -u +%Y-%m-%d)
+          nightly="nightly-$(date -u +%Y%m%d)"
+          notes=$(printf "Nightly router builds from commit \`%s\` (%s).\n\nVersion: \`%s\`\nProfile: \`compact\`, \`router\` and \`router-vvt\` (including the soft-float MIPS VVT asset)\nRolling channel: \`Prerelease-Alpha\`\n" "$commit" "$day" "$version")
+
+          if gh release view "$nightly" >/dev/null 2>&1; then
+            gh release edit "$nightly" \
+              --prerelease \
+              --title "Murmur ${version} nightly ${day} (${commit})" \
+              --notes "$notes"
+          else
+            gh release create "$nightly" \
+              --prerelease \
+              --target "$(git rev-parse HEAD)" \
+              --title "Murmur ${version} nightly ${day} (${commit})" \
+              --notes "$notes"
+          fi
+
+          gh release upload "$nightly" \
+            dist/murmur-*.gz \
+            dist/*.ipk \
+            dist/install-openwrt.sh \
+            dist/version.txt \
+            dist/version-vvt.txt \
+            dist/SHA256SUMS \
+            --clobber
+
+      - name: Prune dated nightlies past retention
+        run: |
+          set -euo pipefail
+          gh release list --limit 200 --json tagName \
+            --jq '[.[] | select(.tagName | startswith("nightly-"))] | sort_by(.tagName) | reverse | .[].tagName' \
+            > "${RUNNER_TEMP}/nightlies.txt"
+          total=$(wc -l < "${RUNNER_TEMP}/nightlies.txt")
+          echo "keeping ${NIGHTLY_RETENTION} of ${total} dated nightly releases"
+          if [ "$total" -gt "$NIGHTLY_RETENTION" ]; then
+            tail -n "+$((NIGHTLY_RETENTION + 1))" "${RUNNER_TEMP}/nightlies.txt" | while read -r old; do
+              echo "deleting ${old}"
+              gh release delete "$old" --yes --cleanup-tag
+            done
+          fi

@@ -1,0 +1,26 @@
+[package]
+name = "murmur-component-ech"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[lib]
+doctest = false
+
+[dependencies]
+anyhow.workspace = true
+base64.workspace = true
+futures.workspace = true
+notify.workspace = true
+parking_lot.workspace = true
+thiserror.workspace = true
+tokio-util.workspace = true
+x25519-dalek.workspace = true
+murmur-component-tls = { path = "../component-tls" }
+murmur-constant = { path = "../constant" }
+
+
+[lints]
+workspace = true
