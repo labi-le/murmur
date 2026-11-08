@@ -190,7 +190,7 @@ impl NetlinkConn {
     }
 }
 
-#[allow(unsafe_code)]
+#[expect(unsafe_code, reason = "`bind` takes a `sockaddr_nl`, which rustix cannot construct")]
 fn open_netlink_socket(protocol: i32) -> io::Result<File> {
     // The third argument of `socket(2)` here is a netlink protocol such as `NETLINK_INET_DIAG`,
     // and rustix wants it as a non-zero number rather than an `i32`.
