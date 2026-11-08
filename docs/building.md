@@ -166,8 +166,9 @@ set. `-v` reports the effective protocol set and the checkout it was built from 
 MIPS32 builds only the two reduced profiles, never the default feature set: the engines need
 64-bit atomics and MIPS32 has none. `geiserx_ts_magicsock` imports `AtomicU64`, which does not
 exist there, and `wasmtime`'s cranelift fails separately (`BuiltinFunctions::new_epoch` is
-absent from the 32-bit build). Neither is repairable from this tree, so enabling
-`extra-protocols` for the target fails inside those dependencies. The installer's
+absent from the 32-bit build); neither is repairable from this tree. It is the engines, not the
+protocol list, that the target cannot host — `router` already carries `extra-protocols` and
+builds fine, while `default` adds `easytier` and `tailscale`. The installer's
 `MURMUR_VARIANT=full` on `mipsel` selects the non-VVT asset, which is the `router` profile, not
 this unreduced set.
 Full builds use `version.txt` and the normal release assets. Reduced
