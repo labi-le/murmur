@@ -29,6 +29,7 @@ pub mod cmd;
 pub mod contextutils;
 pub mod deque;
 pub mod errors;
+pub mod fd;
 pub mod lru;
 pub mod murmur3;
 pub mod net;

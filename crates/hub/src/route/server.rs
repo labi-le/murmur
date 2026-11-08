@@ -622,13 +622,23 @@ async fn finish_unmatched(req: Req) -> Response<RespBody> {
     external::add_external_routers(req).await.unwrap_or_else(not_found)
 }
 
-/// The `/debug` subrouter: `/gc` is handled ahead of the pprof mount, so it is the one route
-/// under `/debug` without that mount's no-cache headers.
+/// The `/debug` subrouter: `/gc` and `/fds` are handled ahead of the pprof mount, so they are the
+/// routes under `/debug` without that mount's no-cache headers.
 async fn debug_route(req: Req, rest: &str) -> Response<RespBody> {
     if rest == "/gc" {
         return if req.method() == Method::PUT { status_only(StatusCode::OK) } else { method_not_allowed(&["PUT"]) };
     }
+    if rest == "/fds" {
+        return if req.method() == Method::GET { descriptor_status() } else { method_not_allowed(&["GET"]) };
+    }
     super::pprof::route(req, rest).await
+}
+
+/// The descriptor budget the kernel reports: open descriptors against the soft and hard limits.
+/// A missing field means this target does not expose it, which is not the same as zero.
+fn descriptor_status() -> Response<RespBody> {
+    let status = murmur_common::fd::FdStatus::read();
+    json_response(StatusCode::OK, &serde_json::json!({"open": status.open, "soft": status.soft, "hard": status.hard}))
 }
 
 const MIME_TYPES: &[(&str, &str)] = &[
