@@ -15,6 +15,7 @@ hex.workspace = true
 libc.workspace = true
 parking_lot.workspace = true
 serde.workspace = true
+rustix.workspace = true
 thiserror.workspace = true
 murmur-common = { path = "../common" }
 murmur-constant = { path = "../constant" }

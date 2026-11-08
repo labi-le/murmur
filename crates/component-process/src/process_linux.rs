@@ -2,7 +2,7 @@ use std::fs::{self, File};
 use std::io::{self, BufRead, BufReader, Read, Write};
 use std::mem::{offset_of, size_of};
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
-use std::os::fd::FromRawFd;
+use std::os::fd::AsRawFd;
 use std::os::unix::ffi::OsStrExt;
 use std::os::unix::fs::MetadataExt;
 use std::path::Path;
@@ -190,14 +190,18 @@ impl NetlinkConn {
     }
 }
 
-#[allow(unsafe_code)]
-fn open_netlink_socket(family: i32) -> io::Result<File> {
-    // SAFETY: `socket(2)` is called with a valid family, socket type and protocol; the returned
-    // descriptor is checked before anything else uses it.
-    let fd = unsafe { libc::socket(libc::AF_NETLINK, libc::SOCK_RAW | libc::SOCK_CLOEXEC, family) };
-    if fd < 0 {
-        return Err(io::Error::last_os_error());
-    }
+#[expect(unsafe_code, reason = "`bind` takes a `sockaddr_nl`, which rustix cannot construct")]
+fn open_netlink_socket(protocol: i32) -> io::Result<File> {
+    // The third argument of `socket(2)` here is a netlink protocol such as `NETLINK_INET_DIAG`,
+    // and rustix wants it as a non-zero number rather than an `i32`.
+    let protocol = std::num::NonZeroU32::new(u32::try_from(protocol).unwrap_or(0))
+        .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "a netlink protocol is non-zero"))?;
+    let fd = rustix::net::socket_with(
+        rustix::net::AddressFamily::NETLINK,
+        rustix::net::SocketType::RAW,
+        rustix::net::SocketFlags::CLOEXEC,
+        Some(rustix::net::Protocol::from_raw(protocol)),
+    )?;
 
     // SAFETY: `addr` is zeroed and fully initialised before `bind(2)` reads it; a port id of 0 asks
     // the kernel to assign one, as a netlink dial does.
@@ -215,17 +219,13 @@ fn open_netlink_socket(family: i32) -> io::Result<File> {
             reason = "the sockaddr length field is 32 bits by definition and the address is 12 bytes"
         )]
         let addr_len = size_of::<libc::sockaddr_nl>() as libc::socklen_t;
-        libc::bind(fd, std::ptr::addr_of!(addr).cast(), addr_len)
+        libc::bind(fd.as_raw_fd(), std::ptr::addr_of!(addr).cast(), addr_len)
     };
     if ret < 0 {
-        let err = io::Error::last_os_error();
-        // SAFETY: `fd` is the live descriptor created above and nothing else owns it yet.
-        unsafe { libc::close(fd) };
-        return Err(err);
+        return Err(io::Error::last_os_error());
     }
 
-    // SAFETY: `fd` is a live descriptor that nothing else owns.
-    Ok(unsafe { File::from_raw_fd(fd) })
+    Ok(File::from(fd))
 }
 
 pub(crate) fn find_process_name(network: &str, ip: Option<IpAddr>, src_port: i32) -> anyhow::Result<(u32, String)> {

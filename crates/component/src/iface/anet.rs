@@ -6,7 +6,7 @@
 use std::fmt;
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
 #[cfg(any(target_os = "linux", target_os = "android", target_os = "macos"))]
-use std::os::fd::{AsFd, AsRawFd, BorrowedFd, FromRawFd, OwnedFd};
+use std::os::fd::{AsFd, AsRawFd, BorrowedFd, OwnedFd};
 
 use ipnet::IpNet;
 
@@ -300,16 +300,14 @@ const IFF_RUNNING: u32 = 0x40;
 const IFF_MULTICAST: u32 = 0x1000;
 
 #[cfg(any(target_os = "linux", target_os = "android"))]
-#[expect(unsafe_code, reason = "`socket` is a raw syscall with no safe wrapper in std")]
 fn ioctl_socket() -> anyhow::Result<OwnedFd> {
-    // SAFETY: a plain socket(2) call, no pointers handed over.
-    let fd = unsafe { libc::socket(libc::AF_INET, libc::SOCK_DGRAM | libc::SOCK_CLOEXEC, 0) };
-    if fd < 0 {
-        return Err(last_os_error());
-    }
-    // SAFETY: `fd` is a fresh descriptor owned by this function and closed exactly once by the
-    // returned value.
-    Ok(unsafe { OwnedFd::from_raw_fd(fd) })
+    Ok(rustix::net::socket_with(
+        rustix::net::AddressFamily::INET,
+        rustix::net::SocketType::DGRAM,
+        rustix::net::SocketFlags::CLOEXEC,
+        None,
+    )
+    .map_err(std::io::Error::from)?)
 }
 
 #[cfg(any(target_os = "linux", target_os = "android"))]
@@ -363,21 +361,15 @@ const IFF_RUNNING_MACOS: u32 = 0x40;
 const IFF_MULTICAST_MACOS: u32 = 0x8000;
 
 #[cfg(target_os = "macos")]
-#[expect(unsafe_code, reason = "`socket` and `fcntl` are raw syscalls with no safe wrapper in std")]
 fn ioctl_socket_macos() -> anyhow::Result<OwnedFd> {
-    // SAFETY: a plain socket(2) call, no pointers handed over.
-    let fd = unsafe { libc::socket(libc::AF_INET, libc::SOCK_DGRAM, 0) };
-    if fd < 0 {
-        return Err(last_os_error());
-    }
-    // SAFETY: `fd` is a fresh descriptor owned by this function and closed exactly once by `fd`.
-    let fd = unsafe { OwnedFd::from_raw_fd(fd) };
-    // SAFETY: `fcntl` only reads the descriptor it is handed; a failure drops `fd` on return.
-    let rc = unsafe { libc::fcntl(fd.as_raw_fd(), libc::F_SETFD, libc::FD_CLOEXEC) };
-    if rc < 0 {
-        return Err(last_os_error());
-    }
-    Ok(fd)
+    // Darwin has no `SOCK_CLOEXEC`; `socket_with` sets the flag with `fcntl` there.
+    Ok(rustix::net::socket_with(
+        rustix::net::AddressFamily::INET,
+        rustix::net::SocketType::DGRAM,
+        rustix::net::SocketFlags::CLOEXEC,
+        None,
+    )
+    .map_err(std::io::Error::from)?)
 }
 
 #[cfg(target_os = "macos")]

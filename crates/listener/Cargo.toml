@@ -36,6 +36,7 @@ quinn.workspace = true
 rand.workspace = true
 regex.workspace = true
 serde.workspace = true
+rustix.workspace = true
 serde_json.workspace = true
 yaml_serde.workspace = true
 sha2.workspace = true
