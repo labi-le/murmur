@@ -7,7 +7,7 @@
 
 use std::io;
 use std::net::IpAddr;
-use std::os::fd::RawFd;
+use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
 
 use anyhow::{Context, Result};
 use ipnet::IpNet;
@@ -174,7 +174,8 @@ pub fn del_route(dst: &IpNet, index: u32) -> Result<()> {
 /// A bound `NETLINK_ROUTE` socket. Binding is what makes the kernel route the acks back here, and
 /// dropping the value is what releases the port.
 struct Socket {
-    fd: RawFd,
+    /// Owns the descriptor: dropping the value closes the port as well as the socket.
+    fd: OwnedFd,
     seq: u32,
 }
 
@@ -199,7 +200,14 @@ impl Socket {
             let mut kernel: libc::sockaddr_nl = std::mem::zeroed();
             kernel.nl_family = AF_NETLINK as libc::c_ushort;
             // Port zero addresses the kernel, not the userspace port assigned by bind.
-            libc::sendto(self.fd, bytes.as_ptr().cast(), len, 0, (&raw const kernel).cast::<libc::sockaddr>(), addr_len)
+            libc::sendto(
+                self.fd.as_raw_fd(),
+                bytes.as_ptr().cast(),
+                len,
+                0,
+                (&raw const kernel).cast::<libc::sockaddr>(),
+                addr_len,
+            )
         };
         if sent < 0 {
             return Err(io::Error::last_os_error()).with_context(|| format!("send {}", message.name()));
@@ -212,7 +220,7 @@ impl Socket {
         let mut buf = vec![0u8; RECV_BUFFER_LEN];
         loop {
             // Safety: `buf` is a live allocation of the length handed to the same call.
-            let len = unsafe { libc::recv(self.fd, buf.as_mut_ptr().cast(), buf.len(), 0) };
+            let len = unsafe { libc::recv(self.fd.as_raw_fd(), buf.as_mut_ptr().cast(), buf.len(), 0) };
             if len < NLMSG_HDR_LEN.cast_signed() {
                 return Err(io::Error::from(io::ErrorKind::InvalidData));
             }
@@ -227,20 +235,12 @@ impl Socket {
     }
 }
 
-impl Drop for Socket {
-    #[expect(unsafe_code, reason = "closes the descriptor this value owns")]
-    fn drop(&mut self) {
-        // Safety: `fd` is owned by this value and closed exactly once, here.
-        unsafe { libc::close(self.fd) };
-    }
-}
-
 #[expect(unsafe_code, reason = "libc::socket/bind on live locals")]
 #[expect(
     clippy::cast_possible_truncation,
     reason = "AF_NETLINK is 16, which fits the 16-bit nl_family field, and sockaddr_nl is 12 bytes, far below the 32-bit socklen_t bound"
 )]
-fn open_socket() -> Result<RawFd> {
+fn open_socket() -> Result<OwnedFd> {
     // Safety: every pointer below points at a live local of the stated type and length, the file
     // descriptor is checked before use, and `fd` is closed on every path that does not return it.
     unsafe {
@@ -248,14 +248,15 @@ fn open_socket() -> Result<RawFd> {
         if fd < 0 {
             return Err(io::Error::last_os_error()).context("socket(AF_NETLINK)");
         }
+        // SAFETY: `fd` is the descriptor just created above; ownership moves into the value, which
+        // closes it on every path below that does not return it.
+        let fd = OwnedFd::from_raw_fd(fd);
         let mut bind_addr: libc::sockaddr_nl = std::mem::zeroed();
         bind_addr.nl_family = AF_NETLINK as libc::c_ushort;
         // Binding port zero lets the kernel assign the return address for ACKs.
         let addr_len = size_of::<libc::sockaddr_nl>() as libc::socklen_t;
-        if libc::bind(fd, (&raw const bind_addr).cast(), addr_len) < 0 {
-            let err = io::Error::last_os_error();
-            libc::close(fd);
-            return Err(err).context("bind(AF_NETLINK)");
+        if libc::bind(fd.as_raw_fd(), (&raw const bind_addr).cast(), addr_len) < 0 {
+            return Err(io::Error::last_os_error()).context("bind(AF_NETLINK)");
         }
         Ok(fd)
     }
