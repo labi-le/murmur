@@ -1157,9 +1157,11 @@ mod iptables {
 
     impl FileLock {
         fn new() -> io::Result<Self> {
+            // `CLOEXEC` matters here: the lock is held across the `iptables` child process, and a
+            // descriptor the child inherited would keep the lock alive past this process.
             let fd = rustix::fs::open(
                 XTABLES_LOCK_FILE_PATH,
-                rustix::fs::OFlags::CREATE,
+                rustix::fs::OFlags::CREATE | rustix::fs::OFlags::CLOEXEC,
                 rustix::fs::Mode::RUSR | rustix::fs::Mode::WUSR,
             )?;
             Ok(Self { fd: Some(fd) })
