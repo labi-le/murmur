@@ -9,7 +9,7 @@
 
 use std::io;
 use std::net::IpAddr;
-use std::os::fd::{AsRawFd, FromRawFd, OwnedFd, RawFd};
+use std::os::fd::{AsFd, AsRawFd, BorrowedFd, FromRawFd, OwnedFd};
 use std::sync::Arc;
 
 use anyhow::{Context, Result};
@@ -38,13 +38,13 @@ pub(super) fn open(device: &str, file_descriptor: i32, addresses: &TunAddresses)
     let (device, mut cleanup) = if file_descriptor == 0 { create(device)? } else { adopt(file_descriptor)? };
     if file_descriptor == 0 {
         let socket = control_socket()?;
-        set_mtu(socket.as_raw_fd(), device.name(), addresses.mtu)?;
+        set_mtu(socket.as_fd(), device.name(), addresses.mtu)?;
         for prefix in &addresses.addresses {
             super::super::netlink_linux::add_address(device.index(), &prefix.addr(), prefix.prefix_len())
                 .with_context(|| format!("add address {prefix} to {}", device.name()))?;
             cleanup.record_address(device.index(), prefix.addr(), prefix.prefix_len());
         }
-        set_up(socket.as_raw_fd(), device.name())?;
+        set_up(socket.as_fd(), device.name())?;
     }
     Ok((Arc::new(device), cleanup))
 }
@@ -65,7 +65,7 @@ impl Inner {
     pub(super) async fn read(&self, buf: &mut [u8]) -> io::Result<usize> {
         loop {
             let mut guard = self.fd.readable().await?;
-            match guard.try_io(|inner| read_once(inner.get_ref().as_raw_fd(), buf)) {
+            match guard.try_io(|inner| read_once(inner.get_ref().as_fd(), buf)) {
                 Ok(result) => return result,
                 Err(_would_block) => {}
             }
@@ -75,7 +75,7 @@ impl Inner {
     pub(super) async fn write(&self, packet: &[u8]) -> io::Result<()> {
         loop {
             let mut guard = self.fd.writable().await?;
-            match guard.try_io(|inner| write_once(inner.get_ref().as_raw_fd(), packet)) {
+            match guard.try_io(|inner| write_once(inner.get_ref().as_fd(), packet)) {
                 Ok(result) => return result,
                 Err(_would_block) => {}
             }
@@ -104,7 +104,7 @@ fn create(requested: &str) -> Result<(Device, Cleanup)> {
             return Err(io::Error::last_os_error()).context("open /dev/net/tun");
         }
         let owned = OwnedFd::from_raw_fd(raw);
-        let name = tun_set_iff(owned.as_raw_fd(), requested)?;
+        let name = tun_set_iff(owned.as_fd(), requested)?;
         let index = ifindex(&name)?;
         from_file(name, index, std::fs::File::from(owned))
     }
@@ -122,7 +122,7 @@ fn adopt(file_descriptor: i32) -> Result<(Device, Cleanup)> {
             return Err(io::Error::last_os_error()).context("dup file-descriptor");
         }
         let owned = OwnedFd::from_raw_fd(dup);
-        let name = tun_name(owned.as_raw_fd())?;
+        let name = tun_name(owned.as_fd())?;
         let index = ifindex(&name)?;
         from_file(name, index, std::fs::File::from(owned))
     }
@@ -144,10 +144,10 @@ fn set_nonblocking(file: &std::fs::File) -> io::Result<()> {
 }
 
 #[expect(unsafe_code, reason = "libc::read into the caller's slice, bounded by its length")]
-fn read_once(fd: RawFd, buf: &mut [u8]) -> io::Result<usize> {
+fn read_once(fd: BorrowedFd<'_>, buf: &mut [u8]) -> io::Result<usize> {
     // Safety: `buf` is a live slice of the length handed to the same call, and the kernel writes
     // at most that many bytes into it.
-    let n = unsafe { libc::read(fd, buf.as_mut_ptr().cast(), buf.len()) };
+    let n = unsafe { libc::read(fd.as_raw_fd(), buf.as_mut_ptr().cast(), buf.len()) };
     if n < 0 {
         Err(io::Error::last_os_error())
     } else {
@@ -156,9 +156,9 @@ fn read_once(fd: RawFd, buf: &mut [u8]) -> io::Result<usize> {
 }
 
 #[expect(unsafe_code, reason = "libc::write from the caller's slice, bounded by its length")]
-fn write_once(fd: RawFd, packet: &[u8]) -> io::Result<()> {
+fn write_once(fd: BorrowedFd<'_>, packet: &[u8]) -> io::Result<()> {
     // Safety: `packet` is a live slice of the length handed to the same call.
-    let n = unsafe { libc::write(fd, packet.as_ptr().cast(), packet.len()) };
+    let n = unsafe { libc::write(fd.as_raw_fd(), packet.as_ptr().cast(), packet.len()) };
     if n < 0 {
         return Err(io::Error::last_os_error());
     }
@@ -171,14 +171,14 @@ fn write_once(fd: RawFd, packet: &[u8]) -> io::Result<()> {
 }
 
 #[expect(unsafe_code, reason = "TUNSETIFF on a live, zeroed ifreq local")]
-fn tun_set_iff(fd: RawFd, requested: &str) -> io::Result<String> {
+fn tun_set_iff(fd: BorrowedFd<'_>, requested: &str) -> io::Result<String> {
     // Safety: the `ifreq` is a live local; the kernel reads `ifr_name` and `ifr_flags` and writes
     // the interface it actually created back into `ifr_name`, still inside it.
     unsafe {
         let mut ifr: libc::ifreq = std::mem::zeroed();
         write_ifreq_name(&mut ifr, requested)?;
         ifr.ifr_ifru.ifru_flags = IFF_TUN | IFF_NO_PI;
-        if libc::ioctl(fd, libc::TUNSETIFF, &raw mut ifr) < 0 {
+        if libc::ioctl(fd.as_raw_fd(), libc::TUNSETIFF, &raw mut ifr) < 0 {
             return Err(io::Error::last_os_error());
         }
         read_ifreq_name(&ifr)
@@ -186,11 +186,11 @@ fn tun_set_iff(fd: RawFd, requested: &str) -> io::Result<String> {
 }
 
 #[expect(unsafe_code, reason = "TUNGETIFF on a live, zeroed ifreq local")]
-fn tun_name(fd: RawFd) -> io::Result<String> {
+fn tun_name(fd: BorrowedFd<'_>) -> io::Result<String> {
     // Safety: the kernel writes the interface name into `ifr_name` of a live local `ifreq`.
     unsafe {
         let mut ifr: libc::ifreq = std::mem::zeroed();
-        if libc::ioctl(fd, libc::TUNGETIFF, &raw mut ifr) < 0 {
+        if libc::ioctl(fd.as_raw_fd(), libc::TUNGETIFF, &raw mut ifr) < 0 {
             return Err(io::Error::last_os_error());
         }
         read_ifreq_name(&ifr)
@@ -222,14 +222,14 @@ fn control_socket() -> Result<std::fs::File> {
 }
 
 #[expect(unsafe_code, reason = "SIOCSIFMTU on a live ifreq local")]
-fn set_mtu(socket: RawFd, name: &str, mtu: u32) -> io::Result<()> {
+fn set_mtu(socket: BorrowedFd<'_>, name: &str, mtu: u32) -> io::Result<()> {
     // Safety: the `ifreq` is a live local whose name is NUL-terminated within `IF_NAMESIZE`, and
     // `ifr_mtu` is written before the ioctl reads it.
     unsafe {
         let mut ifr: libc::ifreq = std::mem::zeroed();
         write_ifreq_name(&mut ifr, name)?;
         ifr.ifr_ifru.ifru_mtu = mtu.cast_signed();
-        if libc::ioctl(socket, SIOCSIFMTU, &raw mut ifr) < 0 {
+        if libc::ioctl(socket.as_raw_fd(), SIOCSIFMTU, &raw mut ifr) < 0 {
             return Err(io::Error::last_os_error());
         }
         Ok(())
@@ -237,17 +237,17 @@ fn set_mtu(socket: RawFd, name: &str, mtu: u32) -> io::Result<()> {
 }
 
 #[expect(unsafe_code, reason = "SIOCGIFFLAGS/SIOCSIFFLAGS on a live ifreq local")]
-fn set_up(socket: RawFd, name: &str) -> io::Result<()> {
+fn set_up(socket: BorrowedFd<'_>, name: &str) -> io::Result<()> {
     // Safety: as `set_mtu`, reading the current flags back first so the bits this crate does not
     // manage survive the update.
     unsafe {
         let mut ifr: libc::ifreq = std::mem::zeroed();
         write_ifreq_name(&mut ifr, name)?;
-        if libc::ioctl(socket, SIOCGIFFLAGS, &raw mut ifr) < 0 {
+        if libc::ioctl(socket.as_raw_fd(), SIOCGIFFLAGS, &raw mut ifr) < 0 {
             return Err(io::Error::last_os_error());
         }
         ifr.ifr_ifru.ifru_flags |= IFF_UP | IFF_RUNNING;
-        if libc::ioctl(socket, SIOCSIFFLAGS, &raw mut ifr) < 0 {
+        if libc::ioctl(socket.as_raw_fd(), SIOCSIFFLAGS, &raw mut ifr) < 0 {
             return Err(io::Error::last_os_error());
         }
         Ok(())

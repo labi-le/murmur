@@ -50,7 +50,7 @@ use murmur_dns::system as dns_system;
 use murmur_hub::executor::executor as hub_executor;
 use murmur_hub::hub;
 use murmur_hub::watch as hub_watch;
-use murmur_log::{debugln, errorln, fatalln, infoln};
+use murmur_log::{debugln, errorln, fatalln, infoln, warnln};
 use murmur_rules::provider::mrs_converter;
 
 #[derive(Clone)]
@@ -639,6 +639,38 @@ fn watch_requested(flags: &[FlagDef]) -> Result<bool> {
     Ok(true)
 }
 
+/// Warns when the open-descriptor count crosses three quarters of the soft limit.
+///
+/// A proxy leaks descriptors by keeping a socket's owner alive rather than by forgetting a close, so
+/// the only cheap signal before `EMFILE` is the count itself. The warning is emitted on the crossing
+/// and cleared when the count falls back, so a steady growth logs once instead of every tick.
+fn spawn_descriptor_watchdog() -> tokio::task::JoinHandle<()> {
+    tokio::spawn(async move {
+        let mut tick = tokio::time::interval(std::time::Duration::from_secs(30));
+        tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+        let mut warned = false;
+        loop {
+            tick.tick().await;
+            let status = murmur_common::fd::FdStatus::read();
+            let open = status.open.unwrap_or(0);
+            let soft = status.soft.unwrap_or(0);
+            match (status.near_limit(), warned) {
+                (true, false) => {
+                    warnln!(
+                        "open descriptors {open} of {soft}: the next dials fail with EMFILE once the limit is reached"
+                    );
+                    warned = true;
+                }
+                (false, true) => {
+                    infoln!("open descriptors back to {open} of {soft}");
+                    warned = false;
+                }
+                _ => {}
+            }
+        }
+    })
+}
+
 #[tokio::main]
 async fn main() -> Result<()> {
     murmur_log::init();
@@ -685,6 +717,12 @@ async fn main() -> Result<()> {
         test_configuration(&config_bytes).await;
         return Ok(());
     }
+
+    match murmur_common::fd::raise_nofile_limit() {
+        Ok((soft, hard)) => infoln!("open-file limit: {soft} soft of {hard} hard"),
+        Err(err) => warnln!("open-file limit could not be raised: {err}"),
+    }
+    let _descriptor_watchdog = spawn_descriptor_watchdog();
 
     let options = hub_options(&flags);
 

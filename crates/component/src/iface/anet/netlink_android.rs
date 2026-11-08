@@ -1,8 +1,9 @@
 use std::mem::size_of;
+use std::os::fd::{AsFd, AsRawFd, BorrowedFd, FromRawFd, OwnedFd};
 
 use anyhow::{anyhow, Result};
 
-use super::{einval, FdGuard};
+use super::einval;
 
 /// A netlink message header.
 #[derive(Clone, Copy, Debug, Default)]
@@ -127,24 +128,25 @@ fn new_netlink_route_request(proto: i32, seq: i32, family: i32) -> Vec<u8> {
 }
 
 #[expect(unsafe_code, reason = "`socket` is a raw syscall with no safe wrapper in std")]
-fn open_netlink_socket() -> Result<i32> {
+fn open_netlink_socket() -> Result<OwnedFd> {
     // SAFETY: a plain socket(2) call, no pointers handed over.
     let s = unsafe { libc::socket(libc::AF_NETLINK, libc::SOCK_RAW | libc::SOCK_CLOEXEC, NETLINK_ROUTE) };
     if s < 0 {
         return Err(last_os_error());
     }
-    Ok(s)
+    // SAFETY: `s` is a descriptor this call has just created and nothing else owns it.
+    Ok(unsafe { OwnedFd::from_raw_fd(s) })
 }
 
 #[expect(
     unsafe_code,
     reason = "`sendto` is a raw syscall; the SAFETY comment below states the buffer and address invariants"
 )]
-fn send_to(s: i32, buf: &[u8], sa: &SockaddrNl) -> Result<usize> {
+fn send_to(s: BorrowedFd<'_>, buf: &[u8], sa: &SockaddrNl) -> Result<usize> {
     // SAFETY: `buf` and `sa` outlive the call and are described by the pointers and length passed.
     let n = unsafe {
         libc::sendto(
-            s,
+            s.as_raw_fd(),
             buf.as_ptr() as *const libc::c_void,
             buf.len(),
             0,
@@ -159,9 +161,9 @@ fn send_to(s: i32, buf: &[u8], sa: &SockaddrNl) -> Result<usize> {
 }
 
 #[expect(unsafe_code, reason = "`recv` is a raw syscall; the SAFETY comment below states the buffer invariant")]
-fn recv_into(s: i32, buf: &mut [u8]) -> Result<usize> {
+fn recv_into(s: BorrowedFd<'_>, buf: &mut [u8]) -> Result<usize> {
     // SAFETY: `buf` is exclusively borrowed for the duration of the call.
-    let n = unsafe { libc::recv(s, buf.as_mut_ptr() as *mut libc::c_void, buf.len(), 0) };
+    let n = unsafe { libc::recv(s.as_raw_fd(), buf.as_mut_ptr() as *mut libc::c_void, buf.len(), 0) };
     if n < 0 {
         return Err(last_os_error());
     }
@@ -172,11 +174,11 @@ fn recv_into(s: i32, buf: &mut [u8]) -> Result<usize> {
     unsafe_code,
     reason = "`getsockname` fills its result through an out-parameter, which safe Rust cannot express"
 )]
-fn sock_name(s: i32) -> Result<SockaddrNl> {
+fn sock_name(s: BorrowedFd<'_>) -> Result<SockaddrNl> {
     let mut sa = SockaddrNl::default();
     let mut len = size_of::<SockaddrNl>() as libc::socklen_t;
     // SAFETY: `sa` is a live `sockaddr_nl` of the size handed to getsockname.
-    let rc = unsafe { libc::getsockname(s, &mut sa as *mut SockaddrNl as *mut libc::sockaddr, &mut len) };
+    let rc = unsafe { libc::getsockname(s.as_raw_fd(), &mut sa as *mut SockaddrNl as *mut libc::sockaddr, &mut len) };
     if rc != 0 {
         return Err(last_os_error());
     }
@@ -187,18 +189,17 @@ fn sock_name(s: i32) -> Result<SockaddrNl> {
 /// facility information, states and parameters.
 pub fn netlink_rib(proto: i32, family: i32) -> Result<Vec<u8>> {
     let s = open_netlink_socket()?;
-    let _guard = FdGuard(s);
 
     let sa = SockaddrNl { family: libc::AF_NETLINK as u16, pad: 0, pid: 0, groups: 0 };
     let wb = new_netlink_route_request(proto, 1, family);
-    send_to(s, &wb, &sa)?;
+    send_to(s.as_fd(), &wb, &sa)?;
 
-    let lsa = sock_name(s)?;
+    let lsa = sock_name(s.as_fd())?;
     let mut tab: Vec<u8> = Vec::new();
     let page_size = page_size();
     let mut rb = vec![0u8; page_size];
     loop {
-        let nr = recv_into(s, &mut rb)?;
+        let nr = recv_into(s.as_fd(), &mut rb)?;
         if nr < NLMSG_HDRLEN {
             return Err(einval());
         }
