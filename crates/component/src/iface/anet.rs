@@ -5,6 +5,8 @@
 
 use std::fmt;
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
+#[cfg(any(target_os = "linux", target_os = "android", target_os = "macos"))]
+use std::os::fd::{AsFd, AsRawFd, BorrowedFd, FromRawFd, OwnedFd};
 
 use ipnet::IpNet;
 
@@ -268,21 +270,6 @@ fn last_os_error() -> anyhow::Error {
     anyhow::anyhow!(std::io::Error::last_os_error())
 }
 
-/// Closes the descriptor when dropped.
-#[cfg(any(target_os = "linux", target_os = "android", target_os = "macos"))]
-pub(crate) struct FdGuard(pub(crate) i32);
-
-#[cfg(any(target_os = "linux", target_os = "android", target_os = "macos"))]
-impl Drop for FdGuard {
-    #[expect(unsafe_code, reason = "`libc::close` on an owned descriptor has no safe wrapper in std")]
-    fn drop(&mut self) {
-        // SAFETY: the descriptor is owned by this guard and closed exactly once.
-        unsafe {
-            libc::close(self.0);
-        }
-    }
-}
-
 /// `IFNAMSIZ` for the name field, plus the 24-byte union the request struct is fixed at.
 #[cfg(any(target_os = "linux", target_os = "android"))]
 const IF_REQ_SIZE: usize = 40;
@@ -314,20 +301,23 @@ const IFF_MULTICAST: u32 = 0x1000;
 
 #[cfg(any(target_os = "linux", target_os = "android"))]
 #[expect(unsafe_code, reason = "`socket` is a raw syscall with no safe wrapper in std")]
-fn ioctl_socket() -> anyhow::Result<i32> {
+fn ioctl_socket() -> anyhow::Result<OwnedFd> {
     // SAFETY: a plain socket(2) call, no pointers handed over.
     let fd = unsafe { libc::socket(libc::AF_INET, libc::SOCK_DGRAM | libc::SOCK_CLOEXEC, 0) };
     if fd < 0 {
         return Err(last_os_error());
     }
-    Ok(fd)
+    // SAFETY: `fd` is a fresh descriptor owned by this function and closed exactly once by the
+    // returned value.
+    Ok(unsafe { OwnedFd::from_raw_fd(fd) })
 }
 
 #[cfg(any(target_os = "linux", target_os = "android"))]
 #[expect(unsafe_code, reason = "`ioctl` is a raw syscall; the SAFETY comment below states the buffer invariant")]
-fn ioctl(fd: i32, req: libc::Ioctl, arg: *mut u8) -> anyhow::Result<()> {
-    // SAFETY: `arg` points at the live `ifreq` buffer the caller owns for the call.
-    let rc = unsafe { libc::ioctl(fd, req, arg.cast::<libc::c_void>()) };
+fn ioctl(fd: BorrowedFd<'_>, req: libc::Ioctl, arg: *mut u8) -> anyhow::Result<()> {
+    // SAFETY: `arg` points at the live `ifreq` buffer the caller owns for the call, and `fd` is
+    // borrowed for its duration by `BorrowedFd`.
+    let rc = unsafe { libc::ioctl(fd.as_raw_fd(), req, arg.cast::<libc::c_void>()) };
     if rc != 0 {
         return Err(last_os_error());
     }
@@ -374,31 +364,27 @@ const IFF_MULTICAST_MACOS: u32 = 0x8000;
 
 #[cfg(target_os = "macos")]
 #[expect(unsafe_code, reason = "`socket` and `fcntl` are raw syscalls with no safe wrapper in std")]
-fn ioctl_socket_macos() -> anyhow::Result<i32> {
+fn ioctl_socket_macos() -> anyhow::Result<OwnedFd> {
     // SAFETY: a plain socket(2) call, no pointers handed over.
     let fd = unsafe { libc::socket(libc::AF_INET, libc::SOCK_DGRAM, 0) };
     if fd < 0 {
         return Err(last_os_error());
     }
-    // SAFETY: `fd` is the descriptor just created above and still owned by this function; a
-    // failed `fcntl` is reported and the descriptor closed by the caller's `FdGuard`.
-    let rc = unsafe { libc::fcntl(fd, libc::F_SETFD, libc::FD_CLOEXEC) };
+    // SAFETY: `fd` is a fresh descriptor owned by this function and closed exactly once by `fd`.
+    let fd = unsafe { OwnedFd::from_raw_fd(fd) };
+    // SAFETY: `fcntl` only reads the descriptor it is handed; a failure drops `fd` on return.
+    let rc = unsafe { libc::fcntl(fd.as_raw_fd(), libc::F_SETFD, libc::FD_CLOEXEC) };
     if rc < 0 {
-        let err = last_os_error();
-        // SAFETY: `fd` is still owned here; no `FdGuard` has been constructed yet.
-        unsafe {
-            libc::close(fd);
-        }
-        return Err(err);
+        return Err(last_os_error());
     }
     Ok(fd)
 }
 
 #[cfg(target_os = "macos")]
 #[expect(unsafe_code, reason = "`ioctl` is a raw syscall; the SAFETY comment below states the buffer invariant")]
-fn ioctl_macos(fd: i32, req: libc::c_ulong, arg: *mut u8) -> anyhow::Result<()> {
+fn ioctl_macos(fd: BorrowedFd<'_>, req: libc::c_ulong, arg: *mut u8) -> anyhow::Result<()> {
     // SAFETY: `arg` points at the live `ifreq` buffer the caller owns for the call.
-    let rc = unsafe { libc::ioctl(fd, req, arg.cast::<libc::c_void>()) };
+    let rc = unsafe { libc::ioctl(fd.as_raw_fd(), req, arg.cast::<libc::c_void>()) };
     if rc != 0 {
         return Err(last_os_error());
     }
@@ -409,11 +395,10 @@ fn ioctl_macos(fd: i32, req: libc::c_ulong, arg: *mut u8) -> anyhow::Result<()> 
 #[cfg(target_os = "android")]
 pub(crate) fn index_to_name(index: u32) -> anyhow::Result<String> {
     let fd = ioctl_socket()?;
-    let _guard = FdGuard(fd);
 
     let mut ifr = [0u8; IF_REQ_SIZE];
     ifr[IFNAMSIZ..IFNAMSIZ + 4].copy_from_slice(&index.to_ne_bytes());
-    ioctl(fd, SIOCGIFNAME, ifr.as_mut_ptr())?;
+    ioctl(fd.as_fd(), SIOCGIFNAME, ifr.as_mut_ptr())?;
 
     Ok(String::from_utf8_lossy(trim_nul(&ifr[..IFNAMSIZ])).into_owned())
 }
@@ -427,12 +412,11 @@ pub(crate) fn name_to_mtu(name: &str) -> anyhow::Result<i32> {
     }
 
     let fd = ioctl_socket()?;
-    let _guard = FdGuard(fd);
 
     let mut ifr = [0u8; IF_REQ_SIZE];
     let (name_field, _) = ifr.split_at_mut(name.len());
     name_field.copy_from_slice(name.as_bytes());
-    ioctl(fd, SIOCGIFMTU, ifr.as_mut_ptr())?;
+    ioctl(fd.as_fd(), SIOCGIFMTU, ifr.as_mut_ptr())?;
 
     Ok(i32::from_ne_bytes([ifr[IFNAMSIZ], ifr[IFNAMSIZ + 1], ifr[IFNAMSIZ + 2], ifr[IFNAMSIZ + 3]]))
 }
@@ -446,12 +430,11 @@ pub(crate) fn name_to_flags(name: &str) -> anyhow::Result<Flags> {
     }
 
     let fd = ioctl_socket()?;
-    let _guard = FdGuard(fd);
 
     let mut ifr = [0u8; IF_REQ_SIZE];
     let (name_field, _) = ifr.split_at_mut(name.len());
     name_field.copy_from_slice(name.as_bytes());
-    ioctl(fd, SIOCGIFFLAGS, ifr.as_mut_ptr())?;
+    ioctl(fd.as_fd(), SIOCGIFFLAGS, ifr.as_mut_ptr())?;
 
     Ok(link_flags(u32::from_ne_bytes([ifr[IFNAMSIZ], ifr[IFNAMSIZ + 1], ifr[IFNAMSIZ + 2], ifr[IFNAMSIZ + 3]])))
 }
@@ -466,12 +449,11 @@ pub(crate) fn name_to_hardware_addr(name: &str) -> anyhow::Result<HardwareAddr> 
     }
 
     let fd = ioctl_socket()?;
-    let _guard = FdGuard(fd);
 
     let mut ifr = [0u8; IF_REQ_SIZE];
     let (name_field, _) = ifr.split_at_mut(name.len());
     name_field.copy_from_slice(name.as_bytes());
-    ioctl(fd, SIOCGIFHWADDR, ifr.as_mut_ptr())?;
+    ioctl(fd.as_fd(), SIOCGIFHWADDR, ifr.as_mut_ptr())?;
 
     // only a non-zero address is kept, which is what a device with no link-layer
     // address (a WireGuard or loopback interface) reports here.
@@ -490,11 +472,10 @@ pub(crate) fn name_to_mtu(name: &str) -> anyhow::Result<i32> {
     }
 
     let fd = ioctl_socket_macos()?;
-    let _guard = FdGuard(fd);
 
     let mut ifr = [0u8; IF_REQ_SIZE_MACOS];
     ifr[..name.len()].copy_from_slice(name.as_bytes());
-    ioctl_macos(fd, SIOCGIFMTU_MACOS, ifr.as_mut_ptr())?;
+    ioctl_macos(fd.as_fd(), SIOCGIFMTU_MACOS, ifr.as_mut_ptr())?;
 
     Ok(i32::from_ne_bytes([ifr[IFNAMSIZ], ifr[IFNAMSIZ + 1], ifr[IFNAMSIZ + 2], ifr[IFNAMSIZ + 3]]))
 }
@@ -509,11 +490,10 @@ pub(crate) fn name_to_flags(name: &str) -> anyhow::Result<Flags> {
     }
 
     let fd = ioctl_socket_macos()?;
-    let _guard = FdGuard(fd);
 
     let mut ifr = [0u8; IF_REQ_SIZE_MACOS];
     ifr[..name.len()].copy_from_slice(name.as_bytes());
-    ioctl_macos(fd, SIOCGIFFLAGS_MACOS, ifr.as_mut_ptr())?;
+    ioctl_macos(fd.as_fd(), SIOCGIFFLAGS_MACOS, ifr.as_mut_ptr())?;
 
     Ok(link_flags_macos(u32::from_ne_bytes([ifr[IFNAMSIZ], ifr[IFNAMSIZ + 1], ifr[IFNAMSIZ + 2], ifr[IFNAMSIZ + 3]])))
 }
