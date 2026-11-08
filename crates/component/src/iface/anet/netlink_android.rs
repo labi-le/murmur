@@ -1,5 +1,5 @@
 use std::mem::size_of;
-use std::os::fd::{AsFd, AsRawFd, BorrowedFd, FromRawFd, OwnedFd};
+use std::os::fd::{AsFd, AsRawFd, BorrowedFd, OwnedFd};
 
 use anyhow::{anyhow, Result};
 
@@ -86,8 +86,6 @@ pub(crate) const RTM_DELROUTE: u16 = 25;
 pub(crate) const IFA_ADDRESS: u16 = 1;
 pub(crate) const IFA_LOCAL: u16 = 2;
 
-const NETLINK_ROUTE: i32 = 0;
-
 fn last_os_error() -> anyhow::Error {
     anyhow!(std::io::Error::last_os_error())
 }
@@ -127,15 +125,15 @@ fn new_netlink_route_request(proto: i32, seq: i32, family: i32) -> Vec<u8> {
     rr.to_wire_format()
 }
 
-#[expect(unsafe_code, reason = "`socket` is a raw syscall with no safe wrapper in std")]
 fn open_netlink_socket() -> Result<OwnedFd> {
-    // SAFETY: a plain socket(2) call, no pointers handed over.
-    let s = unsafe { libc::socket(libc::AF_NETLINK, libc::SOCK_RAW | libc::SOCK_CLOEXEC, NETLINK_ROUTE) };
-    if s < 0 {
-        return Err(last_os_error());
-    }
-    // SAFETY: `s` is a descriptor this call has just created and nothing else owns it.
-    Ok(unsafe { OwnedFd::from_raw_fd(s) })
+    // `NETLINK_ROUTE` is protocol zero, which `socket_with` selects by passing `None`.
+    Ok(rustix::net::socket_with(
+        rustix::net::AddressFamily::NETLINK,
+        rustix::net::SocketType::RAW,
+        rustix::net::SocketFlags::CLOEXEC,
+        None,
+    )
+    .map_err(std::io::Error::from)?)
 }
 
 #[expect(
@@ -220,15 +218,8 @@ pub fn netlink_rib(proto: i32, family: i32) -> Result<Vec<u8>> {
     }
 }
 
-#[expect(unsafe_code, reason = "`sysconf` has no safe wrapper in std")]
 fn page_size() -> usize {
-    // SAFETY: sysconf takes no pointers.
-    let n = unsafe { libc::sysconf(libc::_SC_PAGESIZE) };
-    if n <= 0 {
-        4096
-    } else {
-        n as usize
-    }
+    rustix::param::page_size()
 }
 
 /// Parses `b` as an array of netlink messages and returns the slice
