@@ -7,7 +7,7 @@
 
 use std::io;
 use std::net::IpAddr;
-use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
+use std::os::fd::{AsRawFd, OwnedFd};
 
 use anyhow::{Context, Result};
 use ipnet::IpNet;
@@ -15,7 +15,6 @@ use ipnet::IpNet;
 const AF_NETLINK: libc::c_int = 16;
 const AF_INET: u8 = 2;
 const AF_INET6: u8 = 10;
-const NETLINK_ROUTE: libc::c_int = 0;
 
 const NLMSG_ERROR: u16 = 2;
 
@@ -235,31 +234,34 @@ impl Socket {
     }
 }
 
-#[expect(unsafe_code, reason = "libc::socket/bind on live locals")]
+#[expect(unsafe_code, reason = "`bind` takes a `sockaddr_nl`, which rustix cannot construct")]
 #[expect(
     clippy::cast_possible_truncation,
     reason = "AF_NETLINK is 16, which fits the 16-bit nl_family field, and sockaddr_nl is 12 bytes, far below the 32-bit socklen_t bound"
 )]
 fn open_socket() -> Result<OwnedFd> {
-    // Safety: every pointer below points at a live local of the stated type and length, the file
-    // descriptor is checked before use, and `fd` is closed on every path that does not return it.
-    unsafe {
-        let fd = libc::socket(AF_NETLINK, libc::SOCK_RAW | libc::SOCK_CLOEXEC, NETLINK_ROUTE);
-        if fd < 0 {
-            return Err(io::Error::last_os_error()).context("socket(AF_NETLINK)");
-        }
-        // SAFETY: `fd` is the descriptor just created above; ownership moves into the value, which
-        // closes it on every path below that does not return it.
-        let fd = OwnedFd::from_raw_fd(fd);
+    // `NETLINK_ROUTE` is protocol zero, which `socket_with` selects by passing `None`.
+    let fd = rustix::net::socket_with(
+        rustix::net::AddressFamily::NETLINK,
+        rustix::net::SocketType::RAW,
+        rustix::net::SocketFlags::CLOEXEC,
+        None,
+    )
+    .map_err(io::Error::from)
+    .context("socket(AF_NETLINK)")?;
+    // Binding port zero lets the kernel assign the return address for ACKs.
+    let addr_len = size_of::<libc::sockaddr_nl>() as libc::socklen_t;
+    // SAFETY: `sockaddr_nl` is plain data, the all-zero value with only the family set is the
+    // documented "let the kernel assign the port" address, and `addr_len` states its size.
+    let bound = unsafe {
         let mut bind_addr: libc::sockaddr_nl = std::mem::zeroed();
         bind_addr.nl_family = AF_NETLINK as libc::c_ushort;
-        // Binding port zero lets the kernel assign the return address for ACKs.
-        let addr_len = size_of::<libc::sockaddr_nl>() as libc::socklen_t;
-        if libc::bind(fd.as_raw_fd(), (&raw const bind_addr).cast(), addr_len) < 0 {
-            return Err(io::Error::last_os_error()).context("bind(AF_NETLINK)");
-        }
-        Ok(fd)
+        libc::bind(fd.as_raw_fd(), (&raw const bind_addr).cast(), addr_len)
+    };
+    if bound < 0 {
+        return Err(io::Error::last_os_error()).context("bind(AF_NETLINK)");
     }
+    Ok(fd)
 }
 
 #[cfg(test)]

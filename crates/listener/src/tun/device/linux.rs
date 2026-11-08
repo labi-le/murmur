@@ -94,20 +94,17 @@ fn from_file(name: String, index: u32, file: std::fs::File) -> Result<(Device, C
     Ok((Device { name, index, inner: Inner { fd } }, Cleanup::default()))
 }
 
-#[expect(unsafe_code, reason = "libc::open, whose descriptor is adopted by an OwnedFd")]
 fn create(requested: &str) -> Result<(Device, Cleanup)> {
-    // Safety: `open` returns a descriptor owned here, recorded by `OwnedFd`; `TUNSETIFF` writes
-    // the negotiated name into a local `ifreq`.
-    unsafe {
-        let raw = libc::open(c"/dev/net/tun".as_ptr(), libc::O_RDWR | libc::O_CLOEXEC);
-        if raw < 0 {
-            return Err(io::Error::last_os_error()).context("open /dev/net/tun");
-        }
-        let owned = OwnedFd::from_raw_fd(raw);
-        let name = tun_set_iff(owned.as_fd(), requested)?;
-        let index = ifindex(&name)?;
-        from_file(name, index, std::fs::File::from(owned))
-    }
+    let owned = rustix::fs::open(
+        c"/dev/net/tun",
+        rustix::fs::OFlags::RDWR | rustix::fs::OFlags::CLOEXEC,
+        rustix::fs::Mode::empty(),
+    )
+    .map_err(io::Error::from)
+    .context("open /dev/net/tun")?;
+    let name = tun_set_iff(owned.as_fd(), requested)?;
+    let index = ifindex(&name)?;
+    from_file(name, index, std::fs::File::from(owned))
 }
 
 #[expect(unsafe_code, reason = "libc::dup, whose descriptor is adopted by an OwnedFd")]
@@ -128,43 +125,19 @@ fn adopt(file_descriptor: i32) -> Result<(Device, Cleanup)> {
     }
 }
 
-#[expect(unsafe_code, reason = "fcntl only reads and rewrites the descriptor's status flags")]
 fn set_nonblocking(file: &std::fs::File) -> io::Result<()> {
-    // Safety: `fcntl` only reads or replaces the descriptor's status flags.
-    unsafe {
-        let flags = libc::fcntl(file.as_raw_fd(), libc::F_GETFL);
-        if flags < 0 {
-            return Err(io::Error::last_os_error());
-        }
-        if libc::fcntl(file.as_raw_fd(), libc::F_SETFL, flags | libc::O_NONBLOCK) < 0 {
-            return Err(io::Error::last_os_error());
-        }
-    }
-    Ok(())
+    rustix::io::ioctl_fionbio(file, true).map_err(io::Error::from)
 }
 
-#[expect(unsafe_code, reason = "libc::read into the caller's slice, bounded by its length")]
 fn read_once(fd: BorrowedFd<'_>, buf: &mut [u8]) -> io::Result<usize> {
-    // Safety: `buf` is a live slice of the length handed to the same call, and the kernel writes
-    // at most that many bytes into it.
-    let n = unsafe { libc::read(fd.as_raw_fd(), buf.as_mut_ptr().cast(), buf.len()) };
-    if n < 0 {
-        Err(io::Error::last_os_error())
-    } else {
-        Ok(n.cast_unsigned())
-    }
+    rustix::io::read(fd, buf).map_err(io::Error::from)
 }
 
-#[expect(unsafe_code, reason = "libc::write from the caller's slice, bounded by its length")]
 fn write_once(fd: BorrowedFd<'_>, packet: &[u8]) -> io::Result<()> {
-    // Safety: `packet` is a live slice of the length handed to the same call.
-    let n = unsafe { libc::write(fd.as_raw_fd(), packet.as_ptr().cast(), packet.len()) };
-    if n < 0 {
-        return Err(io::Error::last_os_error());
-    }
+    let n = rustix::io::write(fd, packet).map_err(io::Error::from)?;
     // A short write on a packet device is not a recoverable state: what the client is waiting for
     // is already truncated on the wire.
-    if n.cast_unsigned() != packet.len() {
+    if n != packet.len() {
         return Err(io::Error::new(io::ErrorKind::WriteZero, format!("tun wrote {n} of {} bytes", packet.len())));
     }
     Ok(())
@@ -262,16 +235,18 @@ fn write_ifreq_name(ifr: &mut libc::ifreq, name: &str) -> io::Result<()> {
     Ok(())
 }
 
-#[expect(unsafe_code, reason = "if_nametoindex on a live CString local")]
 fn ifindex(name: &str) -> Result<u32> {
-    let name = std::ffi::CString::new(name)
-        .map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "interface name contains a NUL byte"))?;
-    // Safety: `name` is a live `CString`, so the pointer is NUL-terminated for the call.
-    let index = unsafe { libc::if_nametoindex(name.as_ptr()) };
-    if index == 0 {
-        return Err(io::Error::last_os_error()).with_context(|| format!("if_nametoindex {}", name.to_string_lossy()));
-    }
-    Ok(index)
+    let socket = rustix::net::socket_with(
+        rustix::net::AddressFamily::INET,
+        rustix::net::SocketType::DGRAM,
+        rustix::net::SocketFlags::CLOEXEC,
+        None,
+    )
+    .map_err(io::Error::from)
+    .context("socket for if_nametoindex")?;
+    rustix::net::netdevice::name_to_index(&socket, name)
+        .map_err(io::Error::from)
+        .with_context(|| format!("if_nametoindex {name}"))
 }
 
 #[cfg(test)]
