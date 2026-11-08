@@ -1962,6 +1962,18 @@ mod tests {
         assert!(body.contains("\"soft\""), "body was {body}");
         assert!(body.contains("\"hard\""), "body was {body}");
 
+        let state = router_state(true);
+        let put = exchange(
+            move |req| {
+                let state = Arc::clone(&state);
+                async move { dispatch(req, state).await }
+            },
+            "PUT /debug/fds HTTP/1.1\r\nHost: test\r\nConnection: close\r\n\r\n",
+        )
+        .await;
+        assert_eq!(put.status, StatusCode::METHOD_NOT_ALLOWED);
+        assert_eq!(put.header("allow"), Some("GET"));
+
         let state = router_state(false);
         let hidden = exchange(
             move |req| {
