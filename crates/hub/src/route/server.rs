@@ -1945,6 +1945,35 @@ mod tests {
         assert_eq!(get.status, StatusCode::METHOD_NOT_ALLOWED);
     }
 
+    #[tokio::test]
+    async fn dispatch_reports_the_descriptor_budget_only_in_debug_mode() {
+        let state = router_state(true);
+        let get = exchange(
+            move |req| {
+                let state = Arc::clone(&state);
+                async move { dispatch(req, state).await }
+            },
+            "GET /debug/fds HTTP/1.1\r\nHost: test\r\nConnection: close\r\n\r\n",
+        )
+        .await;
+        assert_eq!(get.status, StatusCode::OK);
+        let body = get.body_text();
+        assert!(body.contains("\"open\""), "body was {body}");
+        assert!(body.contains("\"soft\""), "body was {body}");
+        assert!(body.contains("\"hard\""), "body was {body}");
+
+        let state = router_state(false);
+        let hidden = exchange(
+            move |req| {
+                let state = Arc::clone(&state);
+                async move { dispatch(req, state).await }
+            },
+            "GET /debug/fds HTTP/1.1\r\nHost: test\r\nConnection: close\r\n\r\n",
+        )
+        .await;
+        assert_eq!(hidden.status, StatusCode::NOT_FOUND);
+    }
+
     /// One raw `GET` on an established connection: the status code and the whole response.
     async fn get_on<S>(stream: &mut S, target: &str, secret: Option<&str>) -> (u16, String)
     where
