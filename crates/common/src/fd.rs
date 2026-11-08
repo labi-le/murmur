@@ -72,15 +72,7 @@ pub fn nofile_limit() -> Option<(u64, u64)> {
 #[cfg(unix)]
 pub fn raise_nofile_limit() -> io::Result<(u64, u64)> {
     let limits = rustix::process::getrlimit(rustix::process::Resource::Nofile);
-    let needs_raise = match (limits.current, limits.maximum) {
-        // An infinite hard limit leaves the soft half to raise, and `None` already means infinity.
-        (_, None) => limits.current.is_some(),
-        // A soft limit that is already infinite sits above any finite hard limit; lowering it to
-        // the hard one would shrink the budget instead of raising it.
-        (None, Some(_)) => false,
-        (Some(soft), Some(hard)) => soft < hard,
-    };
-    if !needs_raise {
+    if !needs_raise(limits.current, limits.maximum) {
         return Ok(reported(limits));
     }
     let target = rustix::process::Rlimit { current: limits.maximum, maximum: limits.maximum };
@@ -92,6 +84,23 @@ pub fn raise_nofile_limit() -> io::Result<(u64, u64)> {
 #[cfg(unix)]
 fn reported(limits: rustix::process::Rlimit) -> (u64, u64) {
     (limits.current.unwrap_or(u64::MAX), limits.maximum.unwrap_or(u64::MAX))
+}
+
+/// Whether the soft limit sits below the hard one, the only case a raise can fix.
+///
+/// These `Option`s are rustix's encoding of a platform limit, where `None` is that platform's
+/// infinity sentinel: larger than every `Some`, and the opposite of what `Option`'s own ordering
+/// claims.
+#[cfg(unix)]
+fn needs_raise(current: Option<u64>, maximum: Option<u64>) -> bool {
+    match (current, maximum) {
+        // An infinite hard limit leaves only the soft half to raise, and `None` is infinity there.
+        (_, None) => current.is_some(),
+        // A soft limit that is already infinite sits above any finite hard limit; lowering it to
+        // the hard one would shrink the budget instead of raising it.
+        (None, Some(_)) => false,
+        (Some(soft), Some(hard)) => soft < hard,
+    }
 }
 
 /// Targets without POSIX resource limits cannot raise anything.
@@ -148,9 +157,19 @@ mod tests {
 
     #[cfg(unix)]
     #[test]
-    fn a_raised_limit_never_exceeds_the_hard_one() {
-        let (soft, hard) = raise_nofile_limit().expect("raising the soft limit to the hard one is allowed");
-        assert!(soft <= hard, "soft {soft} ended above hard {hard}");
-        assert!(soft > 0);
+    fn a_raise_is_needed_only_below_a_finite_hard_limit() {
+        assert!(needs_raise(Some(256), Some(1024)));
+        assert!(!needs_raise(Some(1024), Some(1024)));
+        assert!(!needs_raise(Some(2048), Some(1024)));
+        assert!(needs_raise(Some(1024), None));
+        assert!(!needs_raise(None, None));
+        assert!(!needs_raise(None, Some(1024)));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn an_unlimited_limit_is_reported_as_the_largest_number() {
+        let limits = rustix::process::Rlimit { current: None, maximum: Some(1024) };
+        assert_eq!(reported(limits), (u64::MAX, 1024));
     }
 }
