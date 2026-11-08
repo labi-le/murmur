@@ -30,10 +30,13 @@ uuid.workspace = true
 x25519-dalek.workspace = true
 # The default feature set includes `cache`, which pulls `wasmtime-cache` -> zstd 0.13.
 # Easytier never configures wasmtime's on-disk cache, so the feature is disabled to keep the
-# advisory-affected zstd 0.13 out of the build. Every other default feature stays enabled.
+# advisory-affected zstd 0.13 out of the build. Every other default feature stays enabled
+# except `profiling`: nothing here installs a profiler, and it enables
+# `wasmtime-jit-debug/perf_jitdump`, whose `JitDumpFile::get_time_stamp` adds an `i64` `tv_sec`
+# to an `i32` `tv_nsec` and so does not compile for 32-bit musl targets.
 wasmtime = { version = "49.0.5", default-features = false, features = [
     "anyhow", "async", "backtrace", "gc", "gc-copying", "gc-drc", "gc-null", "wat",
-    "profiling", "parallel-compilation", "cranelift", "pooling-allocator", "demangle",
+    "parallel-compilation", "cranelift", "pooling-allocator", "demangle",
     "addr2line", "coredump", "debug-builtins", "runtime", "component-model",
     "component-model-async", "threads", "stack-switching", "std", "debug",
     "compile-time-builtins", "wit-parser",

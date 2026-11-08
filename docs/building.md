@@ -163,6 +163,13 @@ remain where retained protocols or the TUN stack need them.
 adding it to `router-vvt`, or unifying workspace defaults, restores the full protocol
 set. `-v` reports the effective protocol set and the checkout it was built from as
 `Commit: <hash>`; `/version` exposes `protocol-set`, `core-update` and the same `commit`.
+MIPS32 builds only the two reduced profiles, never the default feature set: the engines need
+64-bit atomics and MIPS32 has none. `geiserx_ts_magicsock` imports `AtomicU64`, which does not
+exist there, and `wasmtime`'s cranelift fails separately (`BuiltinFunctions::new_epoch` is
+absent from the 32-bit build). Neither is repairable from this tree, so enabling
+`extra-protocols` for the target fails inside those dependencies. The installer's
+`MURMUR_VARIANT=full` on `mipsel` selects the non-VVT asset, which is the `router` profile, not
+this unreduced set.
 Full builds use `version.txt` and the normal release assets. Reduced
 builds on non-Android Linux ARM64 musl use `version-vvt.txt` and
 `murmur-linux-arm64-vvt-<version>.gz`, attached to a published release by
