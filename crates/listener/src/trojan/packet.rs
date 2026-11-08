@@ -1,4 +1,3 @@
-use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
 
 use anyhow::{anyhow, Result};
@@ -16,7 +15,6 @@ pub(crate) struct Packet {
     /// `remote_addr` still land in distinct NAT entries.
     nat_key: String,
     payload: Vec<u8>,
-    len: AtomicUsize,
     put: Mutex<Option<Box<dyn FnOnce() + Send>>>,
     /// `payload` is the transferred pooled block itself, so `put` is `None` and this struct owes
     /// the block back to the pool at drop time.
@@ -31,17 +29,19 @@ impl Packet {
         payload: Vec<u8>,
         put: Option<Box<dyn FnOnce() + Send>>,
     ) -> Self {
-        let len = AtomicUsize::new(payload.len());
         let pooled = put.is_none();
-        Self { pc, r_addr, nat_key, payload, len, put: Mutex::new(put), pooled }
+        Self { pc, r_addr, nat_key, payload, put: Mutex::new(put), pooled }
     }
 }
 
 impl Drop for Packet {
     fn drop(&mut self) {
+        if let Some(put) = self.put.get_mut().take() {
+            put();
+        }
         if self.pooled {
-            // No callback owns the transferred block; `drop_` cannot move it out of `&self`, so
-            // the owner returns it here, exactly once.
+            // No callback owns the transferred block, so the owner returns it here, exactly
+            // once.
             let payload = std::mem::take(&mut self.payload);
             let _ = pool::put(payload);
         }
@@ -59,16 +59,7 @@ impl WriteBack for Packet {
 
 impl UDPPacket for Packet {
     fn data(&self) -> &[u8] {
-        let len = self.len.load(Ordering::Acquire).min(self.payload.len());
-        self.payload.get(..len).unwrap_or_default()
-    }
-
-    fn drop_(&self) {
-        let put = self.put.lock().take();
-        if let Some(put) = put {
-            put();
-        }
-        self.len.store(0, Ordering::Release);
+        &self.payload
     }
 
     /// returns the source IP/Port of the UDP packet.
@@ -91,6 +82,7 @@ impl UDPPacket for Packet {
 mod tests {
     use std::io;
     use std::net::SocketAddr;
+    use std::sync::atomic::{AtomicUsize, Ordering};
 
     use async_trait::async_trait;
 
@@ -155,7 +147,6 @@ mod tests {
         let pc: Arc<dyn Datagram> = Arc::new(NullDatagram);
 
         let packet = Packet::new(pc, r_addr, "callback".to_owned(), vec![1, 2, 3], Some(put));
-        packet.drop_();
         drop(packet);
 
         assert_eq!(calls.load(Ordering::SeqCst), 1, "the callback must run exactly once");

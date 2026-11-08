@@ -1,4 +1,3 @@
-use std::cell::UnsafeCell;
 use std::fmt;
 use std::net::SocketAddr;
 use std::sync::Arc;
@@ -22,7 +21,7 @@ use super::udp_other::dial_udp;
 pub struct Packet {
     pc: Arc<dyn Datagram>,
     l_addr: SocketAddr,
-    buf: UnsafeCell<Vec<u8>>,
+    buf: Vec<u8>,
     tunnel: Arc<dyn Tunnel>,
     additions: Vec<Addition>,
 }
@@ -33,18 +32,6 @@ impl fmt::Debug for Packet {
     }
 }
 
-// SAFETY: `Sync` is required only so `Arc<dyn UDPPacket>` (the trait's own `Send + Sync` bound,
-// `constant::adapters::UDPPacket`) can move across the tokio worker threads that carry it from
-// the receiving task to the single `process_udp` worker that owns it; it is never used to permit
-// real concurrent access. Exactly one `Arc` is created per received datagram
-// (`handle_packet_conn`) and handed to `tunnel::handle_udp_packet`, which queues it on one mpsc
-// channel to one consumer; `data()`, an optional `write_back()`, then `drop_()` run there in
-// sequence with no other clone of the `Arc` outstanding. A future caller that clones this `Arc`
-// and calls `data()`/`drop_()` from two tasks concurrently would race through `buf.get()` with no
-// synchronization — `UnsafeCell` provides none.
-#[expect(unsafe_code, reason = "the Sync contract documented above the type")]
-unsafe impl Sync for Packet {}
-
 impl Packet {
     pub fn new(
         pc: Arc<dyn Datagram>,
@@ -53,30 +40,21 @@ impl Packet {
         tunnel: Arc<dyn Tunnel>,
         additions: Vec<Addition>,
     ) -> Self {
-        Self { pc, l_addr, buf: UnsafeCell::new(buf), tunnel, additions }
+        Self { pc, l_addr, buf, tunnel, additions }
     }
+}
 
-    #[expect(unsafe_code, reason = "reads the buffer under that Sync contract")]
-    fn buf_slice(&self) -> &[u8] {
-        // SAFETY: see the `Sync` impl above.
-        unsafe { &*self.buf.get() }
-    }
-
-    #[expect(unsafe_code, reason = "moves the buffer out under that Sync contract")]
-    fn take_buf(&self) -> Vec<u8> {
-        // SAFETY: see the `Sync` impl above.
-        unsafe { std::mem::take(&mut *self.buf.get()) }
+impl Drop for Packet {
+    /// The buffer is a pooled block; `Drop` is what puts it back, so the packet owns it for
+    /// exactly as long as the last `Arc` clone exists.
+    fn drop(&mut self) {
+        let _ = pool::put(std::mem::take(&mut self.buf));
     }
 }
 
 impl UDPPacket for Packet {
     fn data(&self) -> &[u8] {
-        self.buf_slice()
-    }
-
-    fn drop_(&self) {
-        let buf = self.take_buf();
-        let _ = pool::put(buf);
+        &self.buf
     }
 
     /// The source IP/port of the UDP packet.

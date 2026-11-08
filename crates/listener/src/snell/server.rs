@@ -730,8 +730,6 @@ impl UDPPacket for UdpPacket {
         &self.data
     }
 
-    fn drop_(&self) {}
-
     fn local_addr(&self) -> std::net::SocketAddr {
         self.local_addr
     }

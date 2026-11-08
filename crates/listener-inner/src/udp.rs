@@ -1,10 +1,7 @@
 //! Inner-tunnel UDP: the `PacketConn`/`UDPPacket` pair that carries datagrams into the tunnel.
 //!
-//! DEVIATION: `data(&self) -> &[u8]` (both `constant::adapters::UDPPacket` and this file's own
-//! `Drop`) cannot null out its backing storage through a shared reference, so a payload's byte
-//! length is tracked in a separate atomic counter that
-//! `Drop` zeroes instead; the original allocation is returned to the pool once by `InnerUdpPacket`'s
-//! `std::ops::Drop` impl, which runs when the packet itself is deallocated.
+//! The payload is a pooled block; `InnerUdpPacket`'s `std::ops::Drop` returns it exactly once,
+//! when the packet itself is deallocated.
 //! DEVIATION: a short-buffer error cannot be returned alongside the partial byte
 //! count and source address, so a short destination buffer
 //! returns that error alone (the bytes are still copied into the caller's buffer beforehand).
@@ -14,7 +11,7 @@
 
 use portable_atomic::AtomicU64;
 use std::io;
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::atomic::Ordering;
 use std::sync::Arc;
 
 use anyhow::{anyhow, Result};
@@ -207,8 +204,7 @@ impl PacketConn for InnerUdpPacketConn {
         let mut data = pool::get(buf.len());
         data.copy_from_slice(buf);
         let inner = Arc::clone(&self.0);
-        let packet_len = data.len();
-        let udp_packet = Arc::new(InnerUdpPacket { conn: inner, data, len: AtomicUsize::new(packet_len) });
+        let udp_packet = Arc::new(InnerUdpPacket { conn: inner, data });
         let (packet, mut metadata) = inbound::packet::new_packet(&target, udp_packet, Type::INNER, &[]);
         // Packet construction also sets the source address from the packet's `local_addr()`, but
         // the synthetic inner-UDP address never parses as a socket address, so that step leaves
@@ -265,7 +261,6 @@ impl PacketConn for InnerUdpPacketConn {
 pub struct InnerUdpPacket {
     conn: Arc<Inner>,
     data: Vec<u8>,
-    len: AtomicUsize,
 }
 
 /// The payload is left out: the bytes are arbitrary user data, not debug material.
@@ -273,7 +268,7 @@ impl core::fmt::Debug for InnerUdpPacket {
     fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
         f.debug_struct("InnerUdpPacket")
             .field("conn_id", &self.conn.id)
-            .field("len", &self.len.load(Ordering::Relaxed))
+            .field("len", &self.data.len())
             .finish_non_exhaustive()
     }
 }
@@ -294,13 +289,7 @@ impl WriteBack for InnerUdpPacket {
 
 impl UDPPacket for InnerUdpPacket {
     fn data(&self) -> &[u8] {
-        let visible = self.len.load(Ordering::Acquire).min(self.data.len());
-        let (visible_data, _) = self.data.split_at(visible);
-        visible_data
-    }
-
-    fn drop_(&self) {
-        self.len.store(0, Ordering::Release);
+        &self.data
     }
 
     fn local_addr(&self) -> std::net::SocketAddr {
@@ -356,7 +345,7 @@ mod tests {
         });
         let mut data = pool::get(payload.len());
         data.copy_from_slice(payload);
-        InnerUdpPacket { conn, len: AtomicUsize::new(data.len()), data }
+        InnerUdpPacket { conn, data }
     }
 
     fn test_packet(payload: &[u8]) -> InnerUdpPacket {
@@ -364,19 +353,8 @@ mod tests {
     }
 
     #[test]
-    fn drop_zeroes_len_without_touching_the_backing_allocation() {
-        let payload = vec![0xABu8; 200];
-        let packet = test_packet(&payload);
-
-        assert_eq!(packet.data(), payload.as_slice());
-        UDPPacket::drop_(&packet);
-        assert!(packet.data().is_empty(), "drop_ must zero the visible length, matching the `p.data = nil`");
-        assert_eq!(packet.data.len(), payload.len(), "drop_ must not clone or otherwise touch the backing Vec");
-    }
-
-    #[test]
     fn real_drop_recycles_the_backing_allocation_exactly_once() {
-        // Regression test for the no-op `self.data.clone()` that used to run inside `drop_`: a
+        // Regression test for the no-op `self.data.clone()` that used to run at drop time: a
         // payload length that is not itself a power of two (200 here, unlike its pool block's
         // 256-byte capacity) made the old code clone a short Vec, so `pool::put` rejected the
         // clone on the allocator's exact-capacity check and the real block was only ever freed,
@@ -390,10 +368,9 @@ mod tests {
         assert_eq!(256, packet.data.capacity(), "pool::get(200) rounds up to a 256-byte block");
         assert_eq!(0, pool::DEFAULT_ALLOCATOR.free_len(256), "the class starts empty");
 
-        UDPPacket::drop_(&packet);
         drop(packet);
 
-        assert_eq!(1, pool::DEFAULT_ALLOCATOR.free_len(256), "drop_ must return the real block to the pool");
+        assert_eq!(1, pool::DEFAULT_ALLOCATOR.free_len(256), "Drop must return the real block to the pool");
 
         let recycled = pool::get(200);
         assert_eq!(256, recycled.capacity(), "the pooled block is handed back out again");

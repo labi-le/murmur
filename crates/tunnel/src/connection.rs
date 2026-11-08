@@ -103,14 +103,11 @@ impl PacketSender for PacketSenderImpl {
     // cancel-safe: the packet is either queued or dropped, never half-written.
     async fn send(&self, packet: Arc<dyn PacketAdapter>) {
         if self.cancel.is_cancelled() {
-            packet.drop_();
             return;
         }
 
-        match self.tx.try_send(packet) {
-            Ok(()) => {}
-            Err(mpsc::error::TrySendError::Full(packet) | mpsc::error::TrySendError::Closed(packet)) => packet.drop_(),
-        }
+        // A full or closed queue hands the packet back; dropping it returns the pooled buffer.
+        let _ = self.tx.try_send(packet);
     }
 
     // NOT cancel-safe: the loop owns the write-back proxy's packet stream.
@@ -139,9 +136,7 @@ impl PacketSender for PacketSenderImpl {
     fn close(&self) {
         self.cancel.cancel();
         if let Ok(mut rx) = self.rx.try_lock() {
-            while let Ok(packet) = rx.try_recv() {
-                packet.drop_();
-            }
+            while rx.try_recv().is_ok() {}
         }
     }
 

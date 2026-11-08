@@ -533,10 +533,6 @@ impl UDPPacket for TunPacket {
         &self.payload
     }
 
-    /// the `Drop` returns the buffer to sing's pool; the payload here is already a private
-    /// `Vec` that the drop frees, so there is nothing to return.
-    fn drop_(&self) {}
-
     fn local_addr(&self) -> std::net::SocketAddr {
         std::net::SocketAddr::new(self.flow.dst, self.flow.dst_port)
     }

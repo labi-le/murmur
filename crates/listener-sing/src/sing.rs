@@ -655,16 +655,19 @@ impl WriteBack for Packet {
     }
 }
 
+impl Drop for Packet {
+    /// `buff` is the pooled read buffer handed to this packet; `Drop` releases it back to the
+    /// pool, so the packet owns it for exactly as long as the last `Arc` clone exists.
+    fn drop(&mut self) {
+        if let Some(mut buff) = self.buff.get_mut().take() {
+            buff.release();
+        }
+    }
+}
+
 impl UDPPacket for Packet {
     fn data(&self) -> &[u8] {
         &self.data
-    }
-
-    fn drop_(&self) {
-        let buff = self.buff.lock().take();
-        if let Some(mut buff) = buff {
-            buff.release();
-        }
     }
 
     /// The source IP/port of the UDP packet.

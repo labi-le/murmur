@@ -1,4 +1,3 @@
-use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Once};
 
 use async_trait::async_trait;
@@ -211,7 +210,6 @@ impl types::ServerHandler for ServerHandlerImpl {
 pub(crate) struct ServerUdpPacket {
     pc: Arc<packet::QuicStreamPacketConn>,
     data: Bytes,
-    len: AtomicUsize,
     r_addr: std::net::SocketAddr,
     /// The per-association NAT key, kept apart from `r_addr` (the real peer socket every
     /// association on one QUIC conn shares) so the tunnel's NAT table sees distinct entries.
@@ -220,8 +218,7 @@ pub(crate) struct ServerUdpPacket {
 
 impl ServerUdpPacket {
     fn new(pc: Arc<packet::QuicStreamPacketConn>, data: Bytes, r_addr: std::net::SocketAddr, nat_key: String) -> Self {
-        let len = data.len();
-        Self { pc, data, len: AtomicUsize::new(len), r_addr, nat_key }
+        Self { pc, data, r_addr, nat_key }
     }
 }
 
@@ -237,12 +234,7 @@ impl WriteBack for ServerUdpPacket {
 
 impl UDPPacket for ServerUdpPacket {
     fn data(&self) -> &[u8] {
-        let visible = self.len.load(Ordering::Acquire).min(self.data.len());
-        self.data.get(..visible).unwrap_or_default()
-    }
-
-    fn drop_(&self) {
-        self.len.store(0, Ordering::Release);
+        &self.data
     }
 
     fn local_addr(&self) -> std::net::SocketAddr {

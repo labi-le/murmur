@@ -127,8 +127,6 @@ impl UDPPacket for BenchPacket {
         &self.data
     }
 
-    fn drop_(&self) {}
-
     fn local_addr(&self) -> SocketAddr {
         self.local
     }

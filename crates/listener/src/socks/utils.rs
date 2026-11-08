@@ -1,10 +1,3 @@
-//! DEVIATION: `Drop` cannot null the backing storage through the trait's `&self` receiver.
-//!
-//! Clearing the payload inside `UDPPacket::drop_` is impossible through the trait's `&self`
-//! receiver, so the payload's readable length is tracked in a separate atomic counter that `Drop`
-//! zeroes instead, mirroring `listener::inner::udp::InnerUdpPacket`.
-
-use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
 
 use anyhow::{anyhow, Result};
@@ -19,7 +12,6 @@ pub(crate) struct Packet {
     pc: Arc<dyn PacketConn>,
     r_addr: std::net::SocketAddr,
     payload: Vec<u8>,
-    len: AtomicUsize,
     put: Mutex<Option<Box<dyn FnOnce() + Send>>>,
 }
 
@@ -30,8 +22,7 @@ impl Packet {
         payload: Vec<u8>,
         put: Option<Box<dyn FnOnce() + Send>>,
     ) -> Self {
-        let len = AtomicUsize::new(payload.len());
-        Self { pc, r_addr, payload, len, put: Mutex::new(put) }
+        Self { pc, r_addr, payload, put: Mutex::new(put) }
     }
 }
 
@@ -50,16 +41,7 @@ impl WriteBack for Packet {
 
 impl UDPPacket for Packet {
     fn data(&self) -> &[u8] {
-        let len = self.len.load(Ordering::Acquire).min(self.payload.len());
-        self.payload.get(..len).unwrap_or_default()
-    }
-
-    fn drop_(&self) {
-        let put = self.put.lock().take();
-        if let Some(put) = put {
-            put();
-        }
-        self.len.store(0, Ordering::Release);
+        &self.payload
     }
 
     /// returns the source IP/Port of the UDP packet.
@@ -75,5 +57,13 @@ impl UDPPacket for Packet {
                 .and_then(|a| murmur_common_net::io::old_addr_to_socket_addr(a.as_ref()).ok())
                 .unwrap_or(self.r_addr),
         )
+    }
+}
+
+impl Drop for Packet {
+    fn drop(&mut self) {
+        if let Some(put) = self.put.get_mut().take() {
+            put();
+        }
     }
 }

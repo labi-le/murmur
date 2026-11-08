@@ -15,7 +15,7 @@
 //! over to close on their error paths; whichever call consumed the conn is responsible for its own
 //! cleanup on error, and this file simply returns.
 
-use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 
 use anyhow::{anyhow, Result};
@@ -231,10 +231,8 @@ impl Listener {
                 continue;
             };
 
-            let payload_len = payload.len();
             let c_packet = Arc::new(UotPacket {
                 payload,
-                len: AtomicUsize::new(payload_len),
                 writer: Arc::clone(&writer),
                 local_addr: peer_addr,
                 nat_key: nat_key.clone(),
@@ -245,13 +243,8 @@ impl Listener {
     }
 }
 
-/// DEVIATION: `Drop` cannot null the backing storage through the trait's
-/// `&self` receiver (`constant::adapters::UDPPacket::drop_`), so the payload's readable length is
-/// tracked in a separate atomic counter that `Drop` zeroes instead, mirroring
-/// `listener::socks::utils::Packet`.
 struct UotPacket {
     payload: Vec<u8>,
-    len: AtomicUsize,
     writer: Arc<UoTPacketConn>,
     local_addr: std::net::SocketAddr,
     /// A fresh
@@ -270,11 +263,7 @@ impl WriteBack for UotPacket {
 
 impl UDPPacket for UotPacket {
     fn data(&self) -> &[u8] {
-        self.payload.get(..self.len.load(Ordering::Acquire).min(self.payload.len())).unwrap_or_default()
-    }
-
-    fn drop_(&self) {
-        self.len.store(0, Ordering::Release);
+        &self.payload
     }
 
     fn local_addr(&self) -> std::net::SocketAddr {
@@ -587,14 +576,12 @@ mod tests {
 
         let one = UotPacket {
             payload: Vec::new(),
-            len: AtomicUsize::new(0),
             writer: Arc::clone(&writer),
             local_addr: peer_addr,
             nat_key: murmur_common::utils::uuid::new_uuid_v4().to_string(),
         };
         let two = UotPacket {
             payload: Vec::new(),
-            len: AtomicUsize::new(0),
             writer,
             local_addr: peer_addr,
             nat_key: murmur_common::utils::uuid::new_uuid_v4().to_string(),
