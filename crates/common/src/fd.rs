@@ -65,15 +65,33 @@ pub fn nofile_limit() -> Option<(u64, u64)> {
 ///
 /// Only the soft half is raised: the hard limit is privileged, so the operating system's ceiling on
 /// this process is unchanged and a caller cannot grant itself more than it was given.
+///
+/// An unlimited limit stays `None` on the way into `setrlimit`, and is only turned into `u64::MAX`
+/// on the way out: the platform's infinity sentinel is not `u64::MAX` everywhere, and macOS
+/// rejects a value above its own sentinel with `EINVAL`.
 #[cfg(unix)]
 pub fn raise_nofile_limit() -> io::Result<(u64, u64)> {
-    let (soft, hard) = nofile_limit().unwrap_or((0, 0));
-    if soft >= hard {
-        return Ok((soft, hard));
+    let limits = rustix::process::getrlimit(rustix::process::Resource::Nofile);
+    let needs_raise = match (limits.current, limits.maximum) {
+        // An infinite hard limit leaves the soft half to raise, and `None` already means infinity.
+        (_, None) => limits.current.is_some(),
+        // A soft limit that is already infinite sits above any finite hard limit; lowering it to
+        // the hard one would shrink the budget instead of raising it.
+        (None, Some(_)) => false,
+        (Some(soft), Some(hard)) => soft < hard,
+    };
+    if !needs_raise {
+        return Ok(reported(limits));
     }
-    let raised = rustix::process::Rlimit { current: Some(hard), maximum: Some(hard) };
-    rustix::process::setrlimit(rustix::process::Resource::Nofile, raised).map_err(io::Error::from)?;
-    nofile_limit().ok_or_else(|| io::Error::other("descriptor limits were readable before the raise and not after"))
+    let target = rustix::process::Rlimit { current: limits.maximum, maximum: limits.maximum };
+    rustix::process::setrlimit(rustix::process::Resource::Nofile, target).map_err(io::Error::from)?;
+    Ok(reported(rustix::process::getrlimit(rustix::process::Resource::Nofile)))
+}
+
+/// Turns a platform limit into a number, with an unlimited limit reported as `u64::MAX`.
+#[cfg(unix)]
+fn reported(limits: rustix::process::Rlimit) -> (u64, u64) {
+    (limits.current.unwrap_or(u64::MAX), limits.maximum.unwrap_or(u64::MAX))
 }
 
 /// Targets without POSIX resource limits cannot raise anything.
