@@ -21,6 +21,7 @@ libc.workspace = true
 parking_lot.workspace = true
 portable-atomic.workspace = true
 rand.workspace = true
+rustix.workspace = true
 quinn.workspace = true
 quinn-proto.workspace = true
 regex.workspace = true

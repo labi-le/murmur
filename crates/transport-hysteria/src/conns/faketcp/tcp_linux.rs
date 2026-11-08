@@ -1116,7 +1116,7 @@ fn serialize_layers(buf: &mut Vec<u8>, opts: SerializeOptions, header: &TcpHeade
 /// The subset of the `iptables` command-line interface this file drives.
 mod iptables {
     use std::io;
-    use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
+    use std::os::fd::OwnedFd;
     use std::process::Command;
 
     use anyhow::{anyhow, Result};
@@ -1156,38 +1156,24 @@ mod iptables {
     }
 
     impl FileLock {
-        #[expect(
-            unsafe_code,
-            reason = "`libc::open`/`OwnedFd::from_raw_fd` keep the xtables lock descriptor alive for the run"
-        )]
         fn new() -> io::Result<Self> {
-            let path = std::ffi::CString::new(XTABLES_LOCK_FILE_PATH)
-                .map_err(|err| io::Error::new(io::ErrorKind::InvalidInput, err))?;
-            // SAFETY: `path` is a live, NUL-terminated `CString` for the call's duration; the
-            // returned fd is checked before being wrapped and takes exclusive ownership below.
-            let fd = unsafe { libc::open(path.as_ptr(), libc::O_CREAT, 0o600) };
-            if fd < 0 {
-                return Err(io::Error::last_os_error());
-            }
-            // SAFETY: `fd` was just returned by `open(2)` above and is owned by nothing else yet.
-            Ok(Self { fd: Some(unsafe { OwnedFd::from_raw_fd(fd) }) })
+            let fd = rustix::fs::open(
+                XTABLES_LOCK_FILE_PATH,
+                rustix::fs::OFlags::CREATE,
+                rustix::fs::Mode::RUSR | rustix::fs::Mode::WUSR,
+            )?;
+            Ok(Self { fd: Some(fd) })
         }
 
-        #[expect(unsafe_code, reason = "`libc::flock` is the only non-blocking lock available for the descriptor")]
         fn try_lock(&self) -> io::Result<()> {
             let Some(fd) = &self.fd else {
                 return Ok(());
             };
-            // SAFETY: `fd` is a live descriptor owned by `self`; the return value is checked below.
-            let rc = unsafe { libc::flock(fd.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) };
-            if rc == 0 {
-                return Ok(());
+            // A held lock is `WOULDBLOCK`, not an error: the call site decides what to do next.
+            match rustix::fs::flock(fd, rustix::fs::FlockOperation::NonBlockingLockExclusive) {
+                Ok(()) | Err(rustix::io::Errno::WOULDBLOCK) => Ok(()),
+                Err(err) => Err(err.into()),
             }
-            let err = io::Error::last_os_error();
-            if err.raw_os_error() == Some(libc::EWOULDBLOCK) {
-                return Ok(());
-            }
-            Err(err)
         }
     }
 
