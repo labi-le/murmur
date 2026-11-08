@@ -885,39 +885,24 @@ fn strip_ipv4_header(n: usize, b: &mut [u8]) -> usize {
 }
 
 fn set_ttl(c: &TcpStream, ttl: i32) -> io::Result<()> {
-    let ipv4 = c.local_addr()?.is_ipv4();
-    set_socket_int_option(c, ipv4, ttl, libc::IP_TTL, libc::IPV6_UNICAST_HOPS)
+    let ttl = u8::try_from(ttl).map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "ttl out of range"))?;
+    if c.local_addr()?.is_ipv4() {
+        rustix::net::sockopt::set_ip_ttl(c, u32::from(ttl)).map_err(io::Error::from)
+    } else {
+        rustix::net::sockopt::set_ipv6_unicast_hops(c, Some(ttl)).map_err(io::Error::from)
+    }
 }
 
 fn set_dscp(c: &IpConn, dscp: i32) -> io::Result<()> {
-    set_socket_int_option(&c.socket, c.local_addr().is_ipv4(), dscp << 2, libc::IP_TOS, libc::IPV6_TCLASS)
-}
-
-/// Sets one integer socket option on the raw descriptor, choosing the IPv4 or IPv6 option name.
-#[expect(unsafe_code, reason = "`libc::setsockopt` is the only way to set TTL/DSCP on the raw socket")]
-fn set_socket_int_option<T: std::os::fd::AsRawFd>(
-    socket: &T,
-    ipv4: bool,
-    value: i32,
-    v4_option: libc::c_int,
-    v6_option: libc::c_int,
-) -> io::Result<()> {
-    let (level, option) = if ipv4 { (libc::IPPROTO_IP, v4_option) } else { (libc::IPPROTO_IPV6, v6_option) };
-    // SAFETY: `socket.as_raw_fd()` is a live fd for the call's duration and `value` outlives it;
-    // the return value is checked below.
-    let rc = unsafe {
-        libc::setsockopt(
-            socket.as_raw_fd(),
-            level,
-            option,
-            std::ptr::addr_of!(value).cast(),
-            libc::socklen_t::try_from(size_of::<libc::c_int>()).unwrap_or_default(),
-        )
-    };
-    if rc == 0 {
-        Ok(())
+    // DSCP occupies the top six bits of the TOS byte, as `IP_TOS`/`IPV6_TCLASS` expect it.
+    let tos = dscp
+        .checked_shl(2)
+        .and_then(|value| u8::try_from(value).ok())
+        .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "dscp out of range"))?;
+    if c.local_addr().is_ipv4() {
+        rustix::net::sockopt::set_ip_tos(&c.socket, tos).map_err(io::Error::from)
     } else {
-        Err(io::Error::last_os_error())
+        rustix::net::sockopt::set_ipv6_tclass(&c.socket, u32::from(tos)).map_err(io::Error::from)
     }
 }
 
