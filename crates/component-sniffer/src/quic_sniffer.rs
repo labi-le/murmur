@@ -1200,8 +1200,6 @@ mod tests {
             &self.0
         }
 
-        fn drop_(&self) {}
-
         fn local_addr(&self) -> SocketAddr {
             "192.0.2.1:443".parse().expect("valid address")
         }

@@ -148,15 +148,13 @@ impl TunnelTrait for Tunnel {
         let packet_adapter = new_packet_adapter(packet, metadata);
         let state = ADMISSION.load(Ordering::Acquire);
         if state & STATUS_MASK != ADMISSION_RUNNING && state & APPLY_ACTIVE == 0 {
-            packet_adapter.drop_();
             return;
         }
         let wait = admission_wait(state);
         let packet = QueuedPacket { packet: packet_adapter, wait };
         if packet.packet.metadata().type_ == Type::INNER {
-            if let Err(err) = INNER_UDP_QUEUE.try_send(packet) {
-                err.into_inner().packet.drop_();
-            }
+            // A full inner queue rejects the packet; dropping it returns the pooled buffer.
+            let _ = INNER_UDP_QUEUE.try_send(packet);
             return;
         }
 
@@ -166,17 +164,10 @@ impl TunnelTrait for Tunnel {
         let queue_no = (hash as usize) % queues.len();
 
         let Some(queue) = queues.get(queue_no) else {
-            packet.packet.drop_();
             return;
         };
-        match queue.try_send(packet) {
-            Ok(()) => {}
-            Err(
-                mpsc::error::TrySendError::Full(packet_adapter) | mpsc::error::TrySendError::Closed(packet_adapter),
-            ) => {
-                packet_adapter.packet.drop_();
-            }
-        }
+        // A full or closed queue hands the packet back; dropping it returns the pooled buffer.
+        let _ = queue.try_send(packet);
     }
 
     fn nat_table(&self) -> Arc<dyn NatTable> {
@@ -693,19 +684,16 @@ async fn handle_queued_udp(packet: QueuedPacket) {
     );
     async move {
         if !admit(packet_adapter.metadata().type_, wait, false).await {
-            packet_adapter.drop_();
             return;
         }
 
         if !packet_adapter.metadata().valid() {
-            packet_adapter.drop_();
             warnln!("[Metadata] not valid: {:?}", packet_adapter.metadata());
             return;
         }
         fix_metadata(packet_adapter.metadata_mut());
 
         if let Err(err) = pre_handle_metadata(packet_adapter.metadata_mut()).await {
-            packet_adapter.drop_();
             debugln!("[Metadata PreHandle] error: {err}");
             return;
         }
@@ -2083,8 +2071,6 @@ mod tests {
         fn data(&self) -> &[u8] {
             &self.data
         }
-
-        fn drop_(&self) {}
 
         fn local_addr(&self) -> SocketAddr {
             self.local

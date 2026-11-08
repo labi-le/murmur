@@ -200,8 +200,6 @@ impl<W: AsyncWrite + Unpin + Send> UDPPacket for MieruUdpPacket<W> {
         &self.data
     }
 
-    fn drop_(&self) {}
-
     fn local_addr(&self) -> SocketAddr {
         self.source.unwrap_or(UNSPECIFIED)
     }

@@ -1,10 +1,5 @@
 //! The Shadowsocks `ss://` URL splitter and the UDP packet backing store.
 //!
-//! DEVIATION: `Drop` cannot null the backing storage through the trait's
-//! `&self` receiver (`constant::adapters::UDPPacket::drop_`), so the payload's readable length is
-//! tracked in a separate atomic counter that `Drop` zeroes instead, mirroring
-//! `listener::socks::utils::Packet`.
-//!
 //! DEVIATION: a multi-host-capable fork of the standard URL parser is needed
 //! because the standard parser and the `url` crate both reject a comma-separated host such as
 //! `ss://…@host1,host2,host3`. Only the host and
@@ -12,7 +7,6 @@
 //! scheme/userinfo/comma-separated-host splitter rather than a full RFC 3986 URL parser.
 
 #[cfg(feature = "extra-protocols")]
-use std::sync::atomic::{AtomicUsize, Ordering};
 #[cfg(feature = "extra-protocols")]
 use std::sync::Arc;
 
@@ -34,7 +28,6 @@ pub(crate) struct Packet {
     pc: Arc<dyn PacketConn>,
     r_addr: std::net::SocketAddr,
     payload: Vec<u8>,
-    len: AtomicUsize,
     put: Mutex<Option<Box<dyn FnOnce() + Send>>>,
 }
 
@@ -46,8 +39,7 @@ impl Packet {
         payload: Vec<u8>,
         put: Option<Box<dyn FnOnce() + Send>>,
     ) -> Self {
-        let len = AtomicUsize::new(payload.len());
-        Self { pc, r_addr, payload, len, put: Mutex::new(put) }
+        Self { pc, r_addr, payload, put: Mutex::new(put) }
     }
 }
 
@@ -79,15 +71,7 @@ fn encode_ss_udp_packet(addr: &socks5::Addr, payload: &[u8]) -> Vec<u8> {
 #[cfg(feature = "extra-protocols")]
 impl UDPPacket for Packet {
     fn data(&self) -> &[u8] {
-        self.payload.get(..self.len.load(Ordering::Acquire).min(self.payload.len())).unwrap_or_default()
-    }
-
-    fn drop_(&self) {
-        let put = self.put.lock().take();
-        if let Some(put) = put {
-            put();
-        }
-        self.len.store(0, Ordering::Release);
+        &self.payload
     }
 
     /// The source IP/port of the UDP packet.
@@ -103,6 +87,14 @@ impl UDPPacket for Packet {
                 .and_then(|a| murmur_common_net::io::old_addr_to_socket_addr(a.as_ref()).ok())
                 .unwrap_or(self.r_addr),
         )
+    }
+}
+
+impl Drop for Packet {
+    fn drop(&mut self) {
+        if let Some(put) = self.put.get_mut().take() {
+            put();
+        }
     }
 }
 

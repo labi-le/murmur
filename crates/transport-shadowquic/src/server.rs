@@ -1,4 +1,3 @@
-use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
 
 use async_trait::async_trait;
@@ -337,15 +336,13 @@ impl Server {
 struct ServerUdpPacket {
     assoc: Arc<Association>,
     data: Vec<u8>,
-    len: AtomicUsize,
     r_addr: std::net::SocketAddr,
     l_addr: std::net::SocketAddr,
 }
 
 impl ServerUdpPacket {
     fn new(assoc: Arc<Association>, data: Vec<u8>, r_addr: std::net::SocketAddr, l_addr: std::net::SocketAddr) -> Self {
-        let len = AtomicUsize::new(data.len());
-        Self { assoc, data, len, r_addr, l_addr }
+        Self { assoc, data, r_addr, l_addr }
     }
 }
 
@@ -358,12 +355,7 @@ impl WriteBack for ServerUdpPacket {
 
 impl UDPPacket for ServerUdpPacket {
     fn data(&self) -> &[u8] {
-        let len = self.len.load(Ordering::Acquire).min(self.data.len());
-        self.data.get(..len).unwrap_or_default()
-    }
-
-    fn drop_(&self) {
-        self.len.store(0, Ordering::Release);
+        &self.data
     }
 
     fn local_addr(&self) -> std::net::SocketAddr {

@@ -328,9 +328,6 @@ pub trait Proxy: ProxyAdapter {
 pub trait UDPPacket: WriteBack + Send + Sync {
     fn data(&self) -> &[u8];
 
-    /// the `Drop`; the trailing underscore keeps it clear of `std::ops::Drop`.
-    fn drop_(&self);
-
     fn local_addr(&self) -> SocketAddr;
 
     /// A second interface that an erased `Arc<dyn UDPPacket>` can no longer be asked about, so the
@@ -406,10 +403,6 @@ impl WriteBack for PacketAdapterImpl {
 impl UDPPacket for PacketAdapterImpl {
     fn data(&self) -> &[u8] {
         self.packet.data()
-    }
-
-    fn drop_(&self) {
-        self.packet.drop_();
     }
 
     fn local_addr(&self) -> SocketAddr {
@@ -636,8 +629,6 @@ mod tests {
             &[]
         }
 
-        fn drop_(&self) {}
-
         fn local_addr(&self) -> std::net::SocketAddr {
             self.addr
         }
@@ -680,7 +671,6 @@ mod tests {
             fn data(&self) -> &[u8] {
                 &[]
             }
-            fn drop_(&self) {}
             fn local_addr(&self) -> std::net::SocketAddr {
                 self.0
             }
