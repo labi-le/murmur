@@ -7,7 +7,6 @@
 //! scheme/userinfo/comma-separated-host splitter rather than a full RFC 3986 URL parser.
 
 #[cfg(feature = "extra-protocols")]
-#[cfg(feature = "extra-protocols")]
 use std::sync::Arc;
 
 use anyhow::{anyhow, Result};
@@ -90,6 +89,7 @@ impl UDPPacket for Packet {
     }
 }
 
+#[cfg(feature = "extra-protocols")]
 impl Drop for Packet {
     fn drop(&mut self) {
         if let Some(put) = self.put.get_mut().take() {
