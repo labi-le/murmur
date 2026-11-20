@@ -4768,6 +4768,7 @@ dependencies = [
  "ed25519-dalek 3.0.0",
  "hkdf 0.13.0",
  "hmac 0.13.0",
+ "ml-kem",
  "murmur-common-net",
  "murmur-log",
  "murmur-ntp",

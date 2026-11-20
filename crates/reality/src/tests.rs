@@ -58,7 +58,7 @@ async fn client_and_server_authenticate_and_exchange_application_data() {
         Some(Duration::from_secs(300)),
         no_dest_dial(),
     );
-    let client_cfg = RealityClientConfig { public_key: server_public, short_id };
+    let client_cfg = RealityClientConfig { public_key: server_public, short_id, support_x25519_mlkem768: false };
 
     let (client_io, server_io) = tokio::io::duplex(64 * 1024);
 
@@ -96,7 +96,7 @@ async fn client_authenticates_when_mirrored_target_requires_p384_signatures() {
             Some(Duration::from_secs(300)),
             no_dest_dial(),
         );
-        let client_cfg = RealityClientConfig { public_key: server_public, short_id };
+        let client_cfg = RealityClientConfig { public_key: server_public, short_id, support_x25519_mlkem768: false };
         let (client_io, mut peer_io) = tokio::io::duplex(64 * 1024);
 
         let peer = async move {
@@ -176,7 +176,8 @@ async fn wrong_short_id_falls_back_instead_of_authenticating() {
     short_ids.insert([0xAAu8; 8]); // server only accepts this short id
 
     let server_cfg = RealityServerConfig::new(server_private, server_names, short_ids, None, no_dest_dial());
-    let client_cfg = RealityClientConfig { public_key: server_public, short_id: [0xBBu8; 8] }; // client uses a different one
+    let client_cfg =
+        RealityClientConfig { public_key: server_public, short_id: [0xBBu8; 8], support_x25519_mlkem768: false }; // client uses a different one
 
     let (client_io, server_io) = tokio::io::duplex(64 * 1024);
 
@@ -231,7 +232,7 @@ fn client_hello_key_share_is_a_list() {
     use crate::suite::CipherSuite;
 
     let public_key = [0x5Au8; 32];
-    let hello = ClientHello::build([0x11u8; 32], &[CipherSuite::Aes128GcmSha256], "example.test", public_key);
+    let hello = ClientHello::build([0x11u8; 32], &[CipherSuite::Aes128GcmSha256], "example.test", public_key, None);
 
     let mut body = &hello.raw[4..];
     body = &body[2 + 32..]; // legacy_version + random
@@ -484,7 +485,7 @@ async fn authenticated_pair_over_tcp() -> (crate::stream::RealityStream<tokio::n
         Some(Duration::from_secs(300)),
         no_dest_dial(),
     );
-    let client_cfg = RealityClientConfig { public_key: server_public, short_id };
+    let client_cfg = RealityClientConfig { public_key: server_public, short_id, support_x25519_mlkem768: false };
 
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.expect("bind");
     let addr = listener.local_addr().expect("addr");
@@ -673,6 +674,14 @@ async fn the_free_allowance_charges_the_overflow_of_a_straddling_read() {
     assert_eq!(owed, Duration::from_secs(8), "nine charged bytes at 1 B/s");
 }
 
+/// The group the REALITY-shaped test server negotiates: the classic one, or the hybrid a modern
+/// upstream REALITY server picks when the client offers both.
+#[derive(Clone, Copy)]
+enum NegotiatedGroup {
+    X25519,
+    X25519MlKem768,
+}
+
 /// The record framing a REALITY server puts on the wire: a plaintext `ServerHello`, a dummy
 /// plaintext `ChangeCipherSpec`, then the server flight under the handshake keys -- one record when
 /// `dest` sent one, one per message when it sent several -- each zero-padded to the length `dest`'s
@@ -682,6 +691,7 @@ async fn reality_shaped_stream(
     private_key: [u8; 32],
     short_id: [u8; 8],
     split_flight: bool,
+    negotiated: NegotiatedGroup,
 ) {
     let (header, payload) = read_record(&mut io).await;
     assert_eq!(header[0], crate::handshake::CONTENT_TYPE_HANDSHAKE);
@@ -699,14 +709,43 @@ async fn reality_shaped_stream(
 
     let suite = CipherSuite::Aes128GcmSha256;
     let (server_private, server_public) = keypair();
+    let (server_share, tls_shared) = match negotiated {
+        NegotiatedGroup::X25519 => (
+            crate::handshake::ServerKeyShare::X25519(server_public),
+            x25519_dalek::x25519(server_private, client_public).to_vec(),
+        ),
+        NegotiatedGroup::X25519MlKem768 => {
+            use ml_kem::{EncapsulationKey, MlKem768};
+
+            let encapsulation_key = client_hello
+                .x25519_mlkem768_encapsulation_key
+                .as_deref()
+                .expect("the client must offer the hybrid share it expects to negotiate");
+            let encapsulation_key = ml_kem::Key::<EncapsulationKey<MlKem768>>::try_from(encapsulation_key)
+                .expect("an ML-KEM-768 encapsulation key is 1184 bytes");
+            let encapsulation_key =
+                EncapsulationKey::<MlKem768>::new(&encapsulation_key).expect("a valid encapsulation key");
+            let mut message = [0u8; 32];
+            rand::RngCore::fill_bytes(&mut rand::rng(), &mut message);
+            let (ciphertext, mlkem_shared) = encapsulation_key.encapsulate_deterministic(&ml_kem::B32::from(message));
+            let mut tls_shared = mlkem_shared.as_slice().to_vec();
+            tls_shared.extend_from_slice(&x25519_dalek::x25519(server_private, client_public));
+            (
+                crate::handshake::ServerKeyShare::X25519MlKem768 {
+                    ciphertext: ciphertext.to_vec(),
+                    x25519_public: server_public,
+                },
+                tls_shared,
+            )
+        }
+    };
     let mut server_random = [0u8; 32];
     rand::RngCore::fill_bytes(&mut rand::rng(), &mut server_random);
     let server_hello =
-        crate::handshake::ServerHello::build(server_random, &client_hello.session_id, suite, server_public);
+        crate::handshake::ServerHello::build(server_random, &client_hello.session_id, suite, server_share);
     write_plain_record(&mut io, crate::handshake::CONTENT_TYPE_HANDSHAKE, &server_hello.raw).await;
     write_plain_record(&mut io, crate::handshake::CONTENT_TYPE_CHANGE_CIPHER_SPEC, &[1]).await;
 
-    let tls_shared = x25519_dalek::x25519(server_private, client_public);
     let mut transcript = suite.transcript();
     transcript.update(&client_hello.raw);
     transcript.update(&server_hello.raw);
@@ -833,9 +872,10 @@ async fn a_reality_shaped_record_stream_is_read_by_the_client() {
         let (server_private, server_public) = keypair();
         let short_id = [0x42u8; 8];
         let (client_io, server_io) = tokio::io::duplex(64 * 1024);
-        let server =
-            tokio::spawn(async move { reality_shaped_stream(server_io, server_private, short_id, split_flight).await });
-        let client_cfg = RealityClientConfig { public_key: server_public, short_id };
+        let server = tokio::spawn(async move {
+            reality_shaped_stream(server_io, server_private, short_id, split_flight, NegotiatedGroup::X25519).await
+        });
+        let client_cfg = RealityClientConfig { public_key: server_public, short_id, support_x25519_mlkem768: false };
 
         let mut client = tokio::time::timeout(
             Duration::from_secs(5),
@@ -851,6 +891,182 @@ async fn a_reality_shaped_record_stream_is_read_by_the_client() {
         assert_eq!(&echoed, b"hello", "split_flight={split_flight}");
         server.await.expect("the REALITY-shaped server must not panic");
     }
+}
+
+/// The `KeyShareEntry` list a `ClientHello` puts on the wire, as `(group, key_exchange length)`.
+fn offered_key_shares(raw: &[u8]) -> Vec<(u16, usize)> {
+    let mut body = &raw[4..];
+    body = &body[2 + 32..]; // legacy_version + random
+    body = &body[1 + 32..]; // session id length + session id
+    let suites_len = u16::from_be_bytes([body[0], body[1]]) as usize;
+    body = &body[2 + suites_len..];
+    let compression_len = body[0] as usize;
+    body = &body[1 + compression_len..];
+    let exts_len = u16::from_be_bytes([body[0], body[1]]) as usize;
+    let mut exts = &body[2..2 + exts_len];
+    while !exts.is_empty() {
+        let ext_type = u16::from_be_bytes([exts[0], exts[1]]);
+        let ext_len = u16::from_be_bytes([exts[2], exts[3]]) as usize;
+        if ext_type == 51 {
+            let mut list = &exts[4..4 + ext_len];
+            let list_len = u16::from_be_bytes([list[0], list[1]]) as usize;
+            list = &list[2..2 + list_len];
+            let mut shares = Vec::new();
+            while !list.is_empty() {
+                let group = u16::from_be_bytes([list[0], list[1]]);
+                let key_len = u16::from_be_bytes([list[2], list[3]]) as usize;
+                shares.push((group, key_len));
+                list = &list[4 + key_len..];
+            }
+            return shares;
+        }
+        exts = &exts[4 + ext_len..];
+    }
+    panic!("the ClientHello must offer a key_share");
+}
+
+/// Reads the `ClientHello` the client writes, then ends the connection: the offer is observed
+/// from the wire instead of from the builder that produced it.
+async fn observed_client_hello(config: RealityClientConfig) -> ClientHello {
+    let (client_io, mut peer_io) = tokio::io::duplex(64 * 1024);
+    let peer = async move {
+        let (header, payload) = read_record(&mut peer_io).await;
+        assert_eq!(header[0], crate::handshake::CONTENT_TYPE_HANDSHAKE, "the first record is a handshake");
+        peer_io.write_all(&[21, 3, 3, 0, 2, 2, 40]).await.expect("write an alert");
+        payload
+    };
+    let client = async {
+        let _ =
+            tokio::time::timeout(Duration::from_secs(5), connect_reality_client(client_io, "example.test", &config))
+                .await;
+    };
+    let (payload, ()) = tokio::join!(peer, client);
+    ClientHello::parse(&payload).expect("the client sends a well-formed ClientHello")
+}
+
+#[tokio::test]
+async fn the_client_offers_the_hybrid_share_only_when_configured() {
+    let (_server_private, server_public) = keypair();
+    let short_id = [0x61u8; 8];
+
+    let classic = observed_client_hello(RealityClientConfig {
+        public_key: server_public,
+        short_id,
+        support_x25519_mlkem768: false,
+    })
+    .await;
+    assert_eq!(offered_key_shares(&classic.raw), vec![(0x001D, 32)], "the default hello offers X25519 alone");
+    assert!(classic.x25519_mlkem768_encapsulation_key.is_none());
+
+    let hybrid = observed_client_hello(RealityClientConfig {
+        public_key: server_public,
+        short_id,
+        support_x25519_mlkem768: true,
+    })
+    .await;
+    assert_eq!(
+        offered_key_shares(&hybrid.raw),
+        vec![(0x11EC, 1216), (0x001D, 32)],
+        "the hybrid-enabled hello offers both the 1216-byte hybrid share and the 32-byte X25519 share"
+    );
+    assert_eq!(hybrid.x25519_mlkem768_encapsulation_key.as_ref().map(Vec::len), Some(1184));
+}
+
+/// Upstream REALITY servers may keep negotiating classic X25519 with a client that offers both,
+/// so the hybrid offer must not cost the connection its authentication.
+#[tokio::test]
+async fn a_client_offering_the_hybrid_authenticates_when_the_server_selects_x25519() {
+    let (server_private, server_public) = keypair();
+    let short_id = [0x62u8; 8];
+    let server_cfg = RealityServerConfig::new(
+        server_private,
+        HashSet::from(["example.test".to_owned()]),
+        HashSet::from([short_id]),
+        Some(Duration::from_secs(300)),
+        no_dest_dial(),
+    );
+    let client_cfg = RealityClientConfig { public_key: server_public, short_id, support_x25519_mlkem768: true };
+    let (client_io, server_io) = tokio::io::duplex(64 * 1024);
+
+    let server_task = tokio::spawn(async move {
+        let mut stream =
+            reality_server_accept(server_io, &server_cfg).await.expect("server must authenticate the client");
+        let mut buf = [0u8; 5];
+        stream.read_exact(&mut buf).await.expect("read ping");
+        assert_eq!(&buf, b"ping!");
+        stream.write_all(b"pong!").await.expect("write pong");
+    });
+
+    let mut client =
+        tokio::time::timeout(Duration::from_secs(5), connect_reality_client(client_io, "example.test", &client_cfg))
+            .await
+            .expect("the client must not hang when the server selects X25519")
+            .expect("the client must authenticate against an X25519-selecting server");
+    client.write_all(b"ping!").await.expect("write ping");
+    let mut buf = [0u8; 5];
+    client.read_exact(&mut buf).await.expect("read pong");
+    assert_eq!(&buf, b"pong!");
+
+    server_task.await.expect("server task should not panic");
+}
+
+/// A modern REALITY server answers a hybrid offer with its own `X25519MLKEM768` share
+/// (1088-byte ML-KEM ciphertext followed by a 32-byte X25519 public key), and the client has to
+/// decapsulate it and append the X25519 ECDH output before deriving the TLS keys.
+#[tokio::test]
+async fn a_client_offering_the_hybrid_completes_a_handshake_that_selects_x25519_mlkem768() {
+    let (server_private, server_public) = keypair();
+    let short_id = [0x63u8; 8];
+    let (client_io, server_io) = tokio::io::duplex(64 * 1024);
+    let server = tokio::spawn(async move {
+        reality_shaped_stream(server_io, server_private, short_id, false, NegotiatedGroup::X25519MlKem768).await
+    });
+    let client_cfg = RealityClientConfig { public_key: server_public, short_id, support_x25519_mlkem768: true };
+
+    let mut client =
+        tokio::time::timeout(Duration::from_secs(5), connect_reality_client(client_io, "example.test", &client_cfg))
+            .await
+            .expect("the client must not hang while negotiating the hybrid group")
+            .expect("the client must complete a handshake that selects X25519MLKEM768");
+
+    client.write_all(b"hello").await.expect("write through the tunnel");
+    let mut echoed = [0u8; 5];
+    client.read_exact(&mut echoed).await.expect("read through the tunnel");
+    assert_eq!(&echoed, b"hello");
+    server.await.expect("the REALITY-shaped server must not panic");
+}
+
+/// A client that offers only the hybrid share still authenticates: the trailing 32 bytes of that
+/// share are the X25519 point `AuthKey` is derived from.
+#[test]
+fn a_client_offering_only_the_hybrid_share_yields_its_trailing_x25519_half() {
+    let x25519_public = [0x2Au8; 32];
+    let encapsulation_key = [0x33u8; 1184];
+    let mut key_exchange = encapsulation_key.to_vec();
+    key_exchange.extend_from_slice(&x25519_public);
+
+    let mut body = Writer::new();
+    body.u16(0x0303);
+    body.bytes(&[0x44u8; 32]);
+    body.vec_u8(&[0u8; 32]);
+    let mut suites = Writer::new();
+    suites.u16(CipherSuite::Aes128GcmSha256.id());
+    body.vec_u16(&suites.into_bytes());
+    body.vec_u8(&[0u8]);
+    let mut exts = Writer::new();
+    let mut key_share = Writer::new();
+    let mut entry = Writer::new();
+    entry.u16(0x11EC);
+    entry.vec_u16(&key_exchange);
+    key_share.vec_u16(&entry.into_bytes());
+    exts.u16(51);
+    exts.vec_u16(&key_share.into_bytes());
+    body.vec_u16(&exts.into_bytes());
+
+    let hello =
+        ClientHello::parse(&crate::wire::handshake_message(1, &body.into_bytes())).expect("a well-formed ClientHello");
+    assert_eq!(hello.x25519_public, Some(x25519_public), "the hybrid share's trailing half authenticates");
+    assert_eq!(hello.x25519_mlkem768_encapsulation_key.as_deref(), Some(encapsulation_key.as_slice()));
 }
 
 /// A record that decrypts to nothing but its content type is legal on the wire, and it is

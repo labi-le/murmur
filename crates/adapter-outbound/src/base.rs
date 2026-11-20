@@ -373,9 +373,8 @@ impl<'de> Deserialize<'de> for RealityOpts {
 impl RealityOpts {
     /// An empty `public-key` yields `Ok(None)`.
     ///
-    /// `support_x25519mlkem768` is accepted but not acted on: the ClientHello is built by
-    /// `murmur_reality::connect_reality_client`, which never offers the X25519MLKEM768 key share —
-    /// the same handshake produced for the flag's `false` default.
+    /// `support_x25519mlkem768` is passed through to the ClientHello: `true` offers the
+    /// X25519MLKEM768 hybrid key share alongside X25519, `false` keeps the classic-only hello.
     pub fn parse(&self) -> Result<Option<murmur_reality::RealityClientConfig>> {
         use base64::engine::general_purpose::URL_SAFE_NO_PAD;
         use base64::Engine as _;
@@ -400,7 +399,11 @@ impl RealityOpts {
         let dest = short_id.get_mut(..decoded_short_id.len()).ok_or_else(|| anyhow!("invalid REALITY short ID"))?;
         dest.copy_from_slice(&decoded_short_id);
 
-        Ok(Some(murmur_reality::RealityClientConfig { public_key, short_id }))
+        Ok(Some(murmur_reality::RealityClientConfig {
+            public_key,
+            short_id,
+            support_x25519_mlkem768: self.support_x25519_mlkem768,
+        }))
     }
 }
 
@@ -1090,6 +1093,21 @@ mod tests {
         assert_eq!(err("ab".repeat(9)), "invalid REALITY short id");
         assert_eq!(err(format!("{}a", "ab".repeat(8))), "invalid REALITY short ID");
         assert!(reality_cfg(&"ab".repeat(8)).unwrap().is_some());
+    }
+
+    #[test]
+    fn a_reality_block_passes_the_hybrid_key_share_flag_through() {
+        let holder = parse(concat!(
+            "reality-opts:\n",
+            "  public-key: AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA\n",
+            "  support-x25519mlkem768: true\n",
+        ))
+        .expect("decodes");
+        let config = holder.reality_opts.parse().expect("parses").expect("selects REALITY");
+        assert!(config.support_x25519_mlkem768, "the flag must reach the ClientHello config");
+
+        let config = reality_cfg("").expect("parses").expect("selects REALITY");
+        assert!(!config.support_x25519_mlkem768, "the flag defaults to off");
     }
 
     #[derive(Deserialize)]

@@ -1754,7 +1754,11 @@ mod tls_conn_tests {
         });
 
         let material = TlsMaterial {
-            reality_config: Some(Arc::new(RealityClientConfig { public_key: server_public, short_id })),
+            reality_config: Some(Arc::new(RealityClientConfig {
+                public_key: server_public,
+                short_id,
+                support_x25519_mlkem768: false,
+            })),
             client_fingerprint: "chrome".to_owned(),
             ..test_material()
         };

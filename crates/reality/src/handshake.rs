@@ -24,6 +24,14 @@ const LEGACY_VERSION_TLS12: u16 = 0x0303;
 const SUPPORTED_VERSION_TLS13: u16 = 0x0304;
 
 pub(crate) const GROUP_X25519: u16 = 0x001D;
+pub(crate) const GROUP_X25519_MLKEM768: u16 = 0x11EC;
+
+/// ML-KEM-768's encapsulation key, the first half of an `X25519MLKEM768` client share.
+pub(crate) const MLKEM768_ENCAPSULATION_KEY_LEN: usize = 1184;
+/// ML-KEM-768's ciphertext, the first half of an `X25519MLKEM768` server share.
+pub(crate) const MLKEM768_CIPHERTEXT_LEN: usize = 1088;
+pub(crate) const X25519_KEY_LEN: usize = 32;
+
 const SIGNATURE_SCHEME_ED25519: u16 = 0x0807;
 
 const EXT_SERVER_NAME: u16 = 0;
@@ -43,7 +51,14 @@ pub(crate) struct ClientHello {
     /// none (the whole auth block is guarded on a real peer key), so absence must not collapse
     /// into a usable point -- an all-zero peer point would otherwise ECDH to the all-zero secret
     /// and authenticate anyone who can compute that HKDF.
+    ///
+    /// A client that offers only an `X25519MLKEM768` share sets this from that share's trailing
+    /// 32-byte X25519 half, which is the same point a standalone entry would carry.
     pub x25519_public: Option<[u8; 32]>,
+    /// The 1184-byte ML-KEM encapsulation key from an offered `X25519MLKEM768` share, or `None`
+    /// when the client did not offer the hybrid group. Its X25519 half is not repeated here: the
+    /// trailing 32 bytes of the share are already in [`Self::x25519_public`].
+    pub x25519_mlkem768_encapsulation_key: Option<Vec<u8>>,
     pub raw: Vec<u8>,
 }
 
@@ -56,7 +71,11 @@ impl ClientHello {
         cipher_suites: &[CipherSuite],
         server_name: &str,
         x25519_public: [u8; 32],
+        x25519_mlkem768_encapsulation_key: Option<&[u8]>,
     ) -> Self {
+        if let Some(key) = x25519_mlkem768_encapsulation_key {
+            debug_assert_eq!(key.len(), MLKEM768_ENCAPSULATION_KEY_LEN, "an ML-KEM-768 encapsulation key");
+        }
         let mut body = Writer::new();
         body.u16(LEGACY_VERSION_TLS12);
         body.bytes(&random);
@@ -72,10 +91,18 @@ impl ClientHello {
 
         let mut exts = Writer::new();
         write_extension(&mut exts, EXT_SERVER_NAME, &server_name_extension(server_name));
-        write_extension(&mut exts, EXT_SUPPORTED_GROUPS, &supported_groups_extension());
+        write_extension(
+            &mut exts,
+            EXT_SUPPORTED_GROUPS,
+            &supported_groups_extension(x25519_mlkem768_encapsulation_key.is_some()),
+        );
         write_extension(&mut exts, EXT_SIGNATURE_ALGORITHMS, &signature_algorithms_extension());
         write_extension(&mut exts, EXT_SUPPORTED_VERSIONS, &supported_versions_extension());
-        write_extension(&mut exts, EXT_KEY_SHARE, &key_share_extension_client(GROUP_X25519, &x25519_public));
+        write_extension(
+            &mut exts,
+            EXT_KEY_SHARE,
+            &key_share_extension_client(x25519_public, x25519_mlkem768_encapsulation_key),
+        );
         body.vec_u16(&exts.into_bytes());
 
         let raw = handshake_message(HANDSHAKE_TYPE_CLIENT_HELLO, &body.into_bytes());
@@ -85,6 +112,7 @@ impl ClientHello {
             cipher_suites: cipher_suites.to_vec(),
             server_name: server_name.to_owned(),
             x25519_public: Some(x25519_public),
+            x25519_mlkem768_encapsulation_key: x25519_mlkem768_encapsulation_key.map(<[u8]>::to_vec),
             raw,
         }
     }
@@ -141,6 +169,7 @@ impl ClientHello {
 
         let mut server_name = String::new();
         let mut x25519_public = None;
+        let mut x25519_mlkem768_encapsulation_key = None;
         let ext_bytes = b.vec_u16()?;
         let mut er = Reader::new(ext_bytes);
         while er.remaining() > 0 {
@@ -149,21 +178,36 @@ impl ClientHello {
             match ext_type {
                 EXT_SERVER_NAME => server_name = parse_server_name_extension(ext_body)?,
                 EXT_KEY_SHARE => {
-                    if let Some(pubkey) = parse_key_share_client(ext_body, GROUP_X25519)? {
-                        x25519_public = Some(pubkey);
-                    }
+                    let shares = parse_client_key_shares(ext_body)?;
+                    x25519_public = shares.x25519;
+                    x25519_mlkem768_encapsulation_key = shares.mlkem768_encapsulation_key;
                 }
                 _ => {}
             }
         }
 
-        Ok(Self { random, session_id, cipher_suites, server_name, x25519_public, raw: msg.to_vec() })
+        Ok(Self {
+            random,
+            session_id,
+            cipher_suites,
+            server_name,
+            x25519_public,
+            x25519_mlkem768_encapsulation_key,
+            raw: msg.to_vec(),
+        })
     }
+}
+
+/// The `key_share` a server selects for its `ServerHello`. The hybrid entry carries
+/// `mlkem_ciphertext (1088) || x25519_public (32)`, matching the client share's layout.
+pub(crate) enum ServerKeyShare {
+    X25519([u8; 32]),
+    X25519MlKem768 { ciphertext: Vec<u8>, x25519_public: [u8; 32] },
 }
 
 pub(crate) struct ServerHello {
     pub cipher_suite: CipherSuite,
-    pub x25519_public: [u8; 32],
+    pub key_share: ServerKeyShare,
     pub raw: Vec<u8>,
 }
 
@@ -172,8 +216,11 @@ impl ServerHello {
         random: [u8; 32],
         session_id_echo: &[u8; 32],
         cipher_suite: CipherSuite,
-        x25519_public: [u8; 32],
+        key_share: ServerKeyShare,
     ) -> Self {
+        if let ServerKeyShare::X25519MlKem768 { ciphertext, .. } = &key_share {
+            debug_assert_eq!(ciphertext.len(), MLKEM768_CIPHERTEXT_LEN, "an ML-KEM-768 ciphertext");
+        }
         let mut body = Writer::new();
         body.u16(LEGACY_VERSION_TLS12);
         body.bytes(&random);
@@ -183,11 +230,11 @@ impl ServerHello {
 
         let mut exts = Writer::new();
         write_extension(&mut exts, EXT_SUPPORTED_VERSIONS, &SUPPORTED_VERSION_TLS13.to_be_bytes());
-        write_extension(&mut exts, EXT_KEY_SHARE, &key_share_entry(GROUP_X25519, &x25519_public));
+        write_extension(&mut exts, EXT_KEY_SHARE, &server_key_share_entry(&key_share));
         body.vec_u16(&exts.into_bytes());
 
         let raw = handshake_message(HANDSHAKE_TYPE_SERVER_HELLO, &body.into_bytes());
-        Self { cipher_suite, x25519_public, raw }
+        Self { cipher_suite, key_share, raw }
     }
 
     pub(crate) fn parse(msg: &[u8]) -> Result<Self> {
@@ -207,7 +254,7 @@ impl ServerHello {
         let _compression = b.u8()?;
 
         let mut supported_version_ok = false;
-        let mut x25519_public = None;
+        let mut key_share = None;
         let ext_bytes = b.vec_u16()?;
         let mut er = Reader::new(ext_bytes);
         while er.remaining() > 0 {
@@ -220,23 +267,16 @@ impl ServerHello {
                         supported_version_ok = true;
                     }
                 }
-                EXT_KEY_SHARE => {
-                    let mut kr = Reader::new(ext_body);
-                    let group = kr.u16()?;
-                    let data = kr.vec_u16()?;
-                    if group == GROUP_X25519 && data.len() == 32 {
-                        x25519_public = Some(<[u8; 32]>::try_from(data)?);
-                    }
-                }
+                EXT_KEY_SHARE => key_share = parse_server_key_share(ext_body)?,
                 _ => {}
             }
         }
         if !supported_version_ok {
             return Err(anyhow!("ServerHello does not negotiate TLS 1.3"));
         }
-        let x25519_public = x25519_public.ok_or_else(|| anyhow!("ServerHello: no usable X25519 key_share"))?;
+        let key_share = key_share.ok_or_else(|| anyhow!("ServerHello: no usable key_share"))?;
 
-        Ok(Self { cipher_suite, x25519_public, raw: msg.to_vec() })
+        Ok(Self { cipher_suite, key_share, raw: msg.to_vec() })
     }
 }
 
@@ -375,8 +415,11 @@ fn parse_server_name_extension(body: &[u8]) -> Result<String> {
     Ok(String::from_utf8_lossy(name).into_owned())
 }
 
-fn supported_groups_extension() -> Vec<u8> {
+fn supported_groups_extension(include_x25519_mlkem768: bool) -> Vec<u8> {
     let mut w = Writer::new();
+    if include_x25519_mlkem768 {
+        w.u16(GROUP_X25519_MLKEM768);
+    }
     w.u16(GROUP_X25519);
     let mut out = Writer::new();
     out.vec_u16(&w.into_bytes());
@@ -403,34 +446,90 @@ fn supported_versions_extension() -> Vec<u8> {
 }
 
 /// RFC 8446 §4.2.8's single `KeyShareEntry`: a group plus a length-prefixed key.
-fn key_share_entry(group: u16, public_key: &[u8; 32]) -> Vec<u8> {
+fn key_share_entry(group: u16, key_exchange: &[u8]) -> Vec<u8> {
     let mut entry = Writer::new();
     entry.u16(group);
-    entry.vec_u16(public_key);
+    entry.vec_u16(key_exchange);
     entry.into_bytes()
+}
+
+fn server_key_share_entry(share: &ServerKeyShare) -> Vec<u8> {
+    match share {
+        ServerKeyShare::X25519(x25519_public) => key_share_entry(GROUP_X25519, x25519_public),
+        ServerKeyShare::X25519MlKem768 { ciphertext, x25519_public } => {
+            let mut key_exchange = Vec::with_capacity(ciphertext.len() + X25519_KEY_LEN);
+            key_exchange.extend_from_slice(ciphertext);
+            key_exchange.extend_from_slice(x25519_public);
+            key_share_entry(GROUP_X25519_MLKEM768, &key_exchange)
+        }
+    }
 }
 
 /// RFC 8446 §4.2.8's `KeyShareClientHello` body is a `<2..2^16-1>`-length list of `KeyShareEntry`;
 /// the server's is a bare entry, so the client form needs a list-length prefix
-/// [`key_share_entry`] alone does not carry.
-fn key_share_extension_client(group: u16, public_key: &[u8; 32]) -> Vec<u8> {
+/// [`key_share_entry`] alone does not carry. The hybrid entry is listed first, mirroring the
+/// browser hellos: `mlkem_encapsulation_key (1184) || x25519_public (32)`.
+fn key_share_extension_client(x25519_public: [u8; 32], x25519_mlkem768_encapsulation_key: Option<&[u8]>) -> Vec<u8> {
+    let mut entries = Vec::new();
+    if let Some(encapsulation_key) = x25519_mlkem768_encapsulation_key {
+        let mut key_exchange = Vec::with_capacity(encapsulation_key.len() + X25519_KEY_LEN);
+        key_exchange.extend_from_slice(encapsulation_key);
+        key_exchange.extend_from_slice(&x25519_public);
+        entries.extend_from_slice(&key_share_entry(GROUP_X25519_MLKEM768, &key_exchange));
+    }
+    entries.extend_from_slice(&key_share_entry(GROUP_X25519, &x25519_public));
     let mut list = Writer::new();
-    list.vec_u16(&key_share_entry(group, public_key));
+    list.vec_u16(&entries);
     list.into_bytes()
 }
 
-/// Picks our entry out of a client that offers several groups; mirrors
-/// [`key_share_extension_client`]'s list framing.
-fn parse_key_share_client(body: &[u8], want_group: u16) -> Result<Option<[u8; 32]>> {
+/// The shares a `ClientHello` offers that REALITY uses: the X25519 point to derive `AuthKey`
+/// from, and the ML-KEM encapsulation key when the client offered the hybrid group.
+struct ClientKeyShares {
+    x25519: Option<[u8; 32]>,
+    mlkem768_encapsulation_key: Option<Vec<u8>>,
+}
+
+/// Picks the entries out of a client that offers several groups; mirrors
+/// [`key_share_extension_client`]'s list framing. A standalone `X25519` entry wins over the
+/// hybrid share's trailing half, so a client that sends both is authenticated from the entry
+/// REALITY's `AuthKey` derivation was written against, whichever order the list uses.
+fn parse_client_key_shares(body: &[u8]) -> Result<ClientKeyShares> {
     let mut r = Reader::new(body);
     let list = r.vec_u16()?;
     let mut lr = Reader::new(list);
+    let mut x25519 = None;
+    let mut mlkem768_x25519 = None;
+    let mut mlkem768_encapsulation_key = None;
     while lr.remaining() > 0 {
         let group = lr.u16()?;
         let data = lr.vec_u16()?;
-        if group == want_group && data.len() == 32 {
-            return Ok(Some(<[u8; 32]>::try_from(data)?));
+        match group {
+            GROUP_X25519 if data.len() == X25519_KEY_LEN => x25519 = Some(<[u8; 32]>::try_from(data)?),
+            GROUP_X25519_MLKEM768 if data.len() == MLKEM768_ENCAPSULATION_KEY_LEN + X25519_KEY_LEN => {
+                let (encapsulation_key, x25519_public) = data.split_at(MLKEM768_ENCAPSULATION_KEY_LEN);
+                mlkem768_encapsulation_key = Some(encapsulation_key.to_vec());
+                mlkem768_x25519 = Some(<[u8; 32]>::try_from(x25519_public)?);
+            }
+            _ => {}
         }
     }
-    Ok(None)
+    Ok(ClientKeyShares { x25519: x25519.or(mlkem768_x25519), mlkem768_encapsulation_key })
+}
+
+fn parse_server_key_share(body: &[u8]) -> Result<Option<ServerKeyShare>> {
+    let mut r = Reader::new(body);
+    let group = r.u16()?;
+    let data = r.vec_u16()?;
+    match group {
+        GROUP_X25519 if data.len() == X25519_KEY_LEN => Ok(Some(ServerKeyShare::X25519(<[u8; 32]>::try_from(data)?))),
+        GROUP_X25519_MLKEM768 if data.len() == MLKEM768_CIPHERTEXT_LEN + X25519_KEY_LEN => {
+            let (ciphertext, x25519_public) = data.split_at(MLKEM768_CIPHERTEXT_LEN);
+            Ok(Some(ServerKeyShare::X25519MlKem768 {
+                ciphertext: ciphertext.to_vec(),
+                x25519_public: <[u8; 32]>::try_from(x25519_public)?,
+            }))
+        }
+        _ => Ok(None),
+    }
 }

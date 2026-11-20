@@ -393,12 +393,17 @@ async fn complete_authenticated_handshake_inner<S: AsyncRead + AsyncWrite + Unpi
     let (server_private, server_public) = crate::suite::generate_x25519_keypair();
     let mut server_random = [0u8; 32];
     rand::rng().fill_bytes(&mut server_random);
-    let server_hello = ServerHello::build(server_random, &client_hello.session_id, suite, server_public);
+    let server_hello = ServerHello::build(
+        server_random,
+        &client_hello.session_id,
+        suite,
+        handshake::ServerKeyShare::X25519(server_public),
+    );
     record_layer.write_plaintext_handshake(&server_hello.raw).await?;
 
     let tls_shared = x25519_dalek::x25519(
         server_private,
-        client_hello.x25519_public.ok_or_else(|| anyhow!("REALITY: ClientHello without X25519 key share"))?,
+        client_hello.x25519_public.ok_or_else(|| anyhow!("REALITY: ClientHello without an X25519 key share"))?,
     );
     let mut transcript = suite.transcript();
     transcript.update(&client_hello.raw);

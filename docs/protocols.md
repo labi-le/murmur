@@ -179,7 +179,9 @@ last non-zero octet — which is what a REALITY server's zero-padded records req
 reference's `utls` implementation does. The client advertises ECDSA P384/SHA384 so a mirrored
 target using a P384 certificate can negotiate before REALITY substitutes its Ed25519 authentication
 certificate; REALITY authentication still verifies Ed25519. This is not browser fingerprint
-emulation. An in-memory regression rejects a ClientHello without the target's required P384 offer,
+emulation. `support-x25519mlkem768` makes the ClientHello offer the `X25519MLKEM768` hybrid key
+share alongside `X25519`, and the client completes the handshake whichever group the server
+selects. An in-memory regression rejects a ClientHello without the target's required P384 offer,
 then completes the authenticated REALITY handshake and application-data exchange when it is present.
 Live third-party dials remain outside the automated suite.
 
