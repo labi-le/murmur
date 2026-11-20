@@ -1,11 +1,14 @@
 use std::collections::HashMap;
+use std::io;
+use std::pin::Pin;
 use std::sync::Arc;
+use std::task::{Context, Poll};
 
 use anyhow::{anyhow, Result};
 use async_trait::async_trait;
 use base64::engine::general_purpose::STANDARD;
 use base64::Engine as _;
-use tokio::io::{AsyncBufReadExt, AsyncRead, AsyncWriteExt, BufReader};
+use tokio::io::{AsyncBufReadExt, AsyncRead, AsyncWrite, AsyncWriteExt, BufReader, ReadBuf};
 use tokio_util::sync::CancellationToken;
 
 use murmur_common::shared_conn::SharedConn;
@@ -17,7 +20,7 @@ use murmur_constant::adapters::{
     AdapterType, Conn as CConn, PacketConn as CPacketConn, Proxy, ProxyAdapter as CProxyAdapter, ProxyInfo,
 };
 use murmur_constant::metadata::Metadata;
-use murmur_std_compat::net::Conn as NetConn;
+use murmur_std_compat::net::{Addr, Conn as NetConn};
 
 use super::base::{new_conn, Base, BaseOption, BasicOption, ProxyAdapter as BaseProxyAdapter};
 use super::util::safe_conn_close;
@@ -169,17 +172,23 @@ impl Http {
     ) -> Result<Box<dyn NetConn>> {
         let shared = SharedConn::from_boxed(c);
         let mut done = setup_context_for_conn(ctx, shared.clone());
-        let result = self.shake_hand_io(&shared, metadata).await;
-        let mut err_opt = result.err();
+        let (buffered, mut err_opt) = match self.shake_hand_io(&shared, metadata).await {
+            Ok(buffered) => (buffered, None),
+            Err(err) => (None, Some(err)),
+        };
         done.call(&mut err_opt).await;
-        match err_opt {
-            Some(err) => Err(err),
+        if let Some(err) = err_opt {
+            return Err(err);
+        }
+        match buffered {
+            Some(conn) => Ok(Box::new(conn)),
             None => Ok(Box::new(shared)),
         }
     }
 
-    /// The header write and status-line read of the CONNECT handshake.
-    async fn shake_hand_io(&self, c: &SharedConn, metadata: &Metadata) -> Result<()> {
+    /// The header write and status-line read of the CONNECT handshake. Returns the bytes that
+    /// arrived behind the response headers, still unsent by the proxy, when there are any.
+    async fn shake_hand_io(&self, c: &SharedConn, metadata: &Metadata) -> Result<Option<BufferedConnectConn>> {
         let addr = metadata.remote_address();
         let mut header_string = format!("CONNECT {addr} HTTP/1.1\r\n");
         let mut temp_headers: HashMap<String, String> = HashMap::new();
@@ -207,10 +216,10 @@ impl Http {
         c.write_all(header_string.as_bytes()).await?;
         c.clone().flush().await?;
 
-        let (status_code, status) = read_connect_response(c.clone()).await?;
+        let (status_code, status, buffered) = read_connect_response(c.clone()).await?;
 
         if status_code == 200 {
-            return Ok(());
+            return Ok(buffered);
         }
         if status_code == 407 {
             return Err(anyhow!("HTTP need auth"));
@@ -225,8 +234,70 @@ impl Http {
     }
 }
 
+/// A tunnel conn that returns the bytes the proxy sent behind its 200 response before reading
+/// the underlying connection; those bytes are the tunnel's first payload, not handshake text.
+struct BufferedConnectConn {
+    reader: BufReader<SharedConn>,
+}
+
+impl AsyncRead for BufferedConnectConn {
+    fn poll_read(self: Pin<&mut Self>, cx: &mut Context<'_>, buf: &mut ReadBuf<'_>) -> Poll<io::Result<()>> {
+        Pin::new(&mut self.get_mut().reader).poll_read(cx, buf)
+    }
+}
+
+impl AsyncWrite for BufferedConnectConn {
+    fn poll_write(self: Pin<&mut Self>, cx: &mut Context<'_>, buf: &[u8]) -> Poll<io::Result<usize>> {
+        Pin::new(self.get_mut().reader.get_mut()).poll_write(cx, buf)
+    }
+
+    fn poll_flush(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+        Pin::new(self.get_mut().reader.get_mut()).poll_flush(cx)
+    }
+
+    fn poll_shutdown(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+        Pin::new(self.get_mut().reader.get_mut()).poll_shutdown(cx)
+    }
+}
+
+impl NetConn for BufferedConnectConn {
+    fn local_addr(&self) -> io::Result<Box<dyn Addr>> {
+        self.reader.get_ref().local_addr()
+    }
+
+    fn remote_addr(&self) -> io::Result<Box<dyn Addr>> {
+        self.reader.get_ref().remote_addr()
+    }
+
+    fn close(&self) -> io::Result<()> {
+        self.reader.get_ref().close()
+    }
+
+    fn close_read(&self) -> io::Result<()> {
+        self.reader.get_ref().close_read()
+    }
+
+    fn close_write(&self) -> io::Result<()> {
+        self.reader.get_ref().close_write()
+    }
+
+    fn set_deadline(&self, deadline: Option<tokio::time::Instant>) -> io::Result<()> {
+        self.reader.get_ref().set_deadline(deadline)
+    }
+
+    fn set_read_deadline(&self, deadline: Option<tokio::time::Instant>) -> io::Result<()> {
+        self.reader.get_ref().set_read_deadline(deadline)
+    }
+
+    fn set_write_deadline(&self, deadline: Option<tokio::time::Instant>) -> io::Result<()> {
+        self.reader.get_ref().set_write_deadline(deadline)
+    }
+}
+
 /// Parses the CONNECT status line, reduced to the status code and text this caller inspects.
-async fn read_connect_response<R: AsyncRead + Unpin>(r: R) -> Result<(u16, String)> {
+/// A proxy may send the target's first bytes in the same segment as the response headers, so
+/// those bytes come back on the returned conn instead of being dropped with the read buffer.
+async fn read_connect_response(r: SharedConn) -> Result<(u16, String, Option<BufferedConnectConn>)> {
     let mut reader = BufReader::new(r);
     let mut line = String::new();
     reader.read_line(&mut line).await?;
@@ -243,7 +314,8 @@ async fn read_connect_response<R: AsyncRead + Unpin>(r: R) -> Result<(u16, Strin
             break;
         }
     }
-    Ok((status_code, format!("{status_code} {reason}")))
+    let buffered = if reader.buffer().is_empty() { None } else { Some(BufferedConnectConn { reader }) };
+    Ok((status_code, format!("{status_code} {reason}"), buffered))
 }
 
 #[async_trait]
@@ -321,5 +393,51 @@ impl BaseProxyAdapter for Http {
 
     async fn resolve_udp(&self, ctx: &CancellationToken, metadata: &mut Metadata) -> Result<()> {
         self.base.resolve_udp(ctx, metadata).await
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use tokio::io::AsyncReadExt;
+    use tokio::net::{TcpListener, TcpStream};
+
+    use super::*;
+
+    /// The proxy writes its 200 response and the target's first bytes in one segment, so the
+    /// status-line reader buffers both. The tunnel must still deliver the target's bytes.
+    #[tokio::test]
+    async fn connect_response_payload_buffered_behind_the_header_reaches_the_tunnel() {
+        const PAYLOAD: &[u8] = b"hello-from-target";
+        let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind mock proxy");
+        let proxy_addr = listener.local_addr().expect("mock proxy address");
+        let proxy = tokio::spawn(async move {
+            let (mut conn, _) = listener.accept().await.expect("accept CONNECT");
+            let mut request = [0u8; 4096];
+            let read = conn.read(&mut request).await.expect("read CONNECT request");
+            assert_ne!(read, 0, "CONNECT request was empty");
+            let mut response = b"HTTP/1.1 200 Connection established\r\n\r\n".to_vec();
+            response.extend_from_slice(PAYLOAD);
+            conn.write_all(&response).await.expect("write CONNECT response");
+            conn.flush().await.expect("flush CONNECT response");
+        });
+
+        let adapter = Http::new(HttpOption {
+            name: "http-connect-test".to_owned(),
+            server: "127.0.0.1".to_owned(),
+            port: proxy_addr.port(),
+            ..HttpOption::default()
+        })
+        .expect("create http adapter");
+        let client = TcpStream::connect(proxy_addr).await.expect("connect to mock proxy");
+        let metadata = Metadata { host: "target.example".to_owned(), dst_port: 22, ..Metadata::default() };
+        let mut tunnel = adapter
+            .stream_conn_context(&CancellationToken::new(), Box::new(client), &metadata)
+            .await
+            .expect("HTTP CONNECT handshake");
+
+        let mut received = Vec::new();
+        tunnel.read_to_end(&mut received).await.expect("read tunnel");
+        assert_eq!(received, PAYLOAD);
+        proxy.await.expect("mock proxy task");
     }
 }
