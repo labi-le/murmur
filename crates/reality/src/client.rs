@@ -5,17 +5,19 @@
 //! minimal TLS 1.3 handshake, not full browser-fingerprint mimicry (client-hello or JA3 spoofing).
 //! A censor doing TLS fingerprinting could tell this apart from a real browser; REALITY's own core
 //! trick -- proving identity via a self-signed certificate's forged signature field -- is
-//! implemented faithfully and interoperates with a real REALITY server. The X25519MLKEM768 hybrid
-//! is accepted but always treated as disabled: the hybrid group "does not work properly with the
-//! old reality server", so classic X25519 is both the safer default and the only key-exchange
-//! group this crate implements.
+//! implemented faithfully and interoperates with a real REALITY server. The X25519MLKEM768
+//! hybrid is offered only when `RealityClientConfig::support_x25519_mlkem768` is set: the hybrid
+//! group "does not work properly with the old reality server", so classic X25519 stays the
+//! default and is still offered as a second key share when the hybrid is on, which lets a server
+//! that only speaks X25519 complete the handshake.
 
 use anyhow::{anyhow, Result};
+use ml_kem::{Decapsulate, DecapsulationKey, KeyExport, MlKem768, Seed};
 use rand::RngCore;
 use tokio::io::{AsyncRead, AsyncWrite, AsyncWriteExt};
 
 use crate::cert;
-use crate::handshake::{self, ClientHello, ServerHello};
+use crate::handshake::{self, ClientHello, ServerHello, ServerKeyShare};
 use crate::record::RecordLayer;
 use crate::stream::RealityStream;
 use crate::suite::{CipherSuite, KeySchedule};
@@ -26,10 +28,20 @@ pub const MAX_SHORT_ID_LEN: usize = 8;
 pub struct RealityClientConfig {
     pub public_key: [u8; 32],
     pub short_id: [u8; MAX_SHORT_ID_LEN],
+    /// Offer `X25519MLKEM768` alongside `X25519`. The `AuthKey` is still derived from the
+    /// ephemeral X25519 scalar, whose public key is the hybrid share's trailing half, so either
+    /// group the server selects authenticates.
+    pub support_x25519_mlkem768: bool,
 }
 
 const OFFERED_SUITES: [CipherSuite; 3] =
     [CipherSuite::Aes128GcmSha256, CipherSuite::Aes256GcmSha384, CipherSuite::Chacha20Poly1305Sha256];
+
+fn generate_mlkem_key() -> DecapsulationKey<MlKem768> {
+    let mut seed = [0u8; 64];
+    rand::rng().fill_bytes(&mut seed);
+    DecapsulationKey::<MlKem768>::from_seed(Seed::from(seed))
+}
 
 /// On authentication failure this fires the fallback masking traffic in the background and
 /// returns an error; the caller must not reuse `stream` afterward either way.
@@ -47,8 +59,11 @@ where
     let mut random = [0u8; 32];
     rand::rng().fill_bytes(&mut random);
     let (client_private, client_public) = crate::suite::generate_x25519_keypair();
+    let mlkem_key = cfg.support_x25519_mlkem768.then(generate_mlkem_key);
+    let encapsulation_key = mlkem_key.as_ref().map(|key| key.encapsulation_key().to_bytes().to_vec());
 
-    let mut hello = ClientHello::build(random, &OFFERED_SUITES, server_name, client_public);
+    let mut hello =
+        ClientHello::build(random, &OFFERED_SUITES, server_name, client_public, encapsulation_key.as_deref());
 
     let auth_key_shared = x25519_dalek::x25519(client_private, cfg.public_key);
     let auth_key = crate::suite::hkdf_sha256_reality(&auth_key_shared, &random[..20]);
@@ -77,7 +92,20 @@ where
     let server_hello = ServerHello::parse(&server_hello_msg)?;
     let suite = server_hello.cipher_suite;
 
-    let tls_shared = x25519_dalek::x25519(client_private, server_hello.x25519_public);
+    let tls_shared = match &server_hello.key_share {
+        ServerKeyShare::X25519(server_public) => x25519_dalek::x25519(client_private, *server_public).to_vec(),
+        ServerKeyShare::X25519MlKem768 { ciphertext, x25519_public } => {
+            let Some(mlkem_key) = mlkem_key.as_ref() else {
+                return Err(anyhow!("REALITY: server selected X25519MLKEM768, which this ClientHello did not offer"));
+            };
+            let mlkem_shared = mlkem_key
+                .decapsulate_slice(ciphertext)
+                .map_err(|_| anyhow!("REALITY: server X25519MLKEM768 key share is not a valid ML-KEM ciphertext"))?;
+            let mut shared = mlkem_shared.as_slice().to_vec();
+            shared.extend_from_slice(&x25519_dalek::x25519(client_private, *x25519_public));
+            shared
+        }
+    };
 
     let mut transcript = suite.transcript();
     transcript.update(&hello.raw);

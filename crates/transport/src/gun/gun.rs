@@ -1084,7 +1084,11 @@ mod tests {
             // REALITY runs over uTLS, so a REALITY config with no client fingerprint is rejected;
             // every config converter defaults it to `chrome`.
             client_fingerprint: "chrome".to_owned(),
-            reality: Some(Arc::new(RealityClientConfig { public_key: server_public, short_id })),
+            reality: Some(Arc::new(RealityClientConfig {
+                public_key: server_public,
+                short_id,
+                support_x25519_mlkem768: false,
+            })),
             ..Default::default()
         };
 

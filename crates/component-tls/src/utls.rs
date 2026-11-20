@@ -213,7 +213,12 @@ pub fn hello_randomized_no_alpn() -> UClientHelloID {
 
 #[must_use]
 pub fn hello_firefox_auto() -> UClientHelloID {
-    hello_firefox_120()
+    hello_firefox_148()
+}
+
+#[must_use]
+pub fn hello_firefox_148() -> UClientHelloID {
+    client_hello_id("Firefox", "148")
 }
 
 #[must_use]
@@ -288,7 +293,12 @@ pub fn hello_edge_85() -> UClientHelloID {
 
 #[must_use]
 pub fn hello_safari_auto() -> UClientHelloID {
-    hello_safari_16_0()
+    hello_safari_26_3()
+}
+
+#[must_use]
+pub fn hello_safari_26_3() -> UClientHelloID {
+    client_hello_id("Safari", "26.3")
 }
 
 #[must_use]
@@ -1955,6 +1965,9 @@ pub struct UConn {
     pub handshake_state: PubClientHandshakeState,
     client_hello_build_status: ClientHelloBuildStatus,
     padding: Option<PaddingPlan>,
+    /// Set by [`hello_plan`] for Firefox 148: the `X25519` key share reuses the hybrid share's
+    /// X25519 scalar and public key instead of generating a second pair.
+    reuse_hybrid_x25519_key_share: bool,
     /// `Some` once [`Self::handshake_context`] has driven the fingerprinted handshake. Until
     /// then every read and write still goes to the embedded [`Conn`], so a caller that never
     /// handshakes behaves exactly as before.
@@ -2780,6 +2793,7 @@ impl UConn {
             handshake_state: PubClientHandshakeState::default(),
             client_hello_build_status: ClientHelloBuildStatus::NotBuilt,
             padding: None,
+            reuse_hybrid_x25519_key_share: false,
             engine: Mutex::new(None),
         }
     }
@@ -2841,6 +2855,7 @@ impl UConn {
         self.extensions = plan.extensions;
         self.handshake_state.hello.cipher_suites = plan.cipher_suites;
         self.padding = plan.padding;
+        self.reuse_hybrid_x25519_key_share = plan.reuse_hybrid_x25519_key_share;
     }
 
     /// The Boring padding style: a `ClientHello` whose
@@ -2877,6 +2892,10 @@ impl UConn {
 
     fn generate_key_shares(&mut self) -> Result<()> {
         let mut keys = KeySharePrivateKeys::default();
+        // Firefox 148 sends the hybrid share's X25519 public key again as the standalone
+        // `X25519` entry, and answers either group with that same scalar.
+        let reuse_hybrid_x25519_key_share = self.reuse_hybrid_x25519_key_share;
+        let mut hybrid_x25519: Option<StaticSecret> = None;
         for extension in &mut self.extensions {
             let Some(key_share_extension) = extension.as_key_share_mut() else {
                 continue;
@@ -2896,7 +2915,19 @@ impl UConn {
                     let mut data = mlkem_key.encapsulation_key().to_bytes().to_vec();
                     data.extend_from_slice(PublicKey::from(&ecdhe_key).as_bytes());
                     key_share.data = data;
+                    if reuse_hybrid_x25519_key_share {
+                        hybrid_x25519 = Some(ecdhe_key.clone());
+                    }
                     keys.shares.push(ShareKeys { curve_id, ecdhe: Some(ecdhe_key), mlkem: Some(mlkem_key), kx: None });
+                } else if reuse_hybrid_x25519_key_share && curve_id == CurveId::X25519 {
+                    let Some(ecdhe_key) = hybrid_x25519.clone() else {
+                        return Err(anyhow!(
+                            "tls: the X25519 key share reuses the hybrid share's scalar, but no X25519MLKEM768 \
+                             share preceded it"
+                        ));
+                    };
+                    key_share.data = PublicKey::from(&ecdhe_key).to_bytes().to_vec();
+                    keys.shares.push(ShareKeys { curve_id, ecdhe: Some(ecdhe_key), mlkem: None, kx: None });
                 } else {
                     let ecdhe_key = generate_x25519_for_curve(curve_id)?;
                     key_share.data = PublicKey::from(&ecdhe_key).to_bytes().to_vec();
@@ -2986,10 +3017,17 @@ const EXTENSION_STATUS_REQUEST: u16 = 5;
 const EXTENSION_EC_POINT_FORMATS: u16 = 11;
 const EXTENSION_SCT: u16 = 18;
 const EXTENSION_PADDING: u16 = 21;
+const EXTENSION_COMPRESS_CERTIFICATE: u16 = 27;
 const EXTENSION_RECORD_SIZE_LIMIT: u16 = 28;
+const EXTENSION_DELEGATED_CREDENTIALS: u16 = 34;
 const EXTENSION_RENEGOTIATION_INFO: u16 = 0xff01;
 const EXTENSION_APPLICATION_SETTINGS: u16 = 17513;
 const EXTENSION_APPLICATION_SETTINGS_NEW: u16 = 17613;
+
+/// RFC 8879's `CertificateCompressionAlgorithm` values.
+const CERT_COMPRESSION_ZLIB: u16 = 1;
+const CERT_COMPRESSION_BROTLI: u16 = 2;
+const CERT_COMPRESSION_ZSTD: u16 = 3;
 
 /// The Boring padding style's target `ClientHello` length.
 const BORING_PADDING_TARGET: usize = 0x200;
@@ -3005,6 +3043,8 @@ const CHROME_CIPHER_SUITES: &[u16] = &[
     0x0035,
 ];
 const CHROME_GROUPS: &[u16] = &[X25519MLKEM768_GROUP, X25519_GROUP, 23, 24];
+/// Chrome 120 and the earlier Chromium shape Edge, 360 and QQ present: classical groups only.
+const CHROME_120_GROUPS: &[u16] = &[X25519_GROUP, 23, 24];
 const CHROME_KEY_SHARES: &[u16] = &[X25519MLKEM768_GROUP, X25519_GROUP];
 const CHROME_SIGNATURE_ALGORITHMS: &[u16] =
     &[0x0403, 0x0804, 0x0401, 0x0503, 0x0805, 0x0806, 0x0603, 0x0601, 0x0807, 0x0203];
@@ -3023,18 +3063,42 @@ const FIREFOX_CIPHER_SUITES: &[u16] = &[
     0x1301, 0x1303, 0x1302, 0xc02b, 0xc02f, 0xcca9, 0xcca8, 0xc02c, 0xc030, 0xc00c, 0xc013, 0xc014, 0x009c, 0x009d,
     0x002f, 0x0035,
 ];
-const FIREFOX_GROUPS: &[u16] = &[X25519MLKEM768_GROUP, X25519_GROUP, 23, 24, 25, 256];
-const FIREFOX_KEY_SHARES: &[u16] = &[X25519MLKEM768_GROUP, X25519_GROUP];
+/// Firefox 148's list: the same shape with the two ECDHE CBC suites Firefox 120 had dropped.
+const FIREFOX_148_CIPHER_SUITES: &[u16] = &[
+    0x1301, 0x1303, 0x1302, 0xc02b, 0xc02f, 0xcca9, 0xcca8, 0xc02c, 0xc030, 0xc00a, 0xc009, 0xc013, 0xc014, 0x009c,
+    0x009d, 0x002f, 0x0035,
+];
+/// Firefox 120: classical groups only, for servers that break on a large hybrid key share.
+const FIREFOX_GROUPS: &[u16] = &[X25519_GROUP, 23, 24, 25, 256];
+/// Firefox 148 offers the hybrid group and appends the ML-DSA hybrid signature groups.
+const FIREFOX_148_GROUPS: &[u16] = &[X25519MLKEM768_GROUP, X25519_GROUP, 23, 24, 25, 256, 257];
+const FIREFOX_120_KEY_SHARES: &[u16] = &[X25519_GROUP];
+const FIREFOX_148_KEY_SHARES: &[u16] = &[X25519MLKEM768_GROUP, X25519_GROUP];
 const FIREFOX_SIGNATURE_ALGORITHMS: &[u16] =
     &[0x0503, 0x0501, 0x0403, 0x0401, 0x0805, 0x0804, 0x0806, 0x0501, 0x0601, 0x0603, 0x0807, 0x0203];
+const FIREFOX_148_SIGNATURE_ALGORITHMS: &[u16] =
+    &[0x0403, 0x0503, 0x0603, 0x0804, 0x0805, 0x0806, 0x0401, 0x0501, 0x0601, 0x0203, 0x0201];
+/// The schemes Firefox 148 lists under `delegated_credentials` (RFC 9345).
+const FIREFOX_148_DELEGATED_CREDENTIAL_SCHEMES: &[u16] = &[0x0403, 0x0503, 0x0603, 0x0203];
 
 const SAFARI_CIPHER_SUITES: &[u16] = &[
     0x1301, 0x1302, 0x1303, 0xc02b, 0xc02f, 0xc02c, 0xc030, 0xcca9, 0xcca8, 0xc013, 0xc014, 0x009c, 0x009d, 0x002f,
     0x0035,
 ];
+/// Safari 16.0: classical groups only, for servers that break on a large hybrid key share.
 const SAFARI_GROUPS: &[u16] = &[X25519_GROUP, 23, 24, 25];
 const SAFARI_SIGNATURE_ALGORITHMS: &[u16] =
     &[0x0403, 0x0804, 0x0401, 0x0503, 0x0805, 0x0806, 0x0603, 0x0601, 0x0807, 0x0203, 0x0201];
+
+/// Safari 26.3's list: WebKit's TLS 1.3 preference order followed by its CBC and 3DES tail.
+const SAFARI_26_3_CIPHER_SUITES: &[u16] = &[
+    0x1302, 0x1303, 0x1301, 0xc02c, 0xc02b, 0xcca9, 0xc030, 0xc02f, 0xcca8, 0xc00a, 0xc009, 0xc014, 0xc013, 0x009d,
+    0x009c, 0x0035, 0x002f, 0xc008, 0xc012, 0x000a,
+];
+const SAFARI_26_3_GROUPS: &[u16] = &[X25519MLKEM768_GROUP, X25519_GROUP, 23, 24, 25];
+const SAFARI_26_3_KEY_SHARES: &[u16] = &[X25519MLKEM768_GROUP, X25519_GROUP];
+const SAFARI_26_3_SIGNATURE_ALGORITHMS: &[u16] =
+    &[0x0403, 0x0804, 0x0401, 0x0503, 0x0805, 0x0805, 0x0501, 0x0806, 0x0601, 0x0201];
 
 const ANDROID_CIPHER_SUITES: &[u16] = &[
     0x1301, 0x1302, 0x1303, 0xc02b, 0xc02f, 0xc02c, 0xc030, 0xcca9, 0xcca8, 0xc013, 0xc014, 0x009c, 0x009d, 0x002f,
@@ -3051,11 +3115,15 @@ const ANDROID_SIGNATURE_ALGORITHMS: &[u16] =
 /// translation of them. What each family does model is pinned by the preset tests below; what it
 /// does not:
 /// - no shape carries `signature_algorithms_cert` (`SignatureAlgorithmsCertExtension` is used
-///   nowhere, and none of the hellos below have it),
-///   nor `compress_certificate`, ECH, `delegated_credentials`, NPN or `channel_id`.
-/// - `Chrome` renders every Chrome version with one shape, where the shuffling variant
+///   nowhere, and none of the hellos below have it), nor ECH, NPN or `channel_id`.
+///   `compress_certificate` appears in the Firefox 148 and Safari 26.3 shapes, and
+///   `delegated_credentials` in Firefox 148's.
+/// - `Chrome` renders every Chrome version with one shape except 120, which drops the
+///   post-quantum key share, where the shuffling variant
 ///   shuffles the whole extension list from Chrome 106 on, and the PQ variant
 ///   is keyed on X25519Kyber768Draft00 instead of X25519MLKEM768.
+/// - Firefox 148's ECH GREASE extension and its P-256 key share are not modelled.
+/// - Safari 26.3's GREASE slots all carry one drawn value instead of one per slot.
 /// - the Android OkHttp shape is TLS 1.2-only, so this crate's TLS 1.3
 ///   extensions (`key_share`/`psk_key_exchange_modes`/`supported_versions`) are extra.
 /// - the 360 7.5 shape is a TLS 1.2 hello with NPN, `channel_id_old` and an `spdy` ALPN list.
@@ -3101,6 +3169,9 @@ struct HelloPlan {
     extensions: Vec<Box<dyn TlsExtension>>,
     cipher_suites: Vec<u16>,
     padding: Option<PaddingPlan>,
+    /// Firefox 148 sends the hybrid share's X25519 public key again as the standalone `X25519`
+    /// entry and answers either group with the same scalar.
+    reuse_hybrid_x25519_key_share: bool,
 }
 
 /// The extension list a family builder produces, plus where its padding extension belongs.
@@ -3168,6 +3239,40 @@ fn alpn_extension(config: &Config) -> Option<Box<dyn TlsExtension>> {
     })
 }
 
+/// RFC 9345's `SignatureSchemeList`: a u16 byte-length prefix followed by the `u16` schemes, the
+/// same encoding `signature_algorithms` uses.
+#[expect(
+    clippy::cast_possible_truncation,
+    reason = "the fixed delegated-credentials list is far below the u16 length field's range"
+)]
+fn signature_scheme_list(values: &[u16]) -> Vec<u8> {
+    let mut list = Vec::with_capacity(values.len() * 2);
+    for value in values {
+        list.extend_from_slice(&value.to_be_bytes());
+    }
+    let mut body = Vec::with_capacity(list.len() + 2);
+    body.extend_from_slice(&(list.len() as u16).to_be_bytes());
+    body.extend_from_slice(&list);
+    body
+}
+
+/// RFC 8879's `compress_certificate` body: a u8 byte-length prefix followed by the `u16`
+/// algorithm ids.
+#[expect(
+    clippy::cast_possible_truncation,
+    reason = "the fixed certificate compression list is far below the u8 length field's range"
+)]
+fn certificate_compression_algorithms(values: &[u16]) -> Vec<u8> {
+    let mut list = Vec::with_capacity(values.len() * 2);
+    for value in values {
+        list.extend_from_slice(&value.to_be_bytes());
+    }
+    let mut body = Vec::with_capacity(list.len() + 1);
+    body.push(list.len() as u8);
+    body.extend_from_slice(&list);
+    body
+}
+
 /// All three randomized ids are generated the same way; the id only picks the ALPN policy.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum RandomizedAlpn {
@@ -3194,22 +3299,98 @@ fn hello_plan(id: &ClientHelloId, config: &Config) -> HelloPlan {
             extensions: default_extensions(config),
             cipher_suites: builtin_cipher_suites(),
             padding: None,
+            reuse_hybrid_x25519_key_share: false,
         };
     };
-    // Edge, 360 and QQ are Chromium stacks, so they keep Chromium's GREASE but not its
-    // post-quantum key share or its ALPS tail.
-    let grease = matches!(browser, Browser::Chrome | Browser::Edge | Browser::Chinese360 | Browser::ChineseQq)
-        .then(random_grease);
-    let (extensions, padding) = match browser {
-        Browser::Chrome => chrome_extensions(config, grease, true, alps_code_point(&id.version)),
-        Browser::Edge | Browser::Chinese360 | Browser::ChineseQq => {
-            chrome_extensions(config, grease, false, EXTENSION_APPLICATION_SETTINGS)
-        }
-        Browser::Firefox => firefox_extensions(config),
-        Browser::Safari | Browser::Ios => (safari_extensions(config), None),
-        Browser::Android => (android_extensions(config), None),
+    match browser {
+        Browser::Chrome => chrome_plan(config, &id.version),
+        Browser::Edge | Browser::Chinese360 | Browser::ChineseQq => legacy_chromium_plan(browser, config),
+        Browser::Firefox => firefox_plan(config, &id.version),
+        Browser::Safari => safari_plan(config, &id.version),
+        Browser::Ios | Browser::Android => android_plan(browser, config),
+    }
+}
+
+/// The current Chrome shape. Chrome 120 stays the classical, non-post-quantum profile: upstream
+/// keeps it for servers and middleboxes that break on a large hybrid key share.
+fn chrome_plan(config: &Config, version: &str) -> HelloPlan {
+    let grease = Some(random_grease());
+    let (groups, shares): (&[u16], &[u16]) =
+        if version == "120" { (CHROME_120_GROUPS, &[X25519_GROUP]) } else { (CHROME_GROUPS, CHROME_KEY_SHARES) };
+    let (extensions, padding) = chrome_extensions(config, grease, groups, shares, Some(alps_code_point(version)));
+    HelloPlan {
+        extensions,
+        cipher_suites: cipher_suites_of(Browser::Chrome, grease),
+        padding,
+        reuse_hybrid_x25519_key_share: false,
+    }
+}
+
+/// Edge, 360 and QQ are Chromium stacks: they keep Chromium's GREASE but not its post-quantum key
+/// share or its ALPS tail.
+fn legacy_chromium_plan(browser: Browser, config: &Config) -> HelloPlan {
+    let grease = Some(random_grease());
+    let (extensions, padding) = chrome_extensions(config, grease, CHROME_GROUPS, &[X25519_GROUP], None);
+    HelloPlan {
+        extensions,
+        cipher_suites: cipher_suites_of(browser, grease),
+        padding,
+        reuse_hybrid_x25519_key_share: false,
+    }
+}
+
+/// Firefox 148 is [`hello_firefox_auto`]'s shape; Firefox 120 stays the classical profile without
+/// the post-quantum key share.
+fn firefox_plan(config: &Config, version: &str) -> HelloPlan {
+    if version == "148" {
+        let (extensions, padding) = firefox_148_extensions(config);
+        return HelloPlan {
+            extensions,
+            cipher_suites: FIREFOX_148_CIPHER_SUITES.to_vec(),
+            padding,
+            reuse_hybrid_x25519_key_share: true,
+        };
+    }
+    let (extensions, padding) = firefox_extensions(config);
+    HelloPlan {
+        extensions,
+        cipher_suites: FIREFOX_CIPHER_SUITES.to_vec(),
+        padding,
+        reuse_hybrid_x25519_key_share: false,
+    }
+}
+
+/// Safari 26.3 is [`hello_safari_auto`]'s shape; Safari 16.0 stays the classical profile without
+/// the post-quantum key share.
+fn safari_plan(config: &Config, version: &str) -> HelloPlan {
+    if version == "26.3" {
+        let grease = random_grease();
+        return HelloPlan {
+            extensions: safari_26_3_extensions(config, grease),
+            cipher_suites: with_grease(Some(grease), SAFARI_26_3_CIPHER_SUITES),
+            padding: None,
+            reuse_hybrid_x25519_key_share: false,
+        };
+    }
+    HelloPlan {
+        extensions: safari_extensions(config),
+        cipher_suites: SAFARI_CIPHER_SUITES.to_vec(),
+        padding: None,
+        reuse_hybrid_x25519_key_share: false,
+    }
+}
+
+fn android_plan(browser: Browser, config: &Config) -> HelloPlan {
+    let extensions = match browser {
+        Browser::Ios => safari_extensions(config),
+        _ => android_extensions(config),
     };
-    HelloPlan { extensions, cipher_suites: cipher_suites_of(browser, grease), padding }
+    HelloPlan {
+        extensions,
+        cipher_suites: cipher_suites_of(browser, None),
+        padding: None,
+        reuse_hybrid_x25519_key_share: false,
+    }
 }
 
 fn cipher_suites_of(browser: Browser, grease: Option<u16>) -> Vec<u16> {
@@ -3231,16 +3412,17 @@ fn alps_code_point(version: &str) -> u16 {
     }
 }
 
-/// Chromium's extension order. `modern` distinguishes the two shapes this crate models: current
-/// Chrome sends a post-quantum key share and the ALPS tail, while the earlier Chromium shape Edge,
-/// 360 and QQ present sends neither.
-fn chrome_extensions(config: &Config, grease: Option<u16>, modern: bool, alps: u16) -> Shape {
-    let shares = if modern { CHROME_KEY_SHARES } else { &[X25519_GROUP][..] };
+/// Chromium's extension order. `groups` and `shares` pick the key-exchange shape: Chrome 120 drops
+/// the post-quantum group and share it used to send, while the earlier Chromium shape Edge, 360 and
+/// QQ present advertises the group without a share (a server may then answer with a
+/// HelloRetryRequest for it). `alps` is the ALPS code point that shape advertises, or `None` when
+/// it has no ALPS tail at all.
+fn chrome_extensions(config: &Config, grease: Option<u16>, groups: &[u16], shares: &[u16], alps: Option<u16>) -> Shape {
     let mut extensions: Vec<Box<dyn TlsExtension>> = vec![
         Box::new(SniExtension { server_name: config.server_name.clone() }),
         Box::new(ExtendedMasterSecretExtension),
         Box::new(GenericExtension { id: EXTENSION_RENEGOTIATION_INFO, data: vec![0] }),
-        Box::new(SupportedCurvesExtension { curves: curves(&with_grease(grease, CHROME_GROUPS)) }),
+        Box::new(SupportedCurvesExtension { curves: curves(&with_grease(grease, groups)) }),
         Box::new(SessionTicketExtension::default()),
     ];
     extensions.extend(alpn_extension(config));
@@ -3257,19 +3439,21 @@ fn chrome_extensions(config: &Config, grease: Option<u16>, modern: bool, alps: u
         extensions.push(Box::new(GenericExtension { id: grease, data: vec![0] }));
     }
     let padding_index = extensions.len();
-    if modern && !config.next_protos.is_empty() {
-        extensions.push(Box::new(GenericExtension { id: alps, data: application_settings(&config.next_protos) }));
+    if let Some(alps) = alps {
+        if !config.next_protos.is_empty() {
+            extensions.push(Box::new(GenericExtension { id: alps, data: application_settings(&config.next_protos) }));
+        }
     }
     (extensions, Some(PaddingPlan { target: BORING_PADDING_TARGET, index: padding_index }))
 }
 
-/// Firefox: no GREASE and an `ec_point_formats`/`record_size_limit` tail.
+/// Firefox 120: no GREASE and an `ec_point_formats`/`record_size_limit` tail.
 fn firefox_extensions(config: &Config) -> Shape {
     let mut extensions: Vec<Box<dyn TlsExtension>> = vec![
         Box::new(SniExtension { server_name: config.server_name.clone() }),
         Box::new(ExtendedMasterSecretExtension),
         Box::new(SupportedCurvesExtension { curves: curves(FIREFOX_GROUPS) }),
-        Box::new(KeyShareExtension { key_shares: key_shares(None, FIREFOX_KEY_SHARES) }),
+        Box::new(KeyShareExtension { key_shares: key_shares(None, FIREFOX_120_KEY_SHARES) }),
         Box::new(SignatureAlgorithmsExtension {
             supported_signature_algorithms: schemes(FIREFOX_SIGNATURE_ALGORITHMS),
         }),
@@ -3288,7 +3472,46 @@ fn firefox_extensions(config: &Config) -> Shape {
     (extensions, Some(PaddingPlan { target: BORING_PADDING_TARGET, index: padding_index }))
 }
 
-/// Safari and iOS share WebKit's extension set. Neither pads explicitly, so both return no
+/// Firefox 148: still no GREASE, but the post-quantum key share and the `delegated_credentials`/
+/// SCT/`compress_certificate` tail Firefox added after 120. The `X25519` key share reuses the
+/// hybrid share's X25519 half, so `hello_plan` marks the plan with
+/// `reuse_hybrid_x25519_key_share`.
+fn firefox_148_extensions(config: &Config) -> Shape {
+    let mut extensions: Vec<Box<dyn TlsExtension>> = vec![
+        Box::new(SniExtension { server_name: config.server_name.clone() }),
+        Box::new(ExtendedMasterSecretExtension),
+        Box::new(GenericExtension { id: EXTENSION_RENEGOTIATION_INFO, data: vec![0] }),
+        Box::new(SupportedCurvesExtension { curves: curves(FIREFOX_148_GROUPS) }),
+        Box::new(GenericExtension { id: EXTENSION_EC_POINT_FORMATS, data: vec![1, 0] }),
+    ];
+    extensions.extend(alpn_extension(config));
+    extensions.extend([
+        boxed_extension(GenericExtension { id: EXTENSION_STATUS_REQUEST, data: STATUS_REQUEST_BODY.to_vec() }),
+        boxed_extension(GenericExtension {
+            id: EXTENSION_DELEGATED_CREDENTIALS,
+            data: signature_scheme_list(FIREFOX_148_DELEGATED_CREDENTIAL_SCHEMES),
+        }),
+        boxed_extension(GenericExtension { id: EXTENSION_SCT, data: Vec::new() }),
+        boxed_extension(KeyShareExtension { key_shares: key_shares(None, FIREFOX_148_KEY_SHARES) }),
+        boxed_extension(SupportedVersionsExtension { versions: vec![VERSION_TLS13, VERSION_TLS12] }),
+        boxed_extension(SignatureAlgorithmsExtension {
+            supported_signature_algorithms: schemes(FIREFOX_148_SIGNATURE_ALGORITHMS),
+        }),
+        boxed_extension(GenericExtension { id: EXTENSION_RECORD_SIZE_LIMIT, data: vec![0x40, 0x01] }),
+        boxed_extension(GenericExtension {
+            id: EXTENSION_COMPRESS_CERTIFICATE,
+            data: certificate_compression_algorithms(&[
+                CERT_COMPRESSION_ZLIB,
+                CERT_COMPRESSION_BROTLI,
+                CERT_COMPRESSION_ZSTD,
+            ]),
+        }),
+    ]);
+    let padding_index = extensions.len();
+    (extensions, Some(PaddingPlan { target: BORING_PADDING_TARGET, index: padding_index }))
+}
+
+/// Safari 16.0 and iOS share WebKit's extension set. Neither pads explicitly, so both return no
 /// [`PaddingPlan`].
 fn safari_extensions(config: &Config) -> Vec<Box<dyn TlsExtension>> {
     let schemes = schemes(SAFARI_SIGNATURE_ALGORITHMS);
@@ -3305,6 +3528,39 @@ fn safari_extensions(config: &Config) -> Vec<Box<dyn TlsExtension>> {
         boxed_extension(KeyShareExtension { key_shares: key_shares(None, &[X25519_GROUP]) }),
         boxed_extension(PskKeyExchangeModesExtension { modes: vec![1] }),
         boxed_extension(SupportedVersionsExtension { versions: vec![VERSION_TLS13, VERSION_TLS12] }),
+    ]);
+    extensions
+}
+
+/// Safari 26.3: GREASE leads and trails the extension list and appears in the cipher suites,
+/// groups, key shares and versions; the post-quantum key share, `sct` and
+/// `compress_certificate` complete the shape. All GREASE slots carry the same drawn value, as
+/// the Chrome shapes here do.
+fn safari_26_3_extensions(config: &Config, grease: u16) -> Vec<Box<dyn TlsExtension>> {
+    let schemes = schemes(SAFARI_26_3_SIGNATURE_ALGORITHMS);
+    let mut extensions: Vec<Box<dyn TlsExtension>> = vec![
+        Box::new(GenericExtension { id: grease, data: vec![0] }),
+        Box::new(SniExtension { server_name: config.server_name.clone() }),
+        Box::new(ExtendedMasterSecretExtension),
+        Box::new(GenericExtension { id: EXTENSION_RENEGOTIATION_INFO, data: vec![0] }),
+        Box::new(SupportedCurvesExtension { curves: curves(&with_grease(Some(grease), SAFARI_26_3_GROUPS)) }),
+        Box::new(GenericExtension { id: EXTENSION_EC_POINT_FORMATS, data: vec![1, 0] }),
+    ];
+    extensions.extend(alpn_extension(config));
+    extensions.extend([
+        boxed_extension(GenericExtension { id: EXTENSION_STATUS_REQUEST, data: STATUS_REQUEST_BODY.to_vec() }),
+        boxed_extension(SignatureAlgorithmsExtension { supported_signature_algorithms: schemes }),
+        boxed_extension(GenericExtension { id: EXTENSION_SCT, data: Vec::new() }),
+        boxed_extension(KeyShareExtension { key_shares: key_shares(Some(grease), SAFARI_26_3_KEY_SHARES) }),
+        boxed_extension(PskKeyExchangeModesExtension { modes: vec![1] }),
+        boxed_extension(SupportedVersionsExtension {
+            versions: with_grease(Some(grease), &[VERSION_TLS13, VERSION_TLS12]),
+        }),
+        boxed_extension(GenericExtension {
+            id: EXTENSION_COMPRESS_CERTIFICATE,
+            data: certificate_compression_algorithms(&[CERT_COMPRESSION_ZLIB]),
+        }),
+        boxed_extension(GenericExtension { id: grease, data: vec![0] }),
     ]);
     extensions
 }
@@ -3491,7 +3747,7 @@ fn randomized_plan(id: &ClientHelloId, config: &Config, alpn: RandomizedAlpn) ->
     let padding = rng
         .chance(weights.extensions_append_padding)
         .then_some(PaddingPlan { target: BORING_PADDING_TARGET, index: extensions.len() });
-    HelloPlan { extensions, cipher_suites, padding }
+    HelloPlan { extensions, cipher_suites, padding, reuse_hybrid_x25519_key_share: false }
 }
 
 /// A padding extension. `length` is the body size; the four-byte extension header is
@@ -5103,8 +5359,10 @@ mod tests {
             ("default", hello_default(), &[0, 11, 0xff01, 23, 18, 5, 10, 13, 16, 43, 51]),
             ("chrome", hello_chrome_133(), &[0, 23, 0xff01, 10, 35, 16, 5, 13, 51, 45, 43, 17613]),
             ("chrome120", hello_chrome_120(), &[0, 23, 0xff01, 10, 35, 16, 5, 13, 51, 45, 43, 17513]),
-            ("firefox", hello_firefox_120(), &[0, 23, 10, 51, 13, 43, 45, 35, 16, 5, 0xff01, 11, 28]),
-            ("safari", hello_safari_16_0(), &[0, 23, 10, 11, 16, 5, 13, 51, 45, 43]),
+            ("firefox", hello_firefox_148(), &[0, 23, 0xff01, 10, 11, 16, 5, 34, 18, 51, 43, 13, 28, 27]),
+            ("firefox120", hello_firefox_120(), &[0, 23, 10, 51, 13, 43, 45, 35, 16, 5, 0xff01, 11, 28]),
+            ("safari", hello_safari_26_3(), &[0, 23, 0xff01, 10, 11, 16, 5, 13, 18, 51, 45, 43, 27]),
+            ("safari16", hello_safari_16_0(), &[0, 23, 10, 11, 16, 5, 13, 51, 45, 43]),
             ("ios", hello_ios_14(), &[0, 23, 10, 11, 16, 5, 13, 51, 45, 43]),
             ("android", hello_android_11_ok_http(), &[0, 23, 16, 5, 10, 13, 51, 43, 45, 35]),
             ("edge", hello_edge_85(), &[0, 23, 0xff01, 10, 35, 16, 5, 13, 51, 45, 43]),
@@ -5119,6 +5377,166 @@ mod tests {
         }
     }
 
+    #[test]
+    fn the_auto_presets_track_the_current_browser_versions() {
+        assert_eq!(hello_firefox_auto(), hello_firefox_148());
+        assert_eq!(hello_firefox_148().client, "Firefox");
+        assert_eq!(hello_firefox_148().version, "148");
+        assert_eq!(hello_safari_auto(), hello_safari_26_3());
+        assert_eq!(hello_safari_26_3().client, "Safari");
+        assert_eq!(hello_safari_26_3().version, "26.3");
+    }
+
+    /// Builds the preset and returns its `supported_groups`, `key_share` groups and the offered
+    /// key-exchange lengths, GREASE entries included.
+    fn offered_groups_and_shares(fingerprint: UClientHelloID) -> (Vec<CurveId>, Vec<(CurveId, usize)>) {
+        let config = Arc::new(Config {
+            server_name: "example.com".to_owned(),
+            next_protos: vec!["h2".to_owned()],
+            ..Default::default()
+        });
+        let mut conn = uclient(Box::new(MockConn), config, fingerprint);
+        conn.build_handshake_state().expect("build handshake state");
+        let curves = conn
+            .extensions
+            .iter()
+            .find_map(|extension| extension.as_supported_curves())
+            .expect("supported curves extension")
+            .curves
+            .clone();
+        let shares = conn
+            .extensions
+            .iter()
+            .find_map(|extension| extension.as_key_share())
+            .expect("key share extension")
+            .key_shares
+            .iter()
+            .map(|share| (share.group, share.data.len()))
+            .collect();
+        (curves, shares)
+    }
+
+    #[test]
+    fn the_classical_presets_omit_the_post_quantum_key_share() {
+        for (name, fingerprint, groups, key_shares) in [
+            ("chrome120", hello_chrome_120(), vec![CurveId::X25519, CurveId(23), CurveId(24)], vec![CurveId::X25519]),
+            (
+                "firefox120",
+                hello_firefox_120(),
+                vec![CurveId::X25519, CurveId(23), CurveId(24), CurveId(25), CurveId(256)],
+                vec![CurveId::X25519],
+            ),
+            (
+                "safari16",
+                hello_safari_16_0(),
+                vec![CurveId::X25519, CurveId(23), CurveId(24), CurveId(25)],
+                vec![CurveId::X25519],
+            ),
+        ] {
+            let (curves, shares) = offered_groups_and_shares(fingerprint);
+            let curves: Vec<CurveId> = curves.into_iter().filter(|curve| !is_grease(curve.as_u16())).collect();
+            assert_eq!(curves, groups, "{name} supported_groups");
+            assert!(!curves.contains(&CurveId::X25519_MLKEM768), "{name} must not offer the hybrid group");
+            let offered: Vec<CurveId> =
+                shares.iter().map(|(group, _)| *group).filter(|group| !is_grease(group.as_u16())).collect();
+            assert_eq!(offered, key_shares, "{name} key_share");
+            let non_grease: Vec<(CurveId, usize)> =
+                shares.iter().copied().filter(|(group, _)| !is_grease(group.as_u16())).collect();
+            assert_eq!(non_grease, vec![(CurveId::X25519, 32)], "{name} key share must carry only X25519");
+        }
+    }
+
+    #[test]
+    fn the_current_presets_offer_the_post_quantum_key_share() {
+        for (name, fingerprint, groups) in [
+            ("chrome", hello_chrome_133(), vec![CurveId::X25519_MLKEM768, CurveId::X25519, CurveId(23), CurveId(24)]),
+            (
+                "firefox",
+                hello_firefox_148(),
+                vec![
+                    CurveId::X25519_MLKEM768,
+                    CurveId::X25519,
+                    CurveId(23),
+                    CurveId(24),
+                    CurveId(25),
+                    CurveId(256),
+                    CurveId(257),
+                ],
+            ),
+            (
+                "safari",
+                hello_safari_26_3(),
+                vec![CurveId::X25519_MLKEM768, CurveId::X25519, CurveId(23), CurveId(24), CurveId(25)],
+            ),
+        ] {
+            let (curves, shares) = offered_groups_and_shares(fingerprint);
+            let curves: Vec<CurveId> = curves.into_iter().filter(|curve| !is_grease(curve.as_u16())).collect();
+            assert_eq!(curves, groups, "{name} supported_groups");
+            let hybrid = shares.iter().find(|(group, _)| *group == CurveId::X25519_MLKEM768).expect("hybrid share");
+            assert_eq!(hybrid.1, 1184 + 32, "{name} hybrid share is the ML-KEM key followed by the X25519 point");
+            let x25519 = shares.iter().find(|(group, _)| *group == CurveId::X25519).expect("x25519 share");
+            assert_eq!(x25519.1, 32, "{name} X25519 share");
+        }
+    }
+
+    /// Firefox 148 reuses one X25519 keypair for the hybrid share's trailing half and the
+    /// standalone entry: the wire bytes are identical and either negotiated group answers with
+    /// the same scalar.
+    #[test]
+    fn firefox_148_reuses_one_x25519_key_share_in_both_entries() {
+        let config = Arc::new(Config {
+            server_name: "example.com".to_owned(),
+            next_protos: vec!["h2".to_owned()],
+            ..Default::default()
+        });
+        let mut conn = uclient(Box::new(MockConn), config, hello_firefox_148());
+        conn.build_handshake_state().expect("build handshake state");
+
+        let key_shares =
+            conn.extensions.iter().find_map(|extension| extension.as_key_share()).expect("key share extension");
+        let hybrid =
+            key_shares.key_shares.iter().find(|share| share.group == CurveId::X25519_MLKEM768).expect("hybrid share");
+        let x25519 = key_shares.key_shares.iter().find(|share| share.group == CurveId::X25519).expect("x25519 share");
+        assert_eq!(&hybrid.data[1184..1216], x25519.data.as_slice(), "the hybrid's trailing half is the X25519 share");
+
+        let keys = conn.handshake_state.state13.key_share_keys.take().expect("key share keys");
+        {
+            let hybrid_keys = keys.share(CurveId::X25519_MLKEM768).expect("hybrid keys");
+            let x25519_keys = keys.share(CurveId::X25519).expect("x25519 keys");
+            assert_eq!(
+                hybrid_keys.ecdhe.as_ref().expect("hybrid scalar").to_bytes(),
+                x25519_keys.ecdhe.as_ref().expect("x25519 scalar").to_bytes(),
+                "both entries must answer with the same scalar"
+            );
+        }
+
+        // Both groups complete against the same peer point, from one server-side keypair.
+        let (_peer_private, peer_public) = {
+            let mut bytes = [0u8; X25519_KEY_LEN];
+            rand::rng().fill(&mut bytes);
+            let private = StaticSecret::from(bytes);
+            let public = PublicKey::from(&private);
+            (private, public)
+        };
+        let (ciphertext, mlkem_shared) = {
+            use ml_kem::{EncapsulationKey, Key, MlKem768};
+            let key: Key<EncapsulationKey<MlKem768>> =
+                hybrid.data[..1184].try_into().expect("an ML-KEM-768 encapsulation key");
+            let key = EncapsulationKey::<MlKem768>::new(&key).expect("a valid encapsulation key");
+            let mut message = [0u8; 32];
+            rand::rng().fill(&mut message);
+            key.encapsulate_deterministic(&ml_kem::B32::from(message))
+        };
+        let mut hybrid_peer = ciphertext.to_vec();
+        hybrid_peer.extend_from_slice(peer_public.as_bytes());
+        let mut keys = keys;
+        let hybrid_secret = keys.complete(CurveId::X25519_MLKEM768, &hybrid_peer).expect("complete the hybrid share");
+        let x25519_secret = keys.complete(CurveId::X25519, peer_public.as_bytes()).expect("complete the X25519 share");
+        assert_eq!(hybrid_secret.len(), 32 + 32, "ML-KEM shared key followed by the X25519 one");
+        assert_eq!(&hybrid_secret[32..], x25519_secret.as_slice(), "the X25519 halves agree");
+        assert_eq!(&hybrid_secret[..32], mlkem_shared.as_slice(), "the ML-KEM shared key is the decapsulated value");
+    }
+
     /// ALPS is a Chromium extension: only the modern Chrome shape carries it, and a preset without
     /// ALPN must not advertise it either.
     #[test]
@@ -5127,9 +5545,15 @@ mod tests {
         assert!(ids.contains(&EXTENSION_APPLICATION_SETTINGS_NEW), "chrome 133 uses the new ALPS code point");
         let ids = built_extension_ids(hello_chrome_120());
         assert!(ids.contains(&EXTENSION_APPLICATION_SETTINGS), "chrome 120 uses the old ALPS code point");
-        for fingerprint in
-            [hello_firefox_120(), hello_safari_16_0(), hello_ios_14(), hello_android_11_ok_http(), hello_edge_85()]
-        {
+        for fingerprint in [
+            hello_firefox_148(),
+            hello_firefox_120(),
+            hello_safari_26_3(),
+            hello_safari_16_0(),
+            hello_ios_14(),
+            hello_android_11_ok_http(),
+            hello_edge_85(),
+        ] {
             let ids = built_extension_ids(fingerprint);
             assert!(
                 !ids.contains(&EXTENSION_APPLICATION_SETTINGS) && !ids.contains(&EXTENSION_APPLICATION_SETTINGS_NEW)
