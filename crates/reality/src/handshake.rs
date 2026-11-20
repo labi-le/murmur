@@ -55,6 +55,7 @@ pub(crate) struct ClientHello {
     /// A client that offers only an `X25519MLKEM768` share sets this from that share's trailing
     /// 32-byte X25519 half, which is the same point a standalone entry would carry.
     pub x25519_public: Option<[u8; 32]>,
+    #[cfg(test)]
     /// The 1184-byte ML-KEM encapsulation key from an offered `X25519MLKEM768` share, or `None`
     /// when the client did not offer the hybrid group. Its X25519 half is not repeated here: the
     /// trailing 32 bytes of the share are already in [`Self::x25519_public`].
@@ -112,6 +113,7 @@ impl ClientHello {
             cipher_suites: cipher_suites.to_vec(),
             server_name: server_name.to_owned(),
             x25519_public: Some(x25519_public),
+            #[cfg(test)]
             x25519_mlkem768_encapsulation_key: x25519_mlkem768_encapsulation_key.map(<[u8]>::to_vec),
             raw,
         }
@@ -169,6 +171,7 @@ impl ClientHello {
 
         let mut server_name = String::new();
         let mut x25519_public = None;
+        #[cfg(test)]
         let mut x25519_mlkem768_encapsulation_key = None;
         let ext_bytes = b.vec_u16()?;
         let mut er = Reader::new(ext_bytes);
@@ -180,7 +183,10 @@ impl ClientHello {
                 EXT_KEY_SHARE => {
                     let shares = parse_client_key_shares(ext_body)?;
                     x25519_public = shares.x25519;
-                    x25519_mlkem768_encapsulation_key = shares.mlkem768_encapsulation_key;
+                    #[cfg(test)]
+                    {
+                        x25519_mlkem768_encapsulation_key = shares.mlkem768_encapsulation_key;
+                    }
                 }
                 _ => {}
             }
@@ -192,6 +198,7 @@ impl ClientHello {
             cipher_suites,
             server_name,
             x25519_public,
+            #[cfg(test)]
             x25519_mlkem768_encapsulation_key,
             raw: msg.to_vec(),
         })
@@ -487,6 +494,7 @@ fn key_share_extension_client(x25519_public: [u8; 32], x25519_mlkem768_encapsula
 /// from, and the ML-KEM encapsulation key when the client offered the hybrid group.
 struct ClientKeyShares {
     x25519: Option<[u8; 32]>,
+    #[cfg(test)]
     mlkem768_encapsulation_key: Option<Vec<u8>>,
 }
 
@@ -500,6 +508,7 @@ fn parse_client_key_shares(body: &[u8]) -> Result<ClientKeyShares> {
     let mut lr = Reader::new(list);
     let mut x25519 = None;
     let mut mlkem768_x25519 = None;
+    #[cfg(test)]
     let mut mlkem768_encapsulation_key = None;
     while lr.remaining() > 0 {
         let group = lr.u16()?;
@@ -507,14 +516,21 @@ fn parse_client_key_shares(body: &[u8]) -> Result<ClientKeyShares> {
         match group {
             GROUP_X25519 if data.len() == X25519_KEY_LEN => x25519 = Some(<[u8; 32]>::try_from(data)?),
             GROUP_X25519_MLKEM768 if data.len() == MLKEM768_ENCAPSULATION_KEY_LEN + X25519_KEY_LEN => {
-                let (encapsulation_key, x25519_public) = data.split_at(MLKEM768_ENCAPSULATION_KEY_LEN);
-                mlkem768_encapsulation_key = Some(encapsulation_key.to_vec());
+                let (_encapsulation_key, x25519_public) = data.split_at(MLKEM768_ENCAPSULATION_KEY_LEN);
+                #[cfg(test)]
+                {
+                    mlkem768_encapsulation_key = Some(_encapsulation_key.to_vec());
+                }
                 mlkem768_x25519 = Some(<[u8; 32]>::try_from(x25519_public)?);
             }
             _ => {}
         }
     }
-    Ok(ClientKeyShares { x25519: x25519.or(mlkem768_x25519), mlkem768_encapsulation_key })
+    Ok(ClientKeyShares {
+        x25519: x25519.or(mlkem768_x25519),
+        #[cfg(test)]
+        mlkem768_encapsulation_key,
+    })
 }
 
 fn parse_server_key_share(body: &[u8]) -> Result<Option<ServerKeyShare>> {

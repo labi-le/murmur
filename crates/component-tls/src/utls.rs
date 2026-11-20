@@ -3306,8 +3306,8 @@ fn hello_plan(id: &ClientHelloId, config: &Config) -> HelloPlan {
         Browser::Chrome => chrome_plan(config, &id.version),
         Browser::Edge | Browser::Chinese360 | Browser::ChineseQq => legacy_chromium_plan(browser, config),
         Browser::Firefox => firefox_plan(config, &id.version),
-        Browser::Safari => safari_plan(config, &id.version),
-        Browser::Ios | Browser::Android => android_plan(browser, config),
+        Browser::Safari | Browser::Ios => safari_plan(browser, config, &id.version),
+        Browser::Android => android_plan(config),
     }
 }
 
@@ -3362,8 +3362,8 @@ fn firefox_plan(config: &Config, version: &str) -> HelloPlan {
 
 /// Safari 26.3 is [`hello_safari_auto`]'s shape; Safari 16.0 stays the classical profile without
 /// the post-quantum key share.
-fn safari_plan(config: &Config, version: &str) -> HelloPlan {
-    if version == "26.3" {
+fn safari_plan(browser: Browser, config: &Config, version: &str) -> HelloPlan {
+    if browser == Browser::Safari && version == "26.3" {
         let grease = random_grease();
         return HelloPlan {
             extensions: safari_26_3_extensions(config, grease),
@@ -3380,14 +3380,10 @@ fn safari_plan(config: &Config, version: &str) -> HelloPlan {
     }
 }
 
-fn android_plan(browser: Browser, config: &Config) -> HelloPlan {
-    let extensions = match browser {
-        Browser::Ios => safari_extensions(config),
-        _ => android_extensions(config),
-    };
+fn android_plan(config: &Config) -> HelloPlan {
     HelloPlan {
-        extensions,
-        cipher_suites: cipher_suites_of(browser, None),
+        extensions: android_extensions(config),
+        cipher_suites: cipher_suites_of(Browser::Android, None),
         padding: None,
         reuse_hybrid_x25519_key_share: false,
     }

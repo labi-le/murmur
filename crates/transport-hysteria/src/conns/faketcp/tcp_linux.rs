@@ -8,7 +8,6 @@
 
 use std::collections::HashMap;
 use std::io;
-use std::mem::size_of;
 use std::net::{IpAddr, SocketAddr};
 use std::sync::{Arc, Once};
 use std::time::Duration;
