@@ -141,30 +141,6 @@ and fixtures in the neighbouring `testdata/`.
   name for a single-crate change (`tuic:`, `listener:`, `net:`). Code, comments, docs and commit
   messages are English.
 
-## Publishing
-
-`main` on `labi-le/murmur` is **one squashed root commit whose tree is exactly this workspace** —
-history is not carried over, only content. `origin` is that repository, so publishing means
-building a fresh root commit from the current tree and replacing `main`:
-
-```bash
-git fetch origin                            # --force-with-lease compares against this ref
-tree=$(git rev-parse HEAD^{tree})
-GIT_AUTHOR_NAME=labi-le GIT_AUTHOR_EMAIL=1a6i1e@gmail.com \
-GIT_COMMITTER_NAME=labi-le GIT_COMMITTER_EMAIL=1a6i1e@gmail.com \
-  git commit-tree "$tree" -m "murmur: init"
-git push --force-with-lease origin <sha>:refs/heads/main
-git ls-remote origin refs/heads/main    # verify, and compare the tree
-```
-
-`commit-tree` never touches the worktree. Always `--force-with-lease`, never `--force`; verify
-afterwards that `git rev-parse origin/main^{tree}` equals `HEAD^{tree}`, and check that nothing was
-deleted relative to the previous published tree:
-
-```bash
-git diff --diff-filter=D --name-only origin/main HEAD   # expect empty
-```
-
 ## Verification expectations
 
 - **Behaviour change** — the targeted test for the crate plus `make gate`. If the change touches a
