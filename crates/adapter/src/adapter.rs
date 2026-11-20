@@ -373,7 +373,9 @@ impl Proxy {
             clippy::cast_possible_truncation,
             reason = "the test delay is a u16 wire field, so the millisecond count truncates exactly as the original did"
         )]
-        let t = (start.elapsed().as_millis() as u64) as u16;
+        // Delay 0 is the dead-node sentinel every reader of this value decodes, so a probe that
+        // finished inside the first millisecond still reports one.
+        let t = ((start.elapsed().as_millis() as u64) as u16).max(1);
 
         Ok((t, satisfied))
     }
@@ -643,5 +645,56 @@ mod tests {
         assert_eq!(proxy.last_delay_for_test_url(url), 12);
         assert!(!proxy.alive_for_test_url(other));
         assert_eq!(proxy.last_delay_for_test_url(other), u16::MAX);
+    }
+
+    /// A loopback probe completes in well under a millisecond, and delay 0 is what
+    /// `last_delay_for_test_url` maps to `u16::MAX` for a dead node, so a successful probe must
+    /// publish a floor of 1 ms. `PROBES` repeats keep the truncation observable on a loaded host.
+    #[tokio::test]
+    async fn url_test_never_records_a_zero_delay_for_a_successful_probe() {
+        tokio::time::timeout(Duration::from_secs(5), async {
+            const PROBES: usize = 32;
+
+            let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind health-check origin");
+            let addr = listener.local_addr().expect("health-check origin address");
+            let server = tokio::spawn(async move {
+                for _ in 0..PROBES {
+                    let (stream, _) = listener.accept().await.expect("accept health check");
+                    tokio::spawn(async move {
+                        let mut reader = BufReader::new(stream);
+                        loop {
+                            let mut line = String::new();
+                            let count = reader.read_line(&mut line).await.expect("read health-check request");
+                            assert_ne!(count, 0, "health check ended before its headers");
+                            if line == "\r\n" {
+                                break;
+                            }
+                        }
+                        reader
+                            .get_mut()
+                            .write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 0\r\nConnection: close\r\n\r\n")
+                            .await
+                            .expect("respond to health check");
+                    });
+                }
+            });
+
+            let proxy = Proxy::new(Arc::new(StubAdapter { dial_addr: Some(addr) }));
+            let url = format!("http://127.0.0.1:{}/", addr.port());
+            for probe in 0..PROBES {
+                let expected = murmur_common::utils::ranges::new_unsigned_ranges("200").expect("status range");
+                let delay = proxy.url_test(&CancellationToken::new(), &url, expected).await.expect("health check");
+                assert!(delay >= 1, "a successful probe published delay 0 on probe {probe}");
+                assert!(proxy.alive_for_test_url(&url), "probe {probe} must stay alive");
+                assert_ne!(
+                    proxy.last_delay_for_test_url(&url),
+                    u16::MAX,
+                    "a recorded delay of 0 reads back as a dead node on probe {probe}"
+                );
+            }
+            server.await.expect("health-check origin");
+        })
+        .await
+        .expect("health-check delay regression timed out");
     }
 }

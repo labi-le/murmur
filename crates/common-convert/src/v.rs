@@ -494,7 +494,9 @@ pub(crate) fn handle_v_share_link(
     insert_packet_encoding_opts(&query, proxy);
 
     let network = v_share_network(&query);
-    proxy.insert("network".to_owned(), Value::String(network.clone()));
+    // The outbound parsers read httpupgrade as a websocket transport with the upgrade flag set.
+    let wire_network = if network == "httpupgrade" { "ws" } else { network.as_str() };
+    proxy.insert("network".to_owned(), Value::String(wire_network.to_owned()));
     match network.as_str() {
         "http" => insert_http_opts(&query, proxy),
         "h2" => insert_h2_opts(&query, proxy),
@@ -625,6 +627,9 @@ fn insert_ws_opts(query: &UrlValues, network: &str, proxy: &mut Map<String, Valu
     headers.insert("Host".to_owned(), json!(query.get("host")));
     ws_opts.insert("path".to_owned(), json!(query.get("path")));
     ws_opts.insert("headers".to_owned(), Value::Object(headers));
+    if network == "httpupgrade" {
+        ws_opts.insert("v2ray-http-upgrade".to_owned(), json!(true));
+    }
 
     let early_data = query.get("ed");
     if !early_data.is_empty() {
@@ -701,6 +706,11 @@ fn insert_xhttp_opts(query: &UrlValues, proxy: &mut Map<String, Value>) {
 pub(crate) fn parse_xhttp_extra(extra: &Map<String, Value>, opts: &mut Map<String, Value>) {
     if matches!(extra.get("noGRPCHeader"), Some(Value::Bool(true))) {
         opts.insert("no-grpc-header".to_owned(), json!(true));
+    }
+    if let Some(Value::Object(headers)) = extra.get("headers") {
+        if !headers.is_empty() {
+            opts.insert("headers".to_owned(), Value::Object(headers.clone()));
+        }
     }
 
     insert_extra_string(extra, opts, "xPaddingBytes", "x-padding-bytes");
@@ -872,5 +882,88 @@ fn insert_download_xhttp_settings(xhttp_settings: &Map<String, Value>, ds: &mut 
         if let Some(Value::Object(xmux)) = xhttp_extra.get("xmux") {
             insert_reuse_settings(xmux, ds);
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use serde_json::json;
+
+    use crate::converter::converts_v2ray;
+
+    /// The outbound adapters only understand `ws` with the upgrade flag, so an `httpupgrade`
+    /// share link must surface as `network: ws` carrying the requested path and host.
+    #[test]
+    fn test_converts_v2_ray_vless_httpupgrade_as_websocket_upgrade() {
+        let link =
+            "vless://uuid@example.com:443?type=httpupgrade&path=%2Fup&host=example.com&security=tls#vless-httpupgrade";
+
+        let proxies = converts_v2ray(link.as_bytes()).unwrap();
+
+        assert_eq!(1, proxies.len());
+        assert_eq!(json!("ws"), proxies[0]["network"]);
+        assert_eq!(json!(true), proxies[0]["ws-opts"]["v2ray-http-upgrade"]);
+        assert_eq!(json!("/up"), proxies[0]["ws-opts"]["path"]);
+        assert_eq!(json!("example.com"), proxies[0]["ws-opts"]["headers"]["Host"]);
+    }
+
+    /// A `vmess://` share link takes the same `ws`-plus-flag shape as the base64 form.
+    #[test]
+    fn test_converts_v2_ray_vmess_share_link_httpupgrade_as_websocket_upgrade() {
+        let link =
+            "vmess://uuid@example.com:443?type=httpupgrade&path=%2Fup&host=example.com&security=tls#vmess-httpupgrade";
+
+        let proxies = converts_v2ray(link.as_bytes()).unwrap();
+
+        assert_eq!(1, proxies.len());
+        assert_eq!(json!("ws"), proxies[0]["network"]);
+        assert_eq!(json!(true), proxies[0]["ws-opts"]["v2ray-http-upgrade"]);
+        assert_eq!(json!("/up"), proxies[0]["ws-opts"]["path"]);
+        assert_eq!(json!("example.com"), proxies[0]["ws-opts"]["headers"]["Host"]);
+    }
+
+    /// `ed` on an `httpupgrade` link is fast-open, not the WebSocket early-data pair.
+    #[test]
+    fn test_converts_v2_ray_vless_httpupgrade_early_data_enables_fast_open() {
+        let link = "vless://uuid@example.com:443?type=httpupgrade&path=%2Fup&host=example.com&security=tls&ed=2048#vless-httpupgrade-early-data";
+
+        let proxies = converts_v2ray(link.as_bytes()).unwrap();
+
+        assert_eq!(1, proxies.len());
+        assert_eq!(json!("ws"), proxies[0]["network"]);
+        assert_eq!(json!(true), proxies[0]["ws-opts"]["v2ray-http-upgrade"]);
+        assert_eq!(json!(true), proxies[0]["ws-opts"]["v2ray-http-upgrade-fast-open"]);
+        assert_eq!(json!("/up"), proxies[0]["ws-opts"]["path"]);
+        assert_eq!(json!("example.com"), proxies[0]["ws-opts"]["headers"]["Host"]);
+    }
+
+    /// Trojan `httpupgrade` links take the same `ws`-plus-flag shape, including the host override
+    /// and the generated user agent.
+    #[test]
+    fn test_converts_v2_ray_trojan_httpupgrade_as_websocket_upgrade() {
+        let link = "trojan://password@example.com:443?type=httpupgrade&path=%2Fup&host=example.com#trojan-httpupgrade";
+
+        let proxies = converts_v2ray(link.as_bytes()).unwrap();
+
+        assert_eq!(1, proxies.len());
+        assert_eq!(json!("ws"), proxies[0]["network"]);
+        assert_eq!(json!(true), proxies[0]["ws-opts"]["v2ray-http-upgrade"]);
+        assert_eq!(json!("/up"), proxies[0]["ws-opts"]["path"]);
+        assert_eq!(json!("example.com"), proxies[0]["ws-opts"]["headers"]["Host"]);
+        let user_agent = proxies[0]["ws-opts"]["headers"]["User-Agent"].as_str().unwrap_or_default();
+        assert!(!user_agent.is_empty(), "expected a User-Agent header: {}", proxies[0]["ws-opts"]);
+    }
+
+    /// The `extra` JSON object of an xhttp link carries a `headers` map that murmur has to keep.
+    #[test]
+    fn test_converts_v2_ray_xhttp_extra_headers() {
+        let link = "vless://uuid@example.com:443?security=tls&type=xhttp&path=%2Fx&host=example.com&extra=%7B%22headers%22%3A%7B%22X-Test%22%3A%22one%22%7D%7D#xhttp-headers";
+
+        let proxies = converts_v2ray(link.as_bytes()).unwrap();
+
+        assert_eq!(1, proxies.len());
+        assert_eq!(json!("xhttp"), proxies[0]["network"]);
+        assert_eq!(json!("/x"), proxies[0]["xhttp-opts"]["path"]);
+        assert_eq!(json!({ "X-Test": "one" }), proxies[0]["xhttp-opts"]["headers"]);
     }
 }

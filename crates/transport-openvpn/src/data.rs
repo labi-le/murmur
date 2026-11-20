@@ -480,8 +480,12 @@ impl DataChannel {
         let header = &self.header;
         let packet_id_bytes = packet_id.to_be_bytes();
         let nonce = data_nonce(packet_id, self.send_implicit_iv);
+        // OpenVPN authenticates the packet id, prefixed by the header only where there is one:
+        // a P_DATA_V1 opcode/key_id byte is not additional data, the P_DATA_V2 peer id is.
         let mut ad = Vec::with_capacity(header.len() + packet_id_bytes.len());
-        ad.extend_from_slice(header);
+        if header.len() > 1 {
+            ad.extend_from_slice(header);
+        }
         ad.extend_from_slice(&packet_id_bytes);
         let sealed = aead.seal(&nonce, packet, &ad)?;
         let (ciphertext, tag) = sealed.split_at(sealed.len() - DATA_CHANNEL_TAG_SIZE);
@@ -568,8 +572,12 @@ impl DataChannel {
         let mut combined = Vec::with_capacity(ciphertext.len() + DATA_CHANNEL_TAG_SIZE);
         combined.extend_from_slice(ciphertext);
         combined.extend_from_slice(tag);
+        // Mirrors `encrypt_aead`: only a P_DATA_V2 header is authenticated, a P_DATA_V1
+        // opcode/key_id byte is not.
         let mut ad = Vec::with_capacity(header.len() + packet_id_bytes.len());
-        ad.extend_from_slice(header);
+        if header.len() > 1 {
+            ad.extend_from_slice(header);
+        }
         ad.extend_from_slice(packet_id_bytes);
 
         let nonce = data_nonce(packet_id, self.recv_implicit_iv);
@@ -839,6 +847,80 @@ mod tests {
         assert_eq!(
             hex::encode(&encrypted),
             "48000007000000010d91b1910bbe2321ff7e7360b4183ff17e794e64a8909482fedb857c6fdb756550120eb7"
+        );
+    }
+
+    fn client_keys() -> KeyMaterial {
+        KeyMaterial {
+            send_cipher_key: vec![0x11; 16],
+            send_hmac_key: vec![0x22; 64],
+            recv_cipher_key: vec![0x33; 16],
+            recv_hmac_key: vec![0x44; 64],
+        }
+    }
+
+    fn server_keys() -> KeyMaterial {
+        let client = client_keys();
+        KeyMaterial {
+            send_cipher_key: client.recv_cipher_key,
+            send_hmac_key: client.recv_hmac_key,
+            recv_cipher_key: client.send_cipher_key,
+            recv_hmac_key: client.send_hmac_key,
+        }
+    }
+
+    fn ip_packet() -> Vec<u8> {
+        vec![0x45, 0, 0, 20, 1, 2, 3, 4, 64, 6, 0, 0, 10, 8, 0, 2, 1, 1, 1, 1]
+    }
+
+    #[test]
+    fn p_data_v1_aead_encrypt_matches_known_answer_vector() {
+        let client = DataChannel::new(&client_keys(), CIPHER_AES_128_GCM, AUTH_SHA256, PEER_ID_UNSET, 0)
+            .expect("create data channel");
+
+        let encrypted = client.encrypt(&ip_packet()).expect("encrypt packet");
+        assert_eq!(
+            hex::encode(&encrypted),
+            "300000000164e8bd09e91ecee643a9e1ab15b0369c7e794e64a8909482fedb857c6fdb756550120eb7"
+        );
+    }
+
+    #[test]
+    fn p_data_v1_aead_authenticates_only_the_packet_id() {
+        let client = DataChannel::new(&client_keys(), CIPHER_AES_128_GCM, AUTH_SHA256, PEER_ID_UNSET, 0)
+            .expect("create client data channel");
+        let server = DataChannel::new(&server_keys(), CIPHER_AES_128_GCM, AUTH_SHA256, PEER_ID_UNSET, 0)
+            .expect("create server data channel");
+
+        let packet = client.encrypt(&ip_packet()).expect("encrypt packet");
+        assert_eq!(packet.first().copied(), Some(opcode_key_id(P_DATA_V1, 0)));
+        assert_eq!(server.decrypt(&packet).expect("decrypt packet"), ip_packet());
+    }
+
+    #[test]
+    fn p_data_v1_aead_rejects_a_tag_computed_with_the_opcode_in_the_additional_data() {
+        let client = client_keys();
+        let mut implicit = [0u8; DATA_CHANNEL_IV_SIZE];
+        implicit[4..].copy_from_slice(&client.send_hmac_key[..DATA_CHANNEL_IV_SIZE - 4]);
+        let nonce = data_nonce(1, implicit);
+        let aead = new_data_channel_aead(CIPHER_AES_128_GCM, &client.send_cipher_key).expect("create cipher");
+        let header = [opcode_key_id(P_DATA_V1, 0)];
+        let packet_id_bytes = 1u32.to_be_bytes();
+
+        let mut wrong_ad = header.to_vec();
+        wrong_ad.extend_from_slice(&packet_id_bytes);
+        let sealed = aead.seal(&nonce, &ip_packet(), &wrong_ad).expect("seal packet");
+        let (ciphertext, tag) = sealed.split_at(sealed.len() - DATA_CHANNEL_TAG_SIZE);
+        let mut packet = header.to_vec();
+        packet.extend_from_slice(&packet_id_bytes);
+        packet.extend_from_slice(tag);
+        packet.extend_from_slice(ciphertext);
+
+        let server = DataChannel::new(&server_keys(), CIPHER_AES_128_GCM, AUTH_SHA256, PEER_ID_UNSET, 0)
+            .expect("create server data channel");
+        assert!(
+            server.decrypt(&packet).is_err(),
+            "P_DATA_V1 must not authenticate the opcode/key_id byte as additional data"
         );
     }
 }

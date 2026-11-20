@@ -137,9 +137,15 @@ pub fn decrypt_bytes(data: &[u8], secret_keys: &[String]) -> Result<Vec<u8>> {
     }
     let mut identities: Vec<Identity> = Vec::new();
     for secret_key in secret_keys {
+        if secret_key.is_empty() {
+            continue;
+        }
         identities.extend(parse_identities(secret_key)?);
     }
     for secret_key in GLOBAL_SECRET_KEYS.read().iter() {
+        if secret_key.is_empty() {
+            continue;
+        }
         identities.extend(parse_identities(secret_key)?);
     }
 
@@ -1422,5 +1428,23 @@ mod tests {
 
         let hybrid_secret_key = gen_hybrid_key_pair();
         assert!(hybrid_secret_key.is_err());
+    }
+
+    /// `decrypt_bytes` reads the caller's keys before the global ones, so an empty entry has to be
+    /// skipped: otherwise `parse_identities("")` fails with "no identities found" and the matching
+    /// identity in `GLOBAL_SECRET_KEYS` is never consulted. The global list is restored before the
+    /// assertions so a failure cannot leak an identity into the other tests in this process.
+    #[test]
+    fn test_decrypt_bytes_skips_empty_secret_keys_and_uses_the_global_identities() {
+        let (secret_key, public_key) = gen_x25519_key_pair().unwrap();
+        let plaintext = b"global identity";
+        let encrypted = encrypt_bytes(plaintext, std::slice::from_ref(&public_key)).unwrap();
+
+        let previous: Vec<String> = GLOBAL_SECRET_KEYS.read().clone();
+        set_global_secret_keys(std::slice::from_ref(&secret_key));
+        let decrypted = decrypt_bytes(&encrypted, &[String::new()]);
+        set_global_secret_keys(&previous);
+
+        assert_eq!(decrypted.expect("an empty key entry must not abort the lookup"), plaintext.to_vec());
     }
 }
