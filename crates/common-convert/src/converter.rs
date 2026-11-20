@@ -175,7 +175,9 @@ fn convert_trojan(names: &mut HashMap<String, i32>, line: &str, scheme: &str, pr
 
     let network = query.get("type").to_lowercase();
     if !network.is_empty() {
-        trojan.insert("network".to_owned(), json!(network.as_str()));
+        // The outbound parsers read httpupgrade as a websocket transport with the upgrade flag.
+        let wire_network = if network == "httpupgrade" { "ws" } else { network.as_str() };
+        trojan.insert("network".to_owned(), json!(wire_network));
     }
 
     match network.as_str() {
@@ -187,6 +189,27 @@ fn convert_trojan(names: &mut HashMap<String, i32>, line: &str, scheme: &str, pr
 
             ws_opts.insert("path".to_owned(), json!(query.get("path")));
             ws_opts.insert("headers".to_owned(), Value::Object(headers));
+
+            trojan.insert("ws-opts".to_owned(), Value::Object(ws_opts));
+        }
+
+        "httpupgrade" => {
+            let mut headers = Map::new();
+            let mut ws_opts = Map::new();
+
+            headers.insert("User-Agent".to_owned(), json!(rand_user_agent()));
+            let host = query.get("host");
+            if !host.is_empty() {
+                headers.insert("Host".to_owned(), json!(host));
+            }
+
+            ws_opts.insert("path".to_owned(), json!(query.get("path")));
+            ws_opts.insert("headers".to_owned(), Value::Object(headers));
+            ws_opts.insert("v2ray-http-upgrade".to_owned(), json!(true));
+            let early_data = query.get("ed");
+            if !early_data.is_empty() && early_data.parse::<i32>().is_ok() {
+                ws_opts.insert("v2ray-http-upgrade-fast-open".to_owned(), json!(true));
+            }
 
             trojan.insert("ws-opts".to_owned(), Value::Object(ws_opts));
         }
@@ -298,7 +321,8 @@ fn convert_vmess(
         } else if network == "http" {
             "h2".clone_into(&mut network);
         }
-        vmess.insert("network".to_owned(), Value::String(network.clone()));
+        let wire_network = if network == "httpupgrade" { "ws" } else { network.as_str() };
+        vmess.insert("network".to_owned(), Value::String(wire_network.to_owned()));
     }
 
     if let Some(tls) = values.get("tls").and_then(|v| v.as_str()) {
@@ -665,6 +689,9 @@ fn insert_vmess_transport(network: &str, values: &Map<String, Value>, vmess: &mu
                 }
             }
             ws_opts.insert("headers".to_owned(), Value::Object(headers));
+            if network == "httpupgrade" {
+                ws_opts.insert("v2ray-http-upgrade".to_owned(), json!(true));
+            }
             vmess.insert("ws-opts".to_owned(), Value::Object(ws_opts));
         }
 
@@ -840,5 +867,39 @@ mod tests {
             proxies[0]["h2-opts"]
         );
         assert!(!proxies[0].contains_key("http-opts"));
+    }
+
+    /// The outbound adapters only understand `ws` with the upgrade flag, so the legacy
+    /// base64-JSON VMess form must turn `net: httpupgrade` into `network: ws`, keeping the path
+    /// and host while marking the upgrade.
+    #[test]
+    fn test_converts_v2_ray_vmess_base64_httpupgrade_as_websocket_upgrade() {
+        let payload = json!({
+            "v": "2",
+            "ps": "demo-httpupgrade",
+            "add": "server.example.com",
+            "port": "443",
+            "id": "b831381d-6324-4d53-ad4f-8cda48b30811",
+            "aid": "0",
+            "scy": "auto",
+            "net": "httpupgrade",
+            "type": "none",
+            "host": "example.com",
+            "path": "/up",
+            "tls": "tls",
+        });
+        let encoded = {
+            use base64::Engine as _;
+            ENC.encode(payload.to_string().as_bytes())
+        };
+        let vmess_test = format!("vmess://{encoded}");
+
+        let proxies = converts_v2ray(vmess_test.as_bytes()).unwrap();
+
+        assert_eq!(1, proxies.len());
+        assert_eq!(json!("ws"), proxies[0]["network"]);
+        assert_eq!(json!(true), proxies[0]["ws-opts"]["v2ray-http-upgrade"]);
+        assert_eq!(json!("/up"), proxies[0]["ws-opts"]["path"]);
+        assert_eq!(json!("example.com"), proxies[0]["ws-opts"]["headers"]["Host"]);
     }
 }
